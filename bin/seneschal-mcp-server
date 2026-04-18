@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Launch the Seneschal MCP server over stdio.
+#
+# Add to ~/.claude.json MCP servers config:
+#   "seneschal": {
+#     "command": "/path/to/seneschal/bin/seneschal-mcp-server",
+#     "args": []
+#   }
+#
+# Reads persisted reviews from ~/.seneschal/reviews/ (configurable via
+# SENESCHAL_REVIEW_STORE env var).
+
+set -e
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Prefer the repo's venv if present
+if [ -x "$DIR/venv/bin/python" ]; then
+  PY="$DIR/venv/bin/python"
+else
+  PY="$(command -v python3)"
+fi
+
+exec "$PY" -m mcp_server.server "$@"

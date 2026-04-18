@@ -43,6 +43,7 @@ from ci_context import fetch_ci_results  # noqa: E402
 from full_review import run_full_review  # noqa: E402
 from history_context import find_adrs  # noqa: E402
 from persona_loader import load_personas  # noqa: E402
+from review_store import save_review  # noqa: E402
 from related_prs import OtherPR  # noqa: E402
 from repo_config import load_from_repo  # noqa: E402
 from review_memory import load as load_memory  # noqa: E402
@@ -351,6 +352,10 @@ def post_review(owner, repo, pr_number, body, token, inline_comments=None):
     If inline_comments is provided, posts them as per-line review comments
     alongside the review body. Each comment should be a dict with keys:
     path, line, side, body.
+
+    On success, persists the posted review to the on-disk review store so
+    the MCP server can expose it to local Claude Code sessions later.
+    Persistence failures are non-fatal (the review is already on GitHub).
     """
     verdict = parse_verdict(body)
     session = _github_session()
@@ -382,6 +387,21 @@ def post_review(owner, repo, pr_number, body, token, inline_comments=None):
     resp.raise_for_status()
     comment_suffix = f" with {len(inline_comments)} inline comment(s)" if inline_comments else ""
     log(f"Posted {verdict} review on {owner}/{repo}#{pr_number}{comment_suffix}")
+
+    # Persist to the review store so the MCP server can surface this later.
+    try:
+        review_json = resp.json() if resp.content else {}
+        review_url = str(review_json.get("html_url", "")) if isinstance(review_json, dict) else ""
+        save_review(
+            f"{owner}/{repo}",
+            int(pr_number),
+            verdict,
+            review_url,
+            body,
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"Review store persist failed (non-fatal): {e}")
+
     return verdict
 
 
