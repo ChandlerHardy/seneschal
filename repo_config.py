@@ -60,6 +60,11 @@ class RepoConfig:
     # review returning REQUEST_CHANGES on a trusted-author PR would silently
     # kick off a 40-turn claude run.
     auto_fix: bool = False
+    # Raw persona entries from `personas:` in YAML. Each entry is a dict
+    # like {"builtin": "architect"} or {"file": ".seneschal/personas/x.md"}.
+    # Resolved into Persona objects by persona_loader.load_personas().
+    # Empty list → run all six builtin personas (pre-v2 default).
+    personas: List[dict] = field(default_factory=list)
 
     def system_prompt_addendum(self) -> str:
         if not self.rules and self.review_style == "concise":
@@ -119,6 +124,15 @@ def parse_config(raw: str) -> RepoConfig:
         config.full_review = data["full_review"]
     if isinstance(data.get("auto_fix"), bool):
         config.auto_fix = data["auto_fix"]
+    # personas: accept only dict entries with either "builtin" or "file" keys.
+    # persona_loader does the real resolution + safety checks; here we just
+    # shape-check and cap the list.
+    if isinstance(data.get("personas"), list):
+        filtered = []
+        for entry in data["personas"][:10]:  # MAX_PERSONAS_PER_REPO mirrors persona_loader
+            if isinstance(entry, dict) and ("builtin" in entry or "file" in entry):
+                filtered.append(entry)
+        config.personas = filtered
     return config
 
 

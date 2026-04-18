@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from analyzer import analyze_pr  # noqa: E402
 from full_review import run_full_review  # noqa: E402
+from persona_loader import load_personas  # noqa: E402
 from related_prs import OtherPR  # noqa: E402
 from repo_config import load_from_repo  # noqa: E402
 from review_memory import load as load_memory  # noqa: E402
@@ -830,8 +831,13 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
         # converge on a single posting code path (~/bin/seneschal-post).
         if config.full_review or FULL_REVIEW_DEFAULT:
             log(f"Full-review mode for {owner}/{repo}#{pr_number}")
+            personas = load_personas(config.personas, repo_path)
+            log(
+                f"Personas for {owner}/{repo}#{pr_number}: "
+                f"{[p.name for p in personas]}"
+            )
             try:
-                status = run_full_review(pr_number, repo_path)
+                status = run_full_review(pr_number, repo_path, personas=personas)
                 log(f"Full review for {owner}/{repo}#{pr_number}: {status}")
             except Exception as e:  # noqa: BLE001
                 log(f"Full review failed for {owner}/{repo}#{pr_number}: {e}")
