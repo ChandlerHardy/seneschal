@@ -1,0 +1,22 @@
+# Secrets (never commit)
+*.pem
+webhook-secret.txt
+
+# Python
+__pycache__/
+venv/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Macos
+.DS_Store
+
+# Editor / agent state
+.claude/settings.local.json
+.claude/plans/
+
+# Local dev
+/tmp/
+*.log
