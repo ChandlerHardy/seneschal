@@ -39,6 +39,7 @@ from flask import Flask, request, jsonify
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from analyzer import analyze_pr  # noqa: E402
+from ci_context import fetch_ci_results  # noqa: E402
 from full_review import run_full_review  # noqa: E402
 from history_context import find_adrs  # noqa: E402
 from persona_loader import load_personas  # noqa: E402
@@ -800,6 +801,17 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
         except Exception as e:  # noqa: BLE001
             log(f"ADR discovery failed (non-fatal): {e}")
             adrs = []
+
+        # Fetch CI check-runs for the PR's head SHA. All failures are
+        # non-fatal — the analyzer ignores an unfetched CIResult.
+        ci = fetch_ci_results(token, owner, repo, head_sha)
+        if ci.fetched:
+            log(
+                f"CI for {owner}/{repo}@{head_sha[:8]}: "
+                f"{ci.passing} pass / {ci.failing} fail / {ci.in_progress} in-progress"
+            )
+        else:
+            log(f"CI fetch skipped or failed for {owner}/{repo}@{head_sha[:8]}")
         try:
             other_prs = get_other_open_prs(owner, repo, pr_number, token)
         except Exception as e:  # noqa: BLE001
@@ -820,6 +832,7 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
             config=config,
             memory=memory,
             adrs=adrs,
+            ci=ci,
         )
         log(
             f"Analysis: risk={analysis.risk.level} score={analysis.risk.score}, "

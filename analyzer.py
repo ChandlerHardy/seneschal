@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
 from breaking_changes import BreakingChange, detect_breaking_changes, summarize_breaking
+from ci_context import CIResult, correlate_failing_checks, render_ci_addendum
 from context_loader import BlastRadius, compute_blast_radius
 from findings import Finding, FindingSet, Severity
 from history_context import ADR, render_adrs_addendum
@@ -46,6 +47,12 @@ class PRAnalysis:
     # Relevant ADRs / decision-log entries selected by history_context.
     # Empty list = no ADR discovery happened or nothing scored relevant.
     relevant_adrs: List[ADR] = field(default_factory=list)
+    # CI check-run status for the PR head SHA. Default is an empty
+    # non-fetched CIResult — ignored by prompt_addendum unless fetched.
+    ci: CIResult = field(default_factory=CIResult)
+    # Failing checks that correlated with touched files (pre-computed in
+    # analyze_pr while it still has the list of touched filenames).
+    _ci_correlated: List = field(default_factory=list)
 
     def labels(self) -> List[str]:
         out = [self.risk.label]
@@ -147,6 +154,15 @@ class PRAnalysis:
             )
         if self.relevant_adrs:
             parts.append(render_adrs_addendum(self.relevant_adrs))
+        if self.ci.fetched and self.ci.total > 0:
+            touched = [
+                # Pull touched filenames from risk scoring — set during analyze_pr
+                # and stored on self.diff_summary isn't structured for this; instead
+                # we rely on the render function's own inputs. Since correlation
+                # needs touched files but we don't hold them on PRAnalysis, render
+                # the CI block with only the correlation we already computed.
+            ]
+            parts.append(render_ci_addendum(self.ci, self._ci_correlated))
         return "\n".join(p for p in parts if p)
 
 
@@ -356,6 +372,7 @@ def analyze_pr(
     run_blast_radius: bool = False,
     memory: Optional[ReviewMemory] = None,
     adrs: Optional[Sequence[ADR]] = None,
+    ci: Optional[CIResult] = None,
 ) -> PRAnalysis:
     """Run all analysis modules and return a combined PRAnalysis.
 
@@ -382,10 +399,18 @@ def analyze_pr(
     # ADR relevance scoring — only runs if caller supplied ADRs.
     # Done here so the scoring heuristic has access to touched filenames.
     relevant_adrs_list: List[ADR] = []
+    touched = [f.filename for f in relevant_files]
     if adrs:
         from history_context import relevant_adrs as _score_relevant_adrs
-        touched = [f.filename for f in relevant_files]
         relevant_adrs_list = list(_score_relevant_adrs(adrs, touched, diff_text))
+
+    # CI correlation — needs touched filenames which aren't on PRAnalysis.
+    ci_result = ci or CIResult()
+    ci_correlated = (
+        list(correlate_failing_checks(ci_result, touched))
+        if ci_result.fetched and ci_result.has_failures
+        else []
+    )
 
     return PRAnalysis(
         risk=risk,
@@ -402,4 +427,6 @@ def analyze_pr(
         secrets=secrets,
         quality=quality,
         relevant_adrs=relevant_adrs_list,
+        ci=ci_result,
+        _ci_correlated=ci_correlated,
     )
