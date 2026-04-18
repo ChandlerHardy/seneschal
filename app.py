@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from analyzer import analyze_pr  # noqa: E402
 from full_review import run_full_review  # noqa: E402
+from history_context import find_adrs  # noqa: E402
 from persona_loader import load_personas  # noqa: E402
 from related_prs import OtherPR  # noqa: E402
 from repo_config import load_from_repo  # noqa: E402
@@ -789,9 +790,16 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
         # 2. Sync local clone (auto-clones on first webhook for a new repo).
         repo_path = ensure_repo_synced(owner, repo, head_ref, head_sha, token)
 
-        # 3. Load per-repo config, review memory, and other open PRs.
+        # 3. Load per-repo config, review memory, ADRs, and other open PRs.
         config = load_from_repo(repo_path)
         memory = load_memory(repo_path)
+        try:
+            adrs = find_adrs(repo_path)
+            if adrs:
+                log(f"Discovered {len(adrs)} ADR(s) in {owner}/{repo}")
+        except Exception as e:  # noqa: BLE001
+            log(f"ADR discovery failed (non-fatal): {e}")
+            adrs = []
         try:
             other_prs = get_other_open_prs(owner, repo, pr_number, token)
         except Exception as e:  # noqa: BLE001
@@ -811,6 +819,7 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
             repo_dir=repo_path,
             config=config,
             memory=memory,
+            adrs=adrs,
         )
         log(
             f"Analysis: risk={analysis.risk.level} score={analysis.risk.score}, "

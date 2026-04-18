@@ -15,6 +15,7 @@ from typing import List, Optional, Sequence
 from breaking_changes import BreakingChange, detect_breaking_changes, summarize_breaking
 from context_loader import BlastRadius, compute_blast_radius
 from findings import Finding, FindingSet, Severity
+from history_context import ADR, render_adrs_addendum
 from quality_scan import QualityHit, scan_quality, summarize_quality
 from related_prs import OtherPR, RelatedPR, find_related_prs, summarize_related
 from repo_config import RepoConfig
@@ -42,6 +43,9 @@ class PRAnalysis:
     breaking: List[BreakingChange] = field(default_factory=list)
     secrets: List[SecretHit] = field(default_factory=list)
     quality: List[QualityHit] = field(default_factory=list)
+    # Relevant ADRs / decision-log entries selected by history_context.
+    # Empty list = no ADR discovery happened or nothing scored relevant.
+    relevant_adrs: List[ADR] = field(default_factory=list)
 
     def labels(self) -> List[str]:
         out = [self.risk.label]
@@ -141,6 +145,8 @@ class PRAnalysis:
                 f"\n**Note:** New symbols without test references: {gap_names}. "
                 "Consider flagging missing tests in your review if they are non-trivial.\n"
             )
+        if self.relevant_adrs:
+            parts.append(render_adrs_addendum(self.relevant_adrs))
         return "\n".join(p for p in parts if p)
 
 
@@ -349,6 +355,7 @@ def analyze_pr(
     config: RepoConfig,
     run_blast_radius: bool = False,
     memory: Optional[ReviewMemory] = None,
+    adrs: Optional[Sequence[ADR]] = None,
 ) -> PRAnalysis:
     """Run all analysis modules and return a combined PRAnalysis.
 
@@ -372,6 +379,14 @@ def analyze_pr(
 
     findings = build_findings(risk, scope, gaps, related, title_report, breaking, secrets, quality)
 
+    # ADR relevance scoring — only runs if caller supplied ADRs.
+    # Done here so the scoring heuristic has access to touched filenames.
+    relevant_adrs_list: List[ADR] = []
+    if adrs:
+        from history_context import relevant_adrs as _score_relevant_adrs
+        touched = [f.filename for f in relevant_files]
+        relevant_adrs_list = list(_score_relevant_adrs(adrs, touched, diff_text))
+
     return PRAnalysis(
         risk=risk,
         scope=scope,
@@ -386,4 +401,5 @@ def analyze_pr(
         breaking=breaking,
         secrets=secrets,
         quality=quality,
+        relevant_adrs=relevant_adrs_list,
     )
