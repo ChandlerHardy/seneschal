@@ -1137,7 +1137,11 @@ def health():
 
 
 if __name__ == "__main__":
-    log("Starting Seneschal webhook handler on port 9100")
+    # Port can be overridden via SENESCHAL_PORT to support side-by-side
+    # deployments (e.g., run v2 on 9101 while v1 still serves 9100 until
+    # the GitHub App webhook URL is cut over).
+    _port = int(os.environ.get("SENESCHAL_PORT", "9100"))
+    log(f"Starting Seneschal webhook handler on port {_port}")
     # One-shot preflight at startup. A failure here only logs a loud
     # WARNING — the Flask app still comes up so GitHub doesn't back off
     # webhook deliveries and so an operator inspecting the endpoint
@@ -1150,4 +1154,4 @@ if __name__ == "__main__":
     else:
         log(f"WARNING: Claude preflight at startup FAILED: {_detail[:200]}")
         log("WARNING: Reviews will fail until `claude` auth is refreshed on this host.")
-    app.run(host="127.0.0.1", port=9100)
+    app.run(host="127.0.0.1", port=_port)
