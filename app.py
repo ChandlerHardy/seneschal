@@ -418,6 +418,33 @@ def post_comment(owner, repo, pr_number, body, token):
     )
 
 
+def react_to_comment(owner, repo, comment_id, token, content="eyes"):
+    """React to an issue/PR comment so the user sees the trigger was
+    received before the full review runs (~30 seconds). Failure is
+    non-fatal — the review continues regardless.
+
+    Args:
+        comment_id: GitHub's numeric id for the triggering comment.
+        content: one of GitHub's reaction contents. Default "eyes" (👀)
+            is the standard "I saw this, working on it" signal.
+    """
+    try:
+        session = _github_session()
+        resp = session.post(
+            f"https://api.github.com/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"content": content},
+            timeout=5,
+        )
+        if resp.status_code >= 400:
+            log(f"React to comment {comment_id} failed ({resp.status_code}): {resp.text[:200]}")
+    except Exception as e:  # noqa: BLE001
+        log(f"React to comment {comment_id} raised (non-fatal): {e}")
+
+
 def get_fix_attempt_count(owner, repo, pr_number, token):
     """Count [auto-fix] comments on the PR to track attempts."""
     session = _github_session()
@@ -1088,6 +1115,13 @@ def _handle_issue_comment_event(data):
         f"Comment trigger accepted: {owner}/{repo}#{pr_number} "
         f"by {author} on branch {head_ref}"
     )
+
+    # Visual ack: react with 👀 so the user knows we got the command
+    # before the 30-second review completes. Non-fatal on failure.
+    comment_id = comment.get("id")
+    if comment_id:
+        react_to_comment(owner, repo, comment_id, token)
+
     _queue_review(
         owner, repo, pr_number, installation_id, head_ref, head_sha,
         trigger="comment",
