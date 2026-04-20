@@ -29,12 +29,24 @@ def test_medium_diff_bumps_to_medium():
     assert any("Substantial diff" in r for r in result.reasons)
 
 
-def test_large_pr_is_high_risk():
+def test_large_pr_is_medium_risk():
+    # Pure size (25 files, 875 lines) now caps at MEDIUM. A PR can be big
+    # without being high-risk — "you should review this" (medium) is the
+    # honest signal, and HIGH is reserved for size + sensitive/infra/
+    # migration/secret signals together.
     files = [f(f"src/file{i}.py", 30, 5) for i in range(25)]
     result = score_risk(files)
-    assert result.level == "high"
+    assert result.level == "medium"
     assert any("Large surface area" in r for r in result.reasons)
     assert any("Large diff" in r for r in result.reasons)
+
+
+def test_large_pr_touching_auth_is_high_risk():
+    # Size + sensitive path is the combo that justifies HIGH.
+    files = [f(f"src/file{i}.py", 30, 5) for i in range(25)]
+    files.append(f("internal/auth/login.go", 20, 5))
+    result = score_risk(files)
+    assert result.level == "high"
 
 
 def test_auth_path_escalates():

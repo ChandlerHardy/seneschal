@@ -3,13 +3,21 @@
 Works from a raw unified diff. Parses added lines, extracts symbol
 declarations from source files, and checks whether any test file in the
 same PR mentions those symbols. Supports Python, Go, and JS/TS.
+
+Gated on the target repo having a detectable test framework — "add a test
+for X" is not actionable advice in a repo with zero test infrastructure,
+and a diff against one shouldn't drown the reviewer in noise suggestions.
+See `has_test_framework()` for the detection heuristic.
 """
 
 from __future__ import annotations
 
+import glob
+import json
+import os
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set
 
 from diff_parser import parse_unified_diff, parse_unified_diff_with_lines
 
@@ -19,6 +27,7 @@ from diff_parser import parse_unified_diff, parse_unified_diff_with_lines
 __all__ = [
     "parse_unified_diff",
     "parse_unified_diff_with_lines",
+    "has_test_framework",
     "is_test_file",
     "extract_added_symbols",
     "collect_referenced_identifiers",
@@ -26,6 +35,98 @@ __all__ = [
     "summarize_gaps",
     "TestGap",
 ]
+
+
+def has_test_framework(repo_dir: Optional[str]) -> bool:
+    """Return True if `repo_dir` has any sign of a test framework.
+
+    Returns True on `None` or a missing directory so callers that haven't
+    yet plumbed repo_dir through keep the previous behavior. Detection is
+    deliberately broad: we want a "definitely no tests anywhere" signal,
+    not a precise framework identification.
+
+    Heuristics (any ONE is enough):
+      - JS/TS: package.json has a `test` script, OR any jest/vitest config
+               file, OR a __tests__ dir, OR any *.test.ts/*.spec.ts file
+      - Python: pytest.ini / pyproject.toml with [tool.pytest], OR a
+               tests/ dir with at least one test_*.py or *_test.py file
+      - Go: any *_test.go anywhere in the tree (excluding vendor/ and
+            node_modules/)
+      - Swift: a Tests/ dir anywhere in the tree
+      - Generic: a test/ or tests/ directory in the repo root
+    """
+    if not repo_dir or not os.path.isdir(repo_dir):
+        # Conservative: if we don't know, don't suppress findings.
+        return True
+
+    # --- JS/TS ---
+    pkg_path = os.path.join(repo_dir, "package.json")
+    if os.path.isfile(pkg_path):
+        try:
+            with open(pkg_path) as fh:
+                pkg = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            pkg = {}
+        scripts = pkg.get("scripts", {}) if isinstance(pkg.get("scripts"), dict) else {}
+        if isinstance(scripts, dict) and any(
+            k == "test" or k.startswith("test:") for k in scripts
+        ):
+            return True
+        deps = {}
+        for key in ("dependencies", "devDependencies"):
+            if isinstance(pkg.get(key), dict):
+                deps.update(pkg[key])
+        if any(name in deps for name in ("jest", "vitest", "mocha", "ava", "playwright", "@testing-library/react")):
+            return True
+
+    for pattern in ("jest.config.*", "vitest.config.*", "playwright.config.*"):
+        if glob.glob(os.path.join(repo_dir, pattern)):
+            return True
+    for subdir in ("__tests__", "test", "tests"):
+        candidate = os.path.join(repo_dir, subdir)
+        if os.path.isdir(candidate):
+            return True
+
+    # --- Python ---
+    if os.path.isfile(os.path.join(repo_dir, "pytest.ini")):
+        return True
+    pyproject = os.path.join(repo_dir, "pyproject.toml")
+    if os.path.isfile(pyproject):
+        try:
+            with open(pyproject) as fh:
+                if "[tool.pytest" in fh.read():
+                    return True
+        except OSError:
+            pass
+
+    # --- Go ---
+    try:
+        for root, dirs, filenames in os.walk(repo_dir):
+            # Skip vendored and dependency trees to keep this fast on large repos.
+            dirs[:] = [
+                d for d in dirs
+                if d not in {"node_modules", "vendor", ".git", "venv", ".venv"}
+            ]
+            for name in filenames:
+                if name.endswith("_test.go"):
+                    return True
+    except OSError:
+        pass
+
+    # --- Swift / generic ---
+    # Tests/ anywhere is a strong signal (SPM / XCTest convention).
+    for root, dirs, _ in os.walk(repo_dir):
+        dirs[:] = [
+            d for d in dirs
+            if d not in {"node_modules", "vendor", ".git", "venv", ".venv"}
+        ]
+        if "Tests" in dirs:
+            return True
+        # Bound the walk — don't crawl deep if nothing matched yet.
+        if root.count(os.sep) - repo_dir.count(os.sep) > 4:
+            dirs[:] = []
+
+    return False
 
 
 # ----- Symbol extraction from source -----

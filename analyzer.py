@@ -25,7 +25,7 @@ from risk import PRFile, RiskScore, score_risk
 from scope import ScopeReport, detect_scope_drift
 from secrets_scan import SecretHit, scan_diff, summarize_secrets
 from summary import summarize_diff
-from test_gaps import TestGap, find_test_gaps, summarize_gaps
+from test_gaps import TestGap, find_test_gaps, has_test_framework, summarize_gaps
 from title_check import TitleReport, check_title
 
 
@@ -167,9 +167,22 @@ class PRAnalysis:
 
 
 def _risk_to_finding(risk: RiskScore) -> Optional[Finding]:
-    if risk.level == "high":
+    # BLOCKER severity is reserved for risk signals that are truly
+    # actionable — right now, a detected secret file. Size/scope-based
+    # HIGH produces a WARNING so it doesn't contradict Claude's
+    # ultimately-APPROVE verdict. The separate secret-scan module also
+    # files its own BLOCKER findings; we mirror that here for consistency
+    # with risk-level secret detection.
+    if risk.secret_files:
         return Finding(
             severity=Severity.BLOCKER,
+            category="risk",
+            title=f"Potential secret file(s) in diff (risk score {risk.score})",
+            detail="; ".join(risk.reasons) if risk.reasons else "",
+        )
+    if risk.level == "high":
+        return Finding(
+            severity=Severity.WARNING,
             category="risk",
             title=f"High-risk change (score {risk.score})",
             detail="; ".join(risk.reasons) if risk.reasons else "",
@@ -385,7 +398,11 @@ def analyze_pr(
 
     risk = score_risk(relevant_files)
     scope = detect_scope_drift(pr_title, relevant_files)
-    gaps = find_test_gaps(diff_text)
+    # Test-gap detection only runs if the repo has a detectable test
+    # framework. Flagging "missing test for X" on a repo with zero test
+    # infrastructure is noise — the action is "set up a test framework",
+    # not "add a test for this specific function".
+    gaps = find_test_gaps(diff_text) if has_test_framework(repo_dir) else []
     related = find_related_prs([f.filename for f in relevant_files], other_open_prs)
     blast = compute_blast_radius(diff_text, repo_dir) if run_blast_radius else BlastRadius()
     title_report = check_title(pr_title)

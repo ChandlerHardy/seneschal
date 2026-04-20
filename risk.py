@@ -158,9 +158,17 @@ def score_risk(files: Sequence[PRFile]) -> RiskScore:
     """Compute a RiskScore from PR files.
 
     Scoring thresholds (tuned for solo/small-team repos):
-        0-2   low
-        3-6   medium
-        7+    high
+        0-3    low
+        4-9    medium
+        10+    high
+
+    The HIGH threshold is set deliberately above the combined signal of
+    "~400-line feature PR + a lockfile update" (which scores 2+3+2 = 7).
+    That kind of PR is normal feature work, not actually high-risk, and
+    BLOCKER severity on it was a false positive that contradicted the
+    Claude-level review verdict. Truly high-risk PRs — large (500+ lines)
+    AND touch sensitive paths, migrations, infra, or secrets — still
+    easily clear 10.
     """
     score = 0
     reasons: List[str] = []
@@ -186,11 +194,14 @@ def score_risk(files: Sequence[PRFile]) -> RiskScore:
             reasons.append(f"{label} ({total_lines} lines)")
 
     # 2. Path-based signals (each family counted once).
+    # Raised single-hit from 3→4 so touching auth/security alone escalates
+    # to MEDIUM (risk score ≥4), matching the intent that sensitive paths
+    # deserve reviewer attention even in a tiny diff.
     def touched(fragments, label):
         nonlocal score
         hits = [f.filename for f in files if _is_match(f.filename, fragments)]
         if hits:
-            score += 4 if len(hits) >= 2 else 3
+            score += 5 if len(hits) >= 2 else 4
             reasons.append(f"{label}: {', '.join(hits[:3])}")
 
     touched(SENSITIVE_FRAGMENTS, "Touches auth/security surface")
@@ -204,9 +215,11 @@ def score_risk(files: Sequence[PRFile]) -> RiskScore:
         reasons.append(f"Dependency manifest changed: {', '.join(dep_hits[:3])}")
 
     # 4. Secret files — huge red flag even if small.
+    # Bonus must exceed the HIGH threshold on its own (≥10) so a 5-line
+    # diff containing .env still trips HIGH regardless of other signals.
     secret_hits = [f.filename for f in files if _is_secret(f.filename)]
     if secret_hits:
-        score += 7
+        score += 10
         secret_files = list(secret_hits)
         reasons.append(f"Potential secret file: {', '.join(secret_hits[:3])}")
 
@@ -219,9 +232,9 @@ def score_risk(files: Sequence[PRFile]) -> RiskScore:
         score += 1
 
     # Classify.
-    if score >= 7:
+    if score >= 10:
         level = "high"
-    elif score >= 3:
+    elif score >= 4:
         level = "medium"
     else:
         level = "low"
