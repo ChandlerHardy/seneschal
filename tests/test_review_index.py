@@ -266,6 +266,61 @@ def test_fts_query_handles_special_chars(store, idx):
 # --------------------------------------------------------------------------
 
 
+def test_adr_sync_failure_does_not_purge_existing_rows(tmp_path, store, idx, monkeypatch):
+    """Blocker #4: when `find_adrs` raises for a repo during sync, the
+    bare `except Exception: continue` used to fall through and leave
+    `seen` without any entries for that repo. The purge step then
+    DELETE'd every previously-indexed ADR for that repo, and the
+    outer BEGIN IMMEDIATE committed the purge. The fix tracks failed
+    repos and skips them in the purge pass."""
+    cross_repo = pytest.importorskip("cross_repo")
+    import history_context
+
+    repos_root = tmp_path / "repos"
+    repos_root.mkdir()
+    repo_dir = repos_root / "b"
+    adr_dir = repo_dir / "docs" / "adr"
+    adr_dir.mkdir(parents=True)
+    (adr_dir / "0001-use-postgres.md").write_text(
+        "# Use Postgres\n\nStatus: accepted\n\nMongo migration notes here."
+    )
+    (repo_dir / ".git").mkdir()
+    (repo_dir / ".git" / "config").write_text(
+        '[remote "origin"]\n\turl = git@github.com:a/b.git\n'
+    )
+    monkeypatch.setenv("SENESCHAL_REPOS_ROOT", str(repos_root))
+    cross_repo._clear_cache()
+
+    # First sync: the ADR lands in the index.
+    idx.sync_from_markdown(str(store))
+    assert len(idx.search_adrs("postgres")) == 1
+
+    # Second sync: force find_adrs to raise for this repo.
+    def _boom(path):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")
+
+    monkeypatch.setattr(history_context, "find_adrs", _boom)
+    idx.sync_from_markdown(str(store))
+
+    # The ADR row must still be present — the failed sync must NOT
+    # have purged previously-indexed rows for that repo.
+    hits = idx.search_adrs("postgres")
+    assert len(hits) == 1, (
+        "failed find_adrs caused purge of previously-indexed ADRs — "
+        "transient failure must not corrupt the index"
+    )
+
+    # Third sync: recovery. find_adrs works again and the ADR stays.
+    monkeypatch.setattr(history_context, "find_adrs", history_context.find_adrs.__wrapped__ if hasattr(history_context.find_adrs, "__wrapped__") else None)
+    # `monkeypatch.setattr` + a sentinel above isn't strictly needed —
+    # the fixture teardown undoes the setattr. Just re-run to confirm.
+    monkeypatch.undo()
+    monkeypatch.setenv("SENESCHAL_REPOS_ROOT", str(repos_root))
+    cross_repo._clear_cache()
+    idx.sync_from_markdown(str(store))
+    assert len(idx.search_adrs("postgres")) == 1
+
+
 def test_sync_indexes_adrs_from_known_repos(tmp_path, store, idx, monkeypatch):
     """ADR sync walks SENESCHAL_REPOS_ROOT for `known_repo` dirs and
     runs history_context.find_adrs. Each top-level child of the repos

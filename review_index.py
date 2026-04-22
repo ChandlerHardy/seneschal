@@ -526,11 +526,19 @@ class Index:
         cur = self._con.cursor()
         # Track (repo, path) pairs we see on this pass so we can purge stale rows.
         seen: set = set()
+        # Track repos whose `find_adrs` raised. We must NOT purge their
+        # existing `adrs` rows — a transient failure (UnicodeDecodeError on
+        # a single ADR, temporary EIO from a flaky FS) would otherwise
+        # wipe every indexed ADR for that repo and the outer BEGIN
+        # IMMEDIATE would persist the purge. The next successful sync
+        # restores the correct set.
+        failed_repos: set = set()
         for kr in repos:
             try:
                 adrs = history_context.find_adrs(kr.path)
             except Exception as e:  # noqa: BLE001
                 _log(f"find_adrs failed for {kr.slug}: {e}")
+                failed_repos.add(kr.slug)
                 continue
             for adr in adrs:
                 abs_path = os.path.join(kr.path, adr.path)
@@ -563,8 +571,14 @@ class Index:
                         (rowid, adr.title or "", adr.body or ""),
                     )
         # Purge ADRs that disappeared (file deleted or repo removed).
+        # Skip purge for repos whose find_adrs raised this pass — we
+        # have no ground truth to diff against, so deleting would be
+        # data loss. Their rows stay intact until the next successful
+        # sync reconciles them.
         existing_rows = list(cur.execute("SELECT repo, path FROM adrs"))
         for slug, path in existing_rows:
+            if slug in failed_repos:
+                continue
             if (slug, path) not in seen:
                 if self._fts5:
                     row = cur.execute(
