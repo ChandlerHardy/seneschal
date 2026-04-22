@@ -389,6 +389,45 @@ def get_file_sha(owner, repo, path, branch, token):
     return None
 
 
+def get_file_content(owner, repo, path, branch, token):
+    """GET /repos/{owner}/{repo}/contents/{path} — return (content_str, sha) or (None, None).
+
+    Used by the release-PR amend path to re-fetch the canonical
+    CHANGELOG from the release branch right before writing back, so a
+    just-merged changelog commit (pushed by a concurrent post-merge
+    worker) isn't overwritten with a stale snapshot from the caller's
+    local clone.
+    """
+    import base64
+
+    session = _github_session()
+    resp = session.get(
+        f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        params={"ref": branch},
+    )
+    if resp.status_code == 404:
+        return (None, None)
+    resp.raise_for_status()
+    data = resp.json() or {}
+    if not isinstance(data, dict):
+        return (None, None)
+    sha = data.get("sha")
+    encoded = data.get("content") or ""
+    if data.get("encoding") != "base64":
+        # GitHub has returned JSON listings for directories — don't try
+        # to decode those as file content.
+        return (None, sha)
+    try:
+        content = base64.b64decode(encoded).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return (None, sha)
+    return (content, sha)
+
+
 def get_default_branch_sha(owner, repo, branch, token):
     """GET /repos/{owner}/{repo}/git/ref/heads/{branch} — return the head SHA."""
     session = _github_session()
@@ -1068,12 +1107,17 @@ def _queue_review(owner, repo, pr_number, installation_id, head_ref, head_sha, t
     thread.start()
 
 
-def _queue_post_merge(owner, repo, pr_number, installation_id, pr_meta, config):
+def _queue_post_merge(owner, repo, pr_number, installation_id, pr_meta):
     """Spawn the post-merge orchestrator on a background thread.
 
     Same pattern as `_queue_review`: webhook handler returns 200 fast,
     the orchestrator chugs on its own. Exceptions in the orchestrator
     are swallowed (it returns a status dict).
+
+    W4: the slow work (installation-token mint, `ensure_repo_synced`,
+    `load_from_repo`) happens INSIDE the thread — not in the webhook
+    handler — so a cold clone doesn't exceed GitHub's delivery timeout
+    and pile up retried Flask workers on the same PR.
     """
     from post_merge.orchestrator import handle_pr_merged
 
@@ -1086,6 +1130,15 @@ def _queue_post_merge(owner, repo, pr_number, installation_id, pr_meta, config):
         # both file the followup issue. Lock-holder wins, the retry
         # sees the persisted state and no-ops.
         with _per_pr_lock(owner, repo, pr_number):
+            try:
+                token = get_installation_token(installation_id)
+                base_ref = (pr_meta.get("base") or {}).get("ref") or "main"
+                head_sha = pr_meta.get("merge_commit_sha") or (pr_meta.get("head") or {}).get("sha", "")
+                repo_path = ensure_repo_synced(owner, repo, base_ref, head_sha, token)
+                config = load_from_repo(repo_path)
+            except Exception as e:  # noqa: BLE001
+                log(f"[post_merge] config load failed for {owner}/{repo}#{pr_number}: {e!r}")
+                return
             result = handle_pr_merged(
                 owner=owner,
                 repo=repo,
@@ -1109,21 +1162,20 @@ def _handle_pull_request_event(data):
     # Merge events: route to post-merge orchestrator regardless of
     # AUTOREVIEW_ENABLED. The orchestrator no-ops on a default config so
     # repos that haven't opted in see no behavior change.
+    #
+    # W4: repo sync + config load happen INSIDE the background thread
+    # (see `_queue_post_merge`), not synchronously in the webhook
+    # handler. A cold clone of a large repo can take >10s — long enough
+    # that GitHub's delivery timeout fires and the webhook is retried
+    # while the first handler is still running, stacking Flask workers
+    # on the same PR. The handler here only does payload validation
+    # (which is cheap + already done above) and queues the thread.
     if action == "closed" and pr.get("merged"):
         owner = data["repository"]["owner"]["login"]
         repo = data["repository"]["name"]
         pr_number = pr["number"]
         installation_id = data["installation"]["id"]
-        try:
-            token = get_installation_token(installation_id)
-            base_ref = (pr.get("base") or {}).get("ref") or "main"
-            head_sha = pr.get("merge_commit_sha") or (pr.get("head") or {}).get("sha", "")
-            repo_path = ensure_repo_synced(owner, repo, base_ref, head_sha, token)
-            config = load_from_repo(repo_path)
-        except Exception as e:  # noqa: BLE001
-            log(f"Failed to load repo config for post-merge {owner}/{repo}#{pr_number}: {e!r}")
-            return jsonify({"status": "post_merge_skipped", "reason": "config_load_failed"}), 200
-        _queue_post_merge(owner, repo, pr_number, installation_id, pr, config)
+        _queue_post_merge(owner, repo, pr_number, installation_id, pr)
         return jsonify({"status": "post_merge_queued", "pr": pr_number}), 200
 
     # Closed-but-not-merged falls through to the ignore branch below; a

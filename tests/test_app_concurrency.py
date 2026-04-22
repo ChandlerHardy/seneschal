@@ -187,3 +187,85 @@ def test_put_file_retries_409_once_then_succeeds(monkeypatch):
     # Sha was re-fetched between the 409 and the retry.
     assert mock_sha.called
     assert mock_session.put.call_count == 2
+
+
+# --------------------------------------------------------------------------
+# W4: The webhook handler for a merge event must return fast (after sig
+# verification + payload parse), with the slow repo-sync + config-load
+# work happening inside the background thread. A cold clone taking >10s
+# must NOT block the handler — GitHub retries on delivery timeout and
+# stacks Flask workers on the same PR.
+# --------------------------------------------------------------------------
+
+
+def test_merge_webhook_does_not_sync_synchronously(monkeypatch):
+    """Regression guard for W4. The handler code path for
+    `pull_request/closed` + `merged=True` used to call
+    `get_installation_token`, `ensure_repo_synced`, and `load_from_repo`
+    INLINE before queuing the thread. That pulled the cold-clone latency
+    onto the critical path. Now those calls happen inside the thread.
+
+    Test: invoke `_handle_pull_request_event` with a merge payload. The
+    `ensure_repo_synced` helper must NOT be called during the
+    synchronous handler return — only inside the runner, which we
+    verify fires asynchronously.
+    """
+    sync_calls = {"synchronous": False, "total": 0}
+
+    def _fake_sync(*args, **kwargs):
+        sync_calls["total"] += 1
+        return "/tmp/fake-repo"
+
+    def _fake_token(*args, **kwargs):
+        return "tok"
+
+    def _fake_load(*args, **kwargs):
+        from repo_config import RepoConfig, PostMergeConfig
+        return RepoConfig(post_merge=PostMergeConfig())
+
+    # Patch a sentinel: during the handler call, flip a flag so we know
+    # if the sync happened inline vs. later in the thread.
+    import threading as _t
+    handler_returning = _t.Event()
+
+    def _sync_watcher(*args, **kwargs):
+        if not handler_returning.is_set():
+            sync_calls["synchronous"] = True
+        return _fake_sync(*args, **kwargs)
+
+    with patch.object(app, "ensure_repo_synced", side_effect=_sync_watcher):
+        with patch.object(app, "get_installation_token", side_effect=_fake_token):
+            with patch.object(app, "load_from_repo", side_effect=_fake_load):
+                with patch("post_merge.orchestrator.handle_pr_merged") as mock_handler:
+                    mock_handler.return_value = {}
+                    payload = {
+                        "action": "closed",
+                        "pull_request": {
+                            "number": 77,
+                            "merged": True,
+                            "base": {"ref": "main"},
+                            "head": {"sha": "deadbeef"},
+                            "merge_commit_sha": "feedface",
+                        },
+                        "repository": {
+                            "owner": {"login": "o"},
+                            "name": "r",
+                        },
+                        "installation": {"id": 1},
+                    }
+                    # Patch Flask's jsonify to return tuples directly so
+                    # the test works outside an app context.
+                    with patch.object(app, "jsonify", lambda d: d):
+                        resp = app._handle_pull_request_event(payload)
+                    handler_returning.set()
+
+    # Handler returned before the thread's sync call (if any).
+    assert sync_calls["synchronous"] is False, (
+        "W4 regression: ensure_repo_synced was called synchronously "
+        "inside the webhook handler. Long clones will block the "
+        "handler and cause GitHub to retry + pile up workers."
+    )
+    # Response itself is a 200-ish "queued" dict.
+    body = resp[0] if isinstance(resp, tuple) else resp
+    assert body.get("status") == "post_merge_queued"
+    assert body.get("pr") == 77

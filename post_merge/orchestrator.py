@@ -36,9 +36,14 @@ from post_merge import release as release_mod  # noqa: E402
 PushProtectedError = app.PushProtectedError
 
 # Process-local cache of which `owner/repo` combinations had `put_file` to
-# main return 403. Entries are (timestamp_seconds, protected_bool). After
+# main return 403. Entries are (monotonic_seconds, protected_bool). After
 # `_PROTECTED_TTL_SEC` we re-probe — branch protection may have been
 # removed and staying in auto-PR mode forever is wasteful.
+#
+# Uses `time.monotonic()` instead of `time.time()` so a wall-clock jump
+# (NTP step forward/back, container wake-from-sleep) can't evict a fresh
+# entry early or keep a stale entry alive forever. Monotonic is immune
+# to those jumps.
 _PROTECTED_REPOS: Dict[str, Tuple[float, bool]] = {}
 _PROTECTED_TTL_SEC = 3600  # 1 hour
 
@@ -54,7 +59,7 @@ def _is_protected(repo_slug: str) -> bool:
     ts, protected = entry
     if not protected:
         return False
-    if time.time() - ts > _PROTECTED_TTL_SEC:
+    if time.monotonic() - ts > _PROTECTED_TTL_SEC:
         # Expire: the next commit attempt will re-probe direct push.
         _PROTECTED_REPOS.pop(repo_slug, None)
         return False
@@ -63,7 +68,7 @@ def _is_protected(repo_slug: str) -> bool:
 
 def _mark_protected(repo_slug: str, protected: bool) -> None:
     """Record `repo_slug`'s protection state with a fresh timestamp."""
-    _PROTECTED_REPOS[repo_slug] = (time.time(), bool(protected))
+    _PROTECTED_REPOS[repo_slug] = (time.monotonic(), bool(protected))
 
 
 def _now_iso() -> str:
@@ -635,6 +640,7 @@ def _release_step(
         return _amend_release_pr(
             owner, repo, existing_prs[0],
             config.post_merge.changelog_path, existing, token,
+            release_base_branch=config.post_merge.release_base_branch or "main",
         )
 
     # Open a fresh release PR.
@@ -685,6 +691,7 @@ def _release_step(
                     return _amend_release_pr(
                         owner, repo, retry_prs[0],
                         config.post_merge.changelog_path, existing, token,
+                        release_base_branch=config.post_merge.release_base_branch or "main",
                     )
             raise
         try:
@@ -704,17 +711,37 @@ def _amend_release_pr(
     changelog_path: str,
     changelog_content: str,
     token: str,
+    release_base_branch: str = "main",
 ) -> Optional[int]:
-    """Refresh the changelog on an already-open seneschal:release PR's branch."""
+    """Refresh the changelog on an already-open seneschal:release PR's branch.
+
+    W2: `changelog_content` is the caller's snapshot, which was read
+    BEFORE this merge's `_changelog_step` pushed its entry. Writing it
+    back directly would overwrite the just-added entry with stale
+    content. Re-fetch the canonical CHANGELOG from the release-base
+    branch (typically `main`) right before the put_file so the amend
+    reflects the latest state.
+
+    Falls back to the caller's snapshot if the fresh fetch fails (404,
+    network error) — better to preserve the PR than to abort, and the
+    caller's content is at worst "stale by one entry", not corrupt.
+    """
     head_ref = (existing_pr.get("head") or {}).get("ref")
     if head_ref:
         try:
+            # Re-fetch from the release base (typically `main`). This
+            # picks up any changelog commits landed between when the
+            # caller snapshotted existing_changelog and now.
+            fresh_content, _base_sha = app.get_file_content(
+                owner, repo, changelog_path, release_base_branch, token,
+            )
+            content_to_write = fresh_content if fresh_content else changelog_content
             sha = app.get_file_sha(owner, repo, changelog_path, head_ref, token)
             app.put_file(
                 owner=owner,
                 repo=repo,
                 path=changelog_path,
-                content=changelog_content,
+                content=content_to_write,
                 message="chore(release): refresh CHANGELOG (Seneschal)",
                 branch=head_ref,
                 sha=sha,
@@ -726,12 +753,20 @@ def _amend_release_pr(
 
 
 def _is_already_exists_error(err: Exception) -> bool:
-    """Return True if `err` looks like a GitHub 422 "PR already exists"."""
+    """Return True if `err` looks like a GitHub 422 "PR already exists".
+
+    W3: Previously matched any 422 containing "pull request" as a
+    substring — false positives on unrelated validation errors (e.g.
+    "the pull request body is invalid" from a different validation
+    failure). Tighten: require `"already exists"` specifically, since
+    that's the fingerprint of GitHub's "A pull request already exists
+    for ..." response body.
+    """
     # requests-style HTTP errors carry a `response` attribute on
     # `HTTPError`. The API returns 422 with a body containing
     # "A pull request already exists for ...".
     msg = str(err).lower()
-    if "422" in msg and ("already exists" in msg or "pull request" in msg):
+    if "422" in msg and "already exists" in msg:
         return True
     resp = getattr(err, "response", None)
     if resp is None:
@@ -739,7 +774,7 @@ def _is_already_exists_error(err: Exception) -> bool:
     try:
         if getattr(resp, "status_code", None) == 422:
             text = (getattr(resp, "text", "") or "").lower()
-            return "already exists" in text or "pull request" in text
+            return "already exists" in text
     except Exception:  # noqa: BLE001
         return False
     return False

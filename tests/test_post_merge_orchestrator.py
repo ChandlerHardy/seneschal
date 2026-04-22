@@ -523,15 +523,17 @@ def test_protected_cache_invalidates_after_ttl(monkeypatch):
     orch._mark_protected("o/r", True)
     assert orch._is_protected("o/r") is True
 
-    # Fast-forward past TTL.
-    orig_time = orch.time.time
+    # Fast-forward past TTL. W1 switched the cache to time.monotonic()
+    # so NTP-step jumps can't evict fresh entries or keep stale ones
+    # alive forever — the test patches the same clock source.
+    orig_mono = orch.time.monotonic
     try:
-        orch.time.time = lambda: orig_time() + orch._PROTECTED_TTL_SEC + 10
+        orch.time.monotonic = lambda: orig_mono() + orch._PROTECTED_TTL_SEC + 10
         assert orch._is_protected("o/r") is False
         # Entry got evicted, not just expired.
         assert "o/r" not in orch._PROTECTED_REPOS
     finally:
-        orch.time.time = orig_time
+        orch.time.monotonic = orig_mono
 
 
 # --------------------------------------------------------------------------
@@ -759,3 +761,130 @@ def test_safe_open_in_repo_blocks_absolute_outside_path(tmp_path):
 
     result = _safe_open_in_repo(str(repo_dir), "../outside.txt")
     assert result is None
+
+
+# --------------------------------------------------------------------------
+# W2: _amend_release_pr must re-fetch CHANGELOG from main before writing,
+# so a concurrent changelog commit landed between snapshot and amend isn't
+# silently overwritten with stale content.
+# --------------------------------------------------------------------------
+
+
+def test_amend_release_pr_refetches_changelog_before_writing(tmp_path, monkeypatch):
+    """Race: `_release_step`'s `existing` snapshot was taken before
+    `_changelog_step` pushed its entry to main. If `_amend_release_pr`
+    writes that stale snapshot back, the just-added entry is dropped
+    from the release PR. Fix: re-fetch from the base branch right
+    before the put_file."""
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True, release_threshold="patch")
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        # Stale local clone — this is the `existing` snapshot the caller
+        # passes to _amend_release_pr.
+        (clone_dir / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- old ([#40](x))\n"
+        )
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_app.find_open_prs_with_label = MagicMock(return_value=[
+            {"number": 77, "head": {"ref": "seneschal/release-0.3.0"}},
+        ])
+        # Fresh content from main — includes a NEW entry pushed between
+        # the caller's snapshot and the amend. This is what must land on
+        # the release branch, not the stale snapshot.
+        fresh_from_main = (
+            "# Changelog\n\n## [Unreleased]\n\n"
+            "### Fixed\n- old ([#40](x))\n- NEW ([#42](x))\n"
+        )
+        mock_app.get_file_content = MagicMock(
+            return_value=(fresh_from_main, "freshsha")
+        )
+        mock_app.create_pull_request = MagicMock()
+        mock_app.get_pr_commits = MagicMock(return_value=[])
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "fix: thing"),
+            config=cfg,
+        )
+
+    # Amend call must have happened.
+    assert mock_app.get_file_content.called, (
+        "_amend_release_pr didn't re-fetch CHANGELOG from main — "
+        "W2 regression: stale snapshot would have been written back."
+    )
+    # The put_file that wrote the release branch must have used the
+    # fresh content, not the stale one. Find that specific call.
+    amend_calls = [
+        c for c in mock_app.put_file.call_args_list
+        if (c.kwargs.get("branch") or "").startswith("seneschal/release")
+    ]
+    assert amend_calls, "No put_file targeted the release branch"
+    written = amend_calls[-1].kwargs.get("content", "")
+    assert "NEW ([#42]" in written, (
+        "Release branch got stale content; fresh fetch was ignored."
+    )
+
+
+# --------------------------------------------------------------------------
+# W3: _is_already_exists_error must not false-positive on unrelated 422s
+# with "pull request" substring but no "already exists".
+# --------------------------------------------------------------------------
+
+
+def test_is_already_exists_error_requires_already_exists_substring():
+    """A 422 error with "pull request" but NOT "already exists" should
+    NOT be treated as an existing-PR race — the previous permissive
+    matcher masked real validation failures as "oh the PR is already
+    open, just amend", hiding bugs."""
+    from post_merge.orchestrator import _is_already_exists_error
+
+    # True positive: contains both "422" and "already exists".
+    assert _is_already_exists_error(
+        RuntimeError("HTTP 422: A pull request already exists for x")
+    ) is True
+
+    # False positive regression: contains "422" and "pull request" but
+    # not "already exists" — must NOT match.
+    assert _is_already_exists_error(
+        RuntimeError("HTTP 422: pull request body is invalid")
+    ) is False
+    assert _is_already_exists_error(
+        RuntimeError("HTTP 422: pull request field 'head' not found")
+    ) is False
+
+
+def test_is_already_exists_error_via_response_attribute():
+    """Mirror the text path through `err.response.status_code` + .text."""
+    from post_merge.orchestrator import _is_already_exists_error
+
+    class _Resp:
+        def __init__(self, code, text):
+            self.status_code = code
+            self.text = text
+
+    class _Err(Exception):
+        def __init__(self, resp):
+            super().__init__("some http error")
+            self.response = resp
+
+    assert _is_already_exists_error(
+        _Err(_Resp(422, "A pull request already exists for branch X"))
+    ) is True
+    assert _is_already_exists_error(
+        _Err(_Resp(422, "some other 422 error without the magic phrase"))
+    ) is False
+    assert _is_already_exists_error(
+        _Err(_Resp(500, "already exists but wrong status"))
+    ) is False
