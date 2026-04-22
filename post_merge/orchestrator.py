@@ -756,7 +756,7 @@ def _amend_release_pr(
     changelog_path: str,
     changelog_content: str,
     token: str,
-    release_base_branch: str = "main",
+    release_base_branch: str,
 ) -> Optional[int]:
     """Refresh the changelog on an already-open seneschal:release PR's branch.
 
@@ -767,9 +767,11 @@ def _amend_release_pr(
     branch (typically `main`) right before the put_file so the amend
     reflects the latest state.
 
-    Falls back to the caller's snapshot if the fresh fetch fails (404,
-    network error) — better to preserve the PR than to abort, and the
-    caller's content is at worst "stale by one entry", not corrupt.
+    Falls back to the caller's snapshot if the fresh fetch RAISES (network
+    error, transient 5xx). A `(None, None)` return is treated as a
+    successful fetch with no content (the base branch legitimately has no
+    CHANGELOG yet — nothing failed). Only a raised exception tags the
+    commit message with `[stale snapshot — fresh fetch failed]`.
 
     Blocker 2 (round 3): the fetch + put_file used to share ONE try
     block, so a fetch failure silently skipped the write — the
@@ -777,15 +779,36 @@ def _amend_release_pr(
     it. Split into two try blocks: fetch in the first (fall back to
     snapshot + tag the commit message so reviewers see the amend was
     based on stale content), put_file in the second.
+
+    Round 4 contract tightening:
+      - Missing `head.ref` → `ValueError`. Previously the function
+        returned the PR number silently, claiming success on zero work.
+      - `put_file` raising → propagates. Previously the exception was
+        caught + logged and the PR number was still returned, so the
+        caller (`_release_step`) thought the amend landed when the
+        release branch got no commit.
+      - A `(None, _)` fetch (genuine 404 — base branch has no
+        CHANGELOG yet) is treated as a *successful* empty fetch. The
+        snapshot-tag only fires when the fetch RAISED.
+      - `release_base_branch` is now required; callers already pass it.
     """
     head_ref = (existing_pr.get("head") or {}).get("ref")
     if not head_ref:
-        return int(existing_pr.get("number") or 0) or None
+        # Silent no-op was hiding bugs — raise so the outer `_release_step`
+        # catches, logs, and skips populating `result["release_pr"]`.
+        raise ValueError(
+            f"amend target has no head.ref; existing_pr={existing_pr!r}"
+        )
 
     # Fetch-step: try to pull the canonical CHANGELOG from the release
-    # base. On any failure, fall back to the caller's snapshot AND mark
-    # the commit message so reviewers know the amend was built on
-    # possibly-stale content rather than a fresh read.
+    # base. Distinguish two failure modes cleanly:
+    #   - fetch RAISED (network error, 5xx): fall back to caller snapshot
+    #     AND tag the commit message so reviewers see the amend is built
+    #     on possibly-stale content.
+    #   - fetch returned `(None, _)` (genuine 404 — base branch legit has
+    #     no CHANGELOG): ALSO fall back to caller snapshot, but DON'T
+    #     tag the message as a failure — nothing failed, the branch is
+    #     just empty of this file.
     fresh_fetch_ok = False
     # Normalize snapshot CRLF upfront. `insert_unreleased_entry` emits
     # LF-only output so the caller's snapshot is already LF — but if
@@ -797,43 +820,45 @@ def _amend_release_pr(
         fresh_content, _base_sha = github_api.get_file_content(
             owner, repo, changelog_path, release_base_branch, token,
         )
-        if fresh_content:
-            # Same CRLF normalization on fresh content — keeps the
-            # release-branch commit diff free of line-ending churn.
-            content_to_write = changelog_mod.normalize_newlines(fresh_content)
-            fresh_fetch_ok = True
-        else:
-            # Empty body / 404 → fall back to snapshot.
-            app.log(
-                f"[post_merge] amend release-PR: fresh fetch of "
-                f"{changelog_path!r} on {release_base_branch!r} returned empty; "
-                f"falling back to caller's snapshot"
-            )
     except Exception as e:  # noqa: BLE001
         app.log(
             f"[post_merge] amend release-PR: fresh fetch failed "
             f"({e!r}); falling back to caller's snapshot"
         )
+    else:
+        # Fetch succeeded. `None` / empty just means the base branch has
+        # no CHANGELOG (genuine 404 from the contents API). That's a
+        # valid state — we don't tag the commit as stale.
+        fresh_fetch_ok = True
+        if fresh_content:
+            content_to_write = changelog_mod.normalize_newlines(fresh_content)
+        else:
+            app.log(
+                f"[post_merge] amend release-PR: fresh fetch of "
+                f"{changelog_path!r} on {release_base_branch!r} returned empty; "
+                f"using caller's snapshot (base branch has no changelog yet)"
+            )
 
     commit_message = "chore(release): refresh CHANGELOG (Seneschal)"
     if not fresh_fetch_ok:
         commit_message += " [stale snapshot — fresh fetch failed]"
 
-    # Put-step: independent try so a fetch miss doesn't skip the write.
-    try:
-        sha = github_api.get_file_sha(owner, repo, changelog_path, head_ref, token)
-        github_api.put_file(
-            owner=owner,
-            repo=repo,
-            path=changelog_path,
-            content=content_to_write,
-            message=commit_message,
-            branch=head_ref,
-            sha=sha,
-            token=token,
-        )
-    except Exception as e:  # noqa: BLE001
-        app.log(f"[post_merge] amend release-PR put_file failed: {e!r}")
+    # Put-step: independent try block — we WANT an exception here to
+    # propagate (round-4 contract). Swallowing it and returning the PR
+    # number would claim success on a failed write, which the caller
+    # (`_release_step`) will then stash in `result["release_pr"]`.
+    # Letting it raise lets the outer handler log + skip that key.
+    sha = github_api.get_file_sha(owner, repo, changelog_path, head_ref, token)
+    github_api.put_file(
+        owner=owner,
+        repo=repo,
+        path=changelog_path,
+        content=content_to_write,
+        message=commit_message,
+        branch=head_ref,
+        sha=sha,
+        token=token,
+    )
 
     return int(existing_pr.get("number") or 0) or None
 

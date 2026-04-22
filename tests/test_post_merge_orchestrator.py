@@ -893,6 +893,7 @@ def test_amend_release_pr_falls_back_to_snapshot_when_fetch_fails(tmp_path, monk
             changelog_path="CHANGELOG.md",
             changelog_content=snapshot,
             token="tok",
+            release_base_branch="main",
         )
 
     # Should still return the PR number.
@@ -988,6 +989,7 @@ def test_amend_release_pr_uses_fresh_when_fetch_succeeds(tmp_path, monkeypatch):
             changelog_path="CHANGELOG.md",
             changelog_content=snapshot,
             token="tok",
+            release_base_branch="main",
         )
 
     call = mock_gh.put_file.call_args
@@ -1304,3 +1306,198 @@ def test_is_already_exists_error_via_response_attribute():
     assert _is_already_exists_error(
         _Err(_Resp(500, "already exists but wrong status"))
     ) is False
+
+
+# --------------------------------------------------------------------------
+# Round 4 regression: _amend_release_pr error contract
+#
+# Round 3 split fetch + put into two try blocks (closing Blocker 2), but
+# the put_file try LOGGED and SWALLOWED the exception, then the function
+# returned the PR number anyway — so callers were told the amend
+# succeeded when the release branch actually got no commit. Any retry
+# sequence (e.g. get_file_sha saw one sha, put_file then conflicted on a
+# newer sha after 3 retries) was silently discarded.
+#
+# Round 4 contract:
+#   - put_file raises → _amend_release_pr raises (caller decides)
+#   - missing head.ref → ValueError (silent no-op was hiding bugs)
+#   - fetch returned (None, _) → treat as SUCCESS with no content
+#     (genuine 404 on base branch, changelog doesn't exist yet), NOT
+#     as stale-snapshot. The stale tag only appears when fetch raised.
+# --------------------------------------------------------------------------
+
+
+def test_amend_release_pr_reraises_when_put_file_fails():
+    """If put_file raises (e.g. 409 retry exhaustion or 5xx), the function
+    must NOT swallow and return the PR number — that was the round-3
+    regression. Re-raise so the caller's outer try-except can log + skip
+    setting `result["release_pr"]`."""
+    from post_merge.orchestrator import _amend_release_pr
+
+    existing_pr = {"number": 77, "head": {"ref": "seneschal/release-0.3.0"}}
+    snapshot = "# Changelog\n\n## [Unreleased]\n- x ([#1](x))\n"
+
+    with patch("post_merge.orchestrator.app"), \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_file_content = MagicMock(return_value=(snapshot, "sha"))
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.put_file = MagicMock(
+            side_effect=RuntimeError("sha conflict after 3 retries")
+        )
+        try:
+            _amend_release_pr(
+                owner="o",
+                repo="r",
+                existing_pr=existing_pr,
+                changelog_path="CHANGELOG.md",
+                changelog_content=snapshot,
+                token="tok",
+                release_base_branch="main",
+            )
+        except RuntimeError as e:
+            assert "sha conflict" in str(e)
+        else:
+            raise AssertionError(
+                "_amend_release_pr silently swallowed put_file failure and "
+                "returned the PR number — round-3 regression."
+            )
+
+
+def test_release_step_skips_release_pr_when_amend_raises(tmp_path, monkeypatch):
+    """Contract test at the outer layer: when _amend_release_pr raises
+    (e.g. put_file exhausted retries), the orchestrator must NOT
+    populate result['release_pr'] with the PR number. Claiming success
+    on a failed write is worse than reporting nothing, since the
+    operator won't know to investigate."""
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True, release_threshold="patch")
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        (clone_dir / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- old ([#40](x))\n"
+        )
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        # Amend path fires because a release PR is already open.
+        mock_gh.find_open_prs_with_label = MagicMock(return_value=[
+            {"number": 77, "head": {"ref": "seneschal/release-0.3.0"}},
+        ])
+        mock_gh.get_file_content = MagicMock(return_value=("x", "sha"))
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        # Changelog put (first) succeeds, amend put (second) fails.
+        mock_gh.put_file = MagicMock(
+            side_effect=[
+                {"commit": {"sha": "abc"}},  # _changelog_step
+                RuntimeError("sha conflict after 3 retries"),  # amend
+            ]
+        )
+        mock_gh.get_pr_commits = MagicMock(return_value=[])
+
+        result = handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "fix: x"),
+            config=cfg,
+        )
+
+    # changelog still succeeded (first put_file)
+    assert result["changelog_updated"] is True
+    # release_pr must NOT be set — amend failed, claiming success is a lie.
+    assert result.get("release_pr") is None, (
+        "Round-3 regression: _amend_release_pr swallowed put_file failure "
+        f"and the orchestrator reported success: {result!r}"
+    )
+
+
+def test_amend_release_pr_rejects_missing_head_ref():
+    """Silent success on a missing head.ref was round-3's second bug:
+    the function returned the PR number without doing any work. If we
+    can't identify the release branch, that's a structural problem —
+    raise so the caller can log + skip setting release_pr."""
+    from post_merge.orchestrator import _amend_release_pr
+
+    # No `head` key at all.
+    try:
+        _amend_release_pr(
+            owner="o",
+            repo="r",
+            existing_pr={"number": 77},
+            changelog_path="CHANGELOG.md",
+            changelog_content="snap",
+            token="tok",
+            release_base_branch="main",
+        )
+    except ValueError as e:
+        assert "head" in str(e).lower() or "ref" in str(e).lower()
+    else:
+        raise AssertionError(
+            "_amend_release_pr should raise ValueError when head.ref is "
+            "missing, not silently return the PR number."
+        )
+
+    # Head present but ref missing.
+    try:
+        _amend_release_pr(
+            owner="o",
+            repo="r",
+            existing_pr={"number": 77, "head": {}},
+            changelog_path="CHANGELOG.md",
+            changelog_content="snap",
+            token="tok",
+            release_base_branch="main",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("head.ref missing must also raise")
+
+
+def test_amend_release_pr_empty_fetch_is_not_stale_tag():
+    """If `get_file_content` returns `(None, None)` — meaning a genuine
+    404 on the base branch because CHANGELOG.md doesn't exist yet —
+    that's a successful fetch with no content, NOT a failed fetch. The
+    commit message must NOT carry the `[stale snapshot — fresh fetch
+    failed]` tag because nothing failed.
+
+    Distinguish: fresh_fetch_ok should be True on (None, None) and only
+    False when get_file_content RAISED.
+    """
+    from post_merge.orchestrator import _amend_release_pr
+
+    existing_pr = {"number": 77, "head": {"ref": "seneschal/release-0.3.0"}}
+    snapshot = "# Changelog\n\n## [Unreleased]\n- x ([#1](x))\n"
+
+    with patch("post_merge.orchestrator.app"), \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        # 404 on base branch → helper returns (None, None).
+        mock_gh.get_file_content = MagicMock(return_value=(None, None))
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+
+        result = _amend_release_pr(
+            owner="o",
+            repo="r",
+            existing_pr=existing_pr,
+            changelog_path="CHANGELOG.md",
+            changelog_content=snapshot,
+            token="tok",
+            release_base_branch="main",
+        )
+
+    assert result == 77
+    # The commit message must NOT mis-tag this as a failed fetch.
+    call = mock_gh.put_file.call_args
+    msg = (call.kwargs.get("message") or "").lower()
+    assert "stale" not in msg and "fresh fetch failed" not in msg, (
+        f"Empty/404 fetch mislabeled as failed fetch: {msg!r}. The stale "
+        "tag should only appear when get_file_content RAISED."
+    )
+    # Snapshot (caller-provided) is what lands because fetch had nothing.
+    assert call.kwargs["content"] == snapshot
