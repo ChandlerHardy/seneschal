@@ -231,18 +231,125 @@ def test_dependency_usage_respects_limit():
 
 def test_get_index_syncs_once_per_process(monkeypatch):
     """The first tool call opens the index + syncs; subsequent calls
-    reuse the same Index and skip re-sync."""
-    # Reset sentinel.
+    reuse the same Index and skip re-sync. The sync-once flag now
+    lives on `Index.ensure_synced`, so this test just verifies the
+    composition in `server._get_index`."""
+    # Reset module-level cached Index.
     server._INDEX = None
-    server._INDEX_SYNCED = False
 
     mock_idx = MagicMock()
     with patch("mcp_server.server.review_index.open_index", return_value=mock_idx):
         ix1 = server._get_index()
         ix2 = server._get_index()
     assert ix1 is ix2
-    # sync_from_markdown was called exactly once.
-    assert mock_idx.sync_from_markdown.call_count == 1
+    # ensure_synced was called for every get_index (cheap no-op after
+    # the first call; the Index is responsible for not re-syncing).
+    assert mock_idx.ensure_synced.call_count == 2
     # Cleanup.
     server._INDEX = None
-    server._INDEX_SYNCED = False
+
+
+def test_ensure_synced_runs_exactly_once_across_threads(tmp_path):
+    """Blocker #7: two concurrent threads calling `ensure_synced`
+    must only trigger `sync_from_markdown` once. The old module-level
+    `_INDEX_SYNCED` sentinel was read-then-set without a lock, so two
+    threads both saw False and both ran sync, colliding on a second
+    BEGIN IMMEDIATE inside the first's transaction."""
+    import threading
+    import review_index
+
+    db_path = tmp_path / "idx.db"
+    ix = review_index.open_index(str(db_path))
+    try:
+        call_count = {"n": 0}
+        ready = threading.Event()
+        start = threading.Event()
+
+        orig = ix.sync_from_markdown
+
+        def _counting_sync(*a, **kw):
+            call_count["n"] += 1
+            # Hold inside the sync briefly so the second thread has
+            # a chance to race on the flag.
+            ready.set()
+            start.wait(timeout=1.0)
+            return orig(*a, **kw)
+
+        ix.sync_from_markdown = _counting_sync
+
+        results = []
+
+        def _runner():
+            ix.ensure_synced()
+            results.append(True)
+
+        t1 = threading.Thread(target=_runner)
+        t2 = threading.Thread(target=_runner)
+        t1.start()
+        ready.wait(timeout=1.0)
+        t2.start()
+        start.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert len(results) == 2
+        assert call_count["n"] == 1, (
+            "sync_from_markdown ran more than once across concurrent "
+            "ensure_synced calls — sentinel race"
+        )
+    finally:
+        ix.close()
+
+
+def test_index_search_is_thread_safe(tmp_path):
+    """Blocker #6: FastMCP can dispatch sync tools on a thread pool
+    executor (asyncio.to_thread). The default sqlite3 connection has
+    check_same_thread=True, which raises ProgrammingError when used
+    from a second thread. The Index now opens with
+    check_same_thread=False and serializes access via an internal
+    RLock — concurrent searches from multiple threads must not raise."""
+    import threading
+    import review_index
+    import review_store
+
+    db_path = tmp_path / "idx.db"
+    store_root = tmp_path / "reviews"
+    store_root.mkdir()
+    # Seed one review so search has content to scan.
+    owner_dir = store_root / "a"
+    owner_dir.mkdir()
+    repo_dir = owner_dir / "b"
+    repo_dir.mkdir()
+    import json
+    meta = {"pr_number": 1, "verdict": "APPROVE",
+            "timestamp": "2026-04-21T00:00:00Z", "url": ""}
+    (repo_dir / "1.md").write_text(
+        f"---\n{json.dumps(meta)}\n---\nbody about migration"
+    )
+
+    ix = review_index.open_index(str(db_path))
+    try:
+        ix.sync_from_markdown(str(store_root))
+
+        errors = []
+
+        def _runner():
+            try:
+                for _ in range(10):
+                    ix.search_reviews("migration")
+                    ix.list_merged_prs()
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=_runner) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        assert errors == [], (
+            f"concurrent Index access raised: {errors!r} "
+            "(check_same_thread or lock misconfiguration)"
+        )
+    finally:
+        ix.close()

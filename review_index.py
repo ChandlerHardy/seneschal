@@ -33,6 +33,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 from typing import List, Optional
 
 from fs_safety import validate_repo_slug
@@ -226,15 +227,43 @@ def open_index(path: Optional[str] = None) -> "Index":
 
 
 class Index:
-    """Thin wrapper around a single sqlite3 connection.
+    """Thread-safe wrapper around a single sqlite3 connection.
 
-    Not thread-safe — one connection per caller. The MCP server is
-    single-threaded per request so that's fine. Cross-process writes are
-    serialized by WAL + a 5s busy timeout."""
+    Shared across FastMCP tool dispatches. Sync tools in FastMCP run
+    on an asyncio thread-pool executor (`asyncio.to_thread`), so two
+    concurrent tool invocations can land on different threads. SQLite's
+    default `check_same_thread=True` raises ProgrammingError in that
+    case, and even with `check_same_thread=False` we need a lock to
+    prevent two simultaneous `BEGIN IMMEDIATE` statements from
+    colliding. Every public method acquires `self._lock` before
+    touching the connection.
+
+    Cross-process writes are still serialized by WAL + a 5s busy
+    timeout — the lock only handles in-process concurrency.
+    """
 
     def __init__(self, path: str):
         self._path = path
-        self._con = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+        # check_same_thread=False: safe because every public method
+        # holds self._lock for the duration of its SQL work, so the
+        # connection is never touched by two threads at once.
+        self._con = sqlite3.connect(
+            path, timeout=5.0, isolation_level=None, check_same_thread=False
+        )
+        # RLock (not Lock) so `ensure_synced` can call
+        # `sync_from_markdown` without re-entering the lock and
+        # deadlocking. Every public method acquires the lock; some
+        # call other public methods — RLock makes that safe.
+        self._lock = threading.RLock()
+        # `_synced` + `_lock` together implement a lazy-once sync for
+        # the MCP server's first tool call per process. The global
+        # `_INDEX_SYNCED` sentinel that used to live in server.py had
+        # a check-then-set race: two concurrent callers both saw False
+        # and both ran `sync_from_markdown`, which collided on a
+        # second BEGIN IMMEDIATE inside the first one's transaction.
+        # Moving the state here + using the shared lock closes that
+        # race without needing a second primitive in server.py.
+        self._synced = False
         self._con.execute("PRAGMA journal_mode=WAL;")
         self._con.execute("PRAGMA synchronous=NORMAL;")
         self._con.execute("PRAGMA foreign_keys=ON;")
@@ -248,6 +277,27 @@ class Index:
             _probe_fts5_contentless_delete() if self._fts5 else False
         )
         self._ensure_schema()
+
+    def ensure_synced(self, store_root: Optional[str] = None) -> None:
+        """Call `sync_from_markdown` exactly once per Index lifetime.
+
+        Thread-safe: uses the shared `self._lock` (RLock) so two
+        concurrent callers race once for the sync, then every
+        subsequent caller no-ops. On sync failure `_synced` stays
+        False so the next call retries (same semantics the old
+        module-level sentinel had, minus the race).
+
+        Replaces the `_INDEX_SYNCED` global in mcp_server.server —
+        that sentinel was read-then-set without a lock, so two
+        concurrent first-calls both saw False and both ran
+        `sync_from_markdown`, colliding on a second BEGIN IMMEDIATE
+        inside the first's transaction.
+        """
+        with self._lock:
+            if self._synced:
+                return
+            self.sync_from_markdown(store_root)
+            self._synced = True
 
     # ------------------------------------------------------------------
     # Schema management
@@ -343,10 +393,11 @@ class Index:
         self._ensure_schema()
 
     def close(self) -> None:
-        try:
-            self._con.close()
-        except sqlite3.Error:
-            pass
+        with self._lock:
+            try:
+                self._con.close()
+            except sqlite3.Error:
+                pass
 
     # ------------------------------------------------------------------
     # FTS helpers
@@ -389,20 +440,27 @@ class Index:
         Returns the number of rows inserted/updated (not counting purges).
         Deferred import of `review_store` avoids a circular import — this
         module is imported by the MCP server, and `review_store` imports
-        `fs_safety` which imports `app.log` at call time."""
+        `fs_safety` which the review-memory path re-enters.
+
+        Thread-safe: acquires `self._lock` for the duration of the sync
+        so a second thread can't start its own BEGIN IMMEDIATE while
+        this one is mid-transaction.
+        """
         import review_store
 
         if store_root is None:
             store_root = getattr(review_store, "STORE_ROOT", None) or os.path.expanduser(
                 "~/.seneschal/reviews"
             )
-        n_updated = self._sync_reviews(store_root)
-        # ADRs: walk known repos. Failure here is non-fatal — reviews
-        # sync is the main show, ADRs are gravy. Log and move on.
-        try:
-            self._sync_adrs()
-        except Exception as e:  # noqa: BLE001 — defensive boundary
-            _log(f"ADR sync failed: {e}")
+        with self._lock:
+            n_updated = self._sync_reviews(store_root)
+            # ADRs: walk known repos. Failure here is non-fatal —
+            # reviews sync is the main show, ADRs are gravy. Log and
+            # move on.
+            try:
+                self._sync_adrs()
+            except Exception as e:  # noqa: BLE001 — defensive boundary
+                _log(f"ADR sync failed: {e}")
         return n_updated
 
     def _sync_reviews(self, store_root: str) -> int:
@@ -644,45 +702,47 @@ class Index:
         if repo is not None:
             validate_repo_slug(repo)
         limit = max(1, min(int(limit), 200))
-        cur = self._con.cursor()
 
-        rows: List[tuple] = []
-        if self._fts5:
-            q = _sanitize_fts_query(query)
-            if q:
+        with self._lock:
+            cur = self._con.cursor()
+
+            rows: List[tuple] = []
+            if self._fts5:
+                q = _sanitize_fts_query(query)
+                if q:
+                    sql = (
+                        "SELECT r.repo, r.pr_number, r.verdict, r.timestamp, "
+                        "r.merged_at, r.head_sha, r.url, r.body "
+                        "FROM reviews_fts f JOIN reviews r ON r.rowid = f.rowid "
+                        "WHERE reviews_fts MATCH ? "
+                    )
+                    args: list = [q]
+                    if repo:
+                        sql += "AND r.repo = ? "
+                        args.append(repo)
+                    sql += "ORDER BY r.timestamp DESC LIMIT ?"
+                    args.append(limit)
+                    try:
+                        rows = list(cur.execute(sql, args))
+                    except sqlite3.OperationalError as e:
+                        # Any residual FTS parse error → fall through to LIKE.
+                        _log(f"FTS MATCH failed ({e}); falling back to LIKE")
+                        rows = []
+
+            if not rows:
+                # LIKE fallback (also the only path when FTS5 isn't available).
+                like_pat = f"%{query}%" if query else "%"
                 sql = (
-                    "SELECT r.repo, r.pr_number, r.verdict, r.timestamp, "
-                    "r.merged_at, r.head_sha, r.url, r.body "
-                    "FROM reviews_fts f JOIN reviews r ON r.rowid = f.rowid "
-                    "WHERE reviews_fts MATCH ? "
+                    "SELECT repo, pr_number, verdict, timestamp, merged_at, "
+                    "head_sha, url, body FROM reviews WHERE body LIKE ? "
                 )
-                args: list = [q]
+                args = [like_pat]
                 if repo:
-                    sql += "AND r.repo = ? "
+                    sql += "AND repo = ? "
                     args.append(repo)
-                sql += "ORDER BY r.timestamp DESC LIMIT ?"
+                sql += "ORDER BY timestamp DESC LIMIT ?"
                 args.append(limit)
-                try:
-                    rows = list(cur.execute(sql, args))
-                except sqlite3.OperationalError as e:
-                    # Any residual FTS parse error → fall through to LIKE.
-                    _log(f"FTS MATCH failed ({e}); falling back to LIKE")
-                    rows = []
-
-        if not rows:
-            # LIKE fallback (also the only path when FTS5 isn't available).
-            like_pat = f"%{query}%" if query else "%"
-            sql = (
-                "SELECT repo, pr_number, verdict, timestamp, merged_at, "
-                "head_sha, url, body FROM reviews WHERE body LIKE ? "
-            )
-            args = [like_pat]
-            if repo:
-                sql += "AND repo = ? "
-                args.append(repo)
-            sql += "ORDER BY timestamp DESC LIMIT ?"
-            args.append(limit)
-            rows = list(cur.execute(sql, args))
+                rows = list(cur.execute(sql, args))
 
         out: List[dict] = []
         for row in rows:
@@ -711,42 +771,44 @@ class Index:
         if repo is not None:
             validate_repo_slug(repo)
         limit = max(1, min(int(limit), 100))
-        cur = self._con.cursor()
 
-        rows: List[tuple] = []
-        if self._fts5:
-            q = _sanitize_fts_query(query)
-            if q:
+        with self._lock:
+            cur = self._con.cursor()
+
+            rows: List[tuple] = []
+            if self._fts5:
+                q = _sanitize_fts_query(query)
+                if q:
+                    sql = (
+                        "SELECT a.repo, a.path, a.id, a.title, a.status, a.body "
+                        "FROM adrs_fts f JOIN adrs a ON a.rowid = f.rowid "
+                        "WHERE adrs_fts MATCH ? "
+                    )
+                    args: list = [q]
+                    if repo:
+                        sql += "AND a.repo = ? "
+                        args.append(repo)
+                    sql += "LIMIT ?"
+                    args.append(limit)
+                    try:
+                        rows = list(cur.execute(sql, args))
+                    except sqlite3.OperationalError as e:
+                        _log(f"ADR FTS MATCH failed ({e}); falling back to LIKE")
+                        rows = []
+
+            if not rows:
+                like_pat = f"%{query}%" if query else "%"
                 sql = (
-                    "SELECT a.repo, a.path, a.id, a.title, a.status, a.body "
-                    "FROM adrs_fts f JOIN adrs a ON a.rowid = f.rowid "
-                    "WHERE adrs_fts MATCH ? "
+                    "SELECT repo, path, id, title, status, body "
+                    "FROM adrs WHERE (title LIKE ? OR body LIKE ?) "
                 )
-                args: list = [q]
+                args = [like_pat, like_pat]
                 if repo:
-                    sql += "AND a.repo = ? "
+                    sql += "AND repo = ? "
                     args.append(repo)
                 sql += "LIMIT ?"
                 args.append(limit)
-                try:
-                    rows = list(cur.execute(sql, args))
-                except sqlite3.OperationalError as e:
-                    _log(f"ADR FTS MATCH failed ({e}); falling back to LIKE")
-                    rows = []
-
-        if not rows:
-            like_pat = f"%{query}%" if query else "%"
-            sql = (
-                "SELECT repo, path, id, title, status, body "
-                "FROM adrs WHERE (title LIKE ? OR body LIKE ?) "
-            )
-            args = [like_pat, like_pat]
-            if repo:
-                sql += "AND repo = ? "
-                args.append(repo)
-            sql += "LIMIT ?"
-            args.append(limit)
-            rows = list(cur.execute(sql, args))
+                rows = list(cur.execute(sql, args))
 
         out: List[dict] = []
         for row in rows:
@@ -798,8 +860,9 @@ class Index:
             args.append(since)
         sql += "ORDER BY merged_at DESC LIMIT ?"
         args.append(limit)
-        cur = self._con.cursor()
-        rows = list(cur.execute(sql, args))
+        with self._lock:
+            cur = self._con.cursor()
+            rows = list(cur.execute(sql, args))
         return [
             {
                 "repo": row[0],

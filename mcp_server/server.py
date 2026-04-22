@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from typing import Optional
 
 import requests
@@ -77,11 +78,17 @@ mcp = FastMCP(
 # Shared helpers — index lifecycle, redaction.
 # --------------------------------------------------------------------------
 
-# Module-level Index + sync sentinel. The MCP server is one long-running
+# Module-level Index reference. The MCP server is one long-running
 # stdio process; we want the first tool call to open + sync, and every
-# subsequent call in that session to reuse the same connection.
+# subsequent call in that session to reuse the same connection. The
+# "sync-once" flag now lives on the Index itself (`_synced`) — moving
+# it onto the object closes the check-then-set race where two
+# concurrent first-calls both saw the module-level sentinel as False
+# and both tried to BEGIN IMMEDIATE inside the other's transaction.
 _INDEX: Optional[review_index.Index] = None
-_INDEX_SYNCED: bool = False
+# Lock protects the open-once initialization. Once `_INDEX` is set,
+# all further synchronization happens inside `Index._lock`.
+_INDEX_OPEN_LOCK = threading.Lock()
 
 
 def _log(msg: str) -> None:
@@ -98,17 +105,24 @@ def _get_index() -> review_index.Index:
     Re-sync during a live MCP session would be wasteful (it walks the
     whole ~/.seneschal/reviews tree). Operators restart the server to
     re-enumerate after a bulk import — same convention as cross_repo's
-    enumeration cache."""
-    global _INDEX, _INDEX_SYNCED
+    enumeration cache.
+
+    Thread-safety: `_INDEX_OPEN_LOCK` serializes the first-time open.
+    The sync-once guard lives on `Index.ensure_synced` where it shares
+    the Index's internal RLock, preventing the double-BEGIN-IMMEDIATE
+    race that the old module-level `_INDEX_SYNCED` sentinel had.
+    """
+    global _INDEX
     if _INDEX is None:
-        _INDEX = review_index.open_index()
-    if not _INDEX_SYNCED:
-        try:
-            _INDEX.sync_from_markdown()
-            _INDEX_SYNCED = True
-        except Exception as e:  # noqa: BLE001 — defensive boundary
-            _log(f"initial index sync failed: {e}; continuing with partial index")
-            # Leave _INDEX_SYNCED False so the next call retries.
+        with _INDEX_OPEN_LOCK:
+            if _INDEX is None:
+                _INDEX = review_index.open_index()
+    try:
+        _INDEX.ensure_synced()
+    except Exception as e:  # noqa: BLE001 — defensive boundary
+        _log(f"initial index sync failed: {e}; continuing with partial index")
+        # `ensure_synced` leaves `_synced` False on failure so the
+        # next call retries — same semantics as before, minus the race.
     return _INDEX
 
 
