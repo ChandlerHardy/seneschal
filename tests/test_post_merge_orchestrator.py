@@ -838,6 +838,97 @@ def test_amend_release_pr_refetches_changelog_before_writing(tmp_path, monkeypat
 
 
 # --------------------------------------------------------------------------
+# Blocker 2 (round 3): _amend_release_pr must split fetch + put_file into
+# separate try blocks so a fetch failure falls back to the snapshot
+# instead of silently aborting the write.
+# --------------------------------------------------------------------------
+
+
+def test_amend_release_pr_falls_back_to_snapshot_when_fetch_fails(tmp_path, monkeypatch):
+    """If get_file_content raises (404, network error), _amend_release_pr
+    must STILL call put_file using the caller's snapshot content —
+    previously fetch + write shared one try block so a fetch failure
+    skipped the write entirely, leaving the release PR stale.
+
+    The commit message should also be tagged so reviewers can tell the
+    amend was built on a stale snapshot rather than a fresh read.
+    """
+    from post_merge.orchestrator import _amend_release_pr
+
+    snapshot = (
+        "# Changelog\n\n## [Unreleased]\n\n"
+        "### Fixed\n- snapshot entry ([#99](x))\n"
+    )
+    existing_pr = {"number": 77, "head": {"ref": "seneschal/release-0.3.0"}}
+
+    with patch("post_merge.orchestrator.app") as mock_app:
+        # get_file_content raises — simulates a 404 / transient 5xx.
+        mock_app.get_file_content = MagicMock(
+            side_effect=RuntimeError("HTTP 500: upstream")
+        )
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+
+        result = _amend_release_pr(
+            owner="o",
+            repo="r",
+            existing_pr=existing_pr,
+            changelog_path="CHANGELOG.md",
+            changelog_content=snapshot,
+            token="tok",
+        )
+
+    # Should still return the PR number.
+    assert result == 77
+    # put_file MUST have been called despite the fetch failure.
+    assert mock_app.put_file.called, (
+        "Blocker 2 regression: fetch failure short-circuited the write — "
+        "_amend_release_pr should fall back to the snapshot."
+    )
+    call = mock_app.put_file.call_args
+    # Snapshot content was written.
+    assert call.kwargs["content"] == snapshot
+    # Commit message carries the stale-snapshot tag.
+    assert "stale snapshot" in call.kwargs["message"].lower() or "stale" in call.kwargs["message"].lower()
+
+
+def test_amend_release_pr_uses_fresh_when_fetch_succeeds(tmp_path, monkeypatch):
+    """Complement to the snapshot-fallback test: when get_file_content
+    returns content, that's what should land on the release branch,
+    and the commit message should NOT carry the stale-snapshot tag."""
+    from post_merge.orchestrator import _amend_release_pr
+
+    snapshot = (
+        "# Changelog\n\n## [Unreleased]\n\n"
+        "### Fixed\n- stale ([#40](x))\n"
+    )
+    fresh = (
+        "# Changelog\n\n## [Unreleased]\n\n"
+        "### Fixed\n- stale ([#40](x))\n- NEW ([#42](x))\n"
+    )
+    existing_pr = {"number": 77, "head": {"ref": "seneschal/release-0.3.0"}}
+
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_file_content = MagicMock(return_value=(fresh, "freshsha"))
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+
+        _amend_release_pr(
+            owner="o",
+            repo="r",
+            existing_pr=existing_pr,
+            changelog_path="CHANGELOG.md",
+            changelog_content=snapshot,
+            token="tok",
+        )
+
+    call = mock_app.put_file.call_args
+    assert call.kwargs["content"] == fresh
+    # Fresh fetch succeeded → no stale-snapshot tag.
+    assert "stale" not in call.kwargs["message"].lower()
+
+
+# --------------------------------------------------------------------------
 # W3: _is_already_exists_error must not false-positive on unrelated 422s
 # with "pull request" substring but no "already exists".
 # --------------------------------------------------------------------------

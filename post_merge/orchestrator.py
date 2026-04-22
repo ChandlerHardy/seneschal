@@ -811,30 +811,64 @@ def _amend_release_pr(
     Falls back to the caller's snapshot if the fresh fetch fails (404,
     network error) — better to preserve the PR than to abort, and the
     caller's content is at worst "stale by one entry", not corrupt.
+
+    Blocker 2 (round 3): the fetch + put_file used to share ONE try
+    block, so a fetch failure silently skipped the write — the
+    docstring claimed a snapshot fallback but the code never reached
+    it. Split into two try blocks: fetch in the first (fall back to
+    snapshot + tag the commit message so reviewers see the amend was
+    based on stale content), put_file in the second.
     """
     head_ref = (existing_pr.get("head") or {}).get("ref")
-    if head_ref:
-        try:
-            # Re-fetch from the release base (typically `main`). This
-            # picks up any changelog commits landed between when the
-            # caller snapshotted existing_changelog and now.
-            fresh_content, _base_sha = app.get_file_content(
-                owner, repo, changelog_path, release_base_branch, token,
+    if not head_ref:
+        return int(existing_pr.get("number") or 0) or None
+
+    # Fetch-step: try to pull the canonical CHANGELOG from the release
+    # base. On any failure, fall back to the caller's snapshot AND mark
+    # the commit message so reviewers know the amend was built on
+    # possibly-stale content rather than a fresh read.
+    fresh_fetch_ok = False
+    content_to_write = changelog_content
+    try:
+        fresh_content, _base_sha = app.get_file_content(
+            owner, repo, changelog_path, release_base_branch, token,
+        )
+        if fresh_content:
+            content_to_write = fresh_content
+            fresh_fetch_ok = True
+        else:
+            # Empty body / 404 → fall back to snapshot.
+            app.log(
+                f"[post_merge] amend release-PR: fresh fetch of "
+                f"{changelog_path!r} on {release_base_branch!r} returned empty; "
+                f"falling back to caller's snapshot"
             )
-            content_to_write = fresh_content if fresh_content else changelog_content
-            sha = app.get_file_sha(owner, repo, changelog_path, head_ref, token)
-            app.put_file(
-                owner=owner,
-                repo=repo,
-                path=changelog_path,
-                content=content_to_write,
-                message="chore(release): refresh CHANGELOG (Seneschal)",
-                branch=head_ref,
-                sha=sha,
-                token=token,
-            )
-        except Exception as e:  # noqa: BLE001
-            app.log(f"[post_merge] amend release-PR failed: {e!r}")
+    except Exception as e:  # noqa: BLE001
+        app.log(
+            f"[post_merge] amend release-PR: fresh fetch failed "
+            f"({e!r}); falling back to caller's snapshot"
+        )
+
+    commit_message = "chore(release): refresh CHANGELOG (Seneschal)"
+    if not fresh_fetch_ok:
+        commit_message += " [stale snapshot — fresh fetch failed]"
+
+    # Put-step: independent try so a fetch miss doesn't skip the write.
+    try:
+        sha = app.get_file_sha(owner, repo, changelog_path, head_ref, token)
+        app.put_file(
+            owner=owner,
+            repo=repo,
+            path=changelog_path,
+            content=content_to_write,
+            message=commit_message,
+            branch=head_ref,
+            sha=sha,
+            token=token,
+        )
+    except Exception as e:  # noqa: BLE001
+        app.log(f"[post_merge] amend release-PR put_file failed: {e!r}")
+
     return int(existing_pr.get("number") or 0) or None
 
 
