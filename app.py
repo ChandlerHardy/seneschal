@@ -293,6 +293,204 @@ def get_other_open_prs(owner, repo, exclude_pr, token, max_prs=200):
     return others
 
 
+class PushProtectedError(Exception):
+    """Raised when GitHub returns 403 on a Contents-API write to a protected ref.
+
+    The post-merge orchestrator catches this to switch from direct-commit
+    mode to auto-PR mode (open a branch + PR instead of pushing to main).
+    """
+
+
+def create_issue(owner, repo, title, body, labels, token):
+    """POST /repos/{owner}/{repo}/issues. Returns the issue dict."""
+    session = _github_session()
+    payload = {"title": str(title), "body": str(body or "")}
+    if labels:
+        payload["labels"] = list(labels)
+    resp = session.post(
+        f"https://api.github.com/repos/{owner}/{repo}/issues",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        json=payload,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_pull_request(owner, repo, title, body, head, base, token, draft=True):
+    """POST /repos/{owner}/{repo}/pulls. Returns the PR dict."""
+    session = _github_session()
+    resp = session.post(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        json={
+            "title": str(title),
+            "body": str(body or ""),
+            "head": str(head),
+            "base": str(base),
+            "draft": bool(draft),
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_branch(owner, repo, new_ref, from_sha, token):
+    """POST /repos/{owner}/{repo}/git/refs. Idempotent: existing ref returns its current state."""
+    session = _github_session()
+    full_ref = new_ref if new_ref.startswith("refs/") else f"refs/heads/{new_ref}"
+    resp = session.post(
+        f"https://api.github.com/repos/{owner}/{repo}/git/refs",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        json={"ref": full_ref, "sha": str(from_sha)},
+    )
+    if resp.status_code == 422:
+        # "Reference already exists" — fetch it and return.
+        ref_only = full_ref[len("refs/"):] if full_ref.startswith("refs/") else full_ref
+        existing = session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/git/ref/{ref_only}",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        existing.raise_for_status()
+        return existing.json()
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_file_sha(owner, repo, path, branch, token):
+    """GET /repos/{owner}/{repo}/contents/{path} — return the file's blob SHA, or None if missing."""
+    session = _github_session()
+    resp = session.get(
+        f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        params={"ref": branch},
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, dict):
+        return data.get("sha")
+    return None
+
+
+def get_default_branch_sha(owner, repo, branch, token):
+    """GET /repos/{owner}/{repo}/git/ref/heads/{branch} — return the head SHA."""
+    session = _github_session()
+    resp = session.get(
+        f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{branch}",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json() or {}
+    obj = data.get("object") or {}
+    return obj.get("sha", "")
+
+
+def put_file(owner, repo, path, content, message, branch, sha, token):
+    """PUT /repos/{owner}/{repo}/contents/{path} — write a file via the Contents API.
+
+    On 409 (sha mismatch from a concurrent write) re-fetches the file's
+    current SHA and retries up to 3 times. On 403 raises PushProtectedError
+    so the orchestrator can switch to auto-PR mode.
+    """
+    import base64
+
+    session = _github_session()
+    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+
+    for attempt in range(3):
+        payload = {
+            "message": str(message),
+            "content": encoded,
+            "branch": str(branch),
+        }
+        if sha:
+            payload["sha"] = str(sha)
+        resp = session.put(
+            f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            json=payload,
+        )
+        if resp.status_code == 403:
+            raise PushProtectedError(
+                f"PUT {path} on {owner}/{repo}@{branch} returned 403 — likely branch protection"
+            )
+        if resp.status_code == 409 and attempt < 2:
+            # Concurrent write — re-fetch sha and retry.
+            sha = get_file_sha(owner, repo, path, branch, token)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    # If we exhausted retries on 409:
+    raise RuntimeError(f"put_file: gave up after 3 retries on {owner}/{repo}/{path}")
+
+
+def find_open_prs_with_label(owner, repo, label, token):
+    """GET /repos/{owner}/{repo}/issues?labels=<label>&state=open — return PR dicts only."""
+    session = _github_session()
+    resp = session.get(
+        f"https://api.github.com/repos/{owner}/{repo}/issues",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        params={"labels": label, "state": "open", "per_page": 100},
+    )
+    resp.raise_for_status()
+    out = []
+    for item in resp.json() or []:
+        if not isinstance(item, dict):
+            continue
+        if "pull_request" in item:
+            # Hydrate the PR object so callers get head.ref.
+            pr_resp = session.get(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls/{item['number']}",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+            )
+            if pr_resp.status_code == 200:
+                out.append(pr_resp.json())
+    return out
+
+
+def get_pr_commits(owner, repo, pr_number, token):
+    """GET /repos/{owner}/{repo}/pulls/{pr_number}/commits — list of commit dicts."""
+    session = _github_session()
+    resp = session.get(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+        },
+        params={"per_page": 100},
+    )
+    resp.raise_for_status()
+    return resp.json() or []
+
+
 def apply_labels(owner, repo, pr_number, labels, token):
     """Add labels to a PR (additive, not replace)."""
     if not labels:
@@ -781,16 +979,69 @@ def _queue_review(owner, repo, pr_number, installation_id, head_ref, head_sha, t
     thread.start()
 
 
+def _queue_post_merge(owner, repo, pr_number, installation_id, pr_meta, config):
+    """Spawn the post-merge orchestrator on a background thread.
+
+    Same pattern as `_queue_review`: webhook handler returns 200 fast,
+    the orchestrator chugs on its own. Exceptions in the orchestrator
+    are swallowed (it returns a status dict).
+    """
+    from post_merge.orchestrator import handle_pr_merged
+
+    log(f"Queueing post-merge for {owner}/{repo}#{pr_number}")
+
+    def _runner():
+        result = handle_pr_merged(
+            owner=owner,
+            repo=repo,
+            pr_number=pr_number,
+            installation_id=installation_id,
+            pr_meta=pr_meta,
+            config=config,
+        )
+        log(f"[post_merge] {owner}/{repo}#{pr_number} done: {result}")
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+
+
 def _handle_pull_request_event(data):
     """Auto-trigger path. Gated by AUTOREVIEW_ENABLED."""
     action = data.get("action")
+
+    pr = data.get("pull_request") or {}
+
+    # Merge events: route to post-merge orchestrator regardless of
+    # AUTOREVIEW_ENABLED. The orchestrator no-ops on a default config so
+    # repos that haven't opted in see no behavior change.
+    if action == "closed" and pr.get("merged"):
+        owner = data["repository"]["owner"]["login"]
+        repo = data["repository"]["name"]
+        pr_number = pr["number"]
+        installation_id = data["installation"]["id"]
+        try:
+            token = get_installation_token(installation_id)
+            base_ref = (pr.get("base") or {}).get("ref") or "main"
+            head_sha = pr.get("merge_commit_sha") or (pr.get("head") or {}).get("sha", "")
+            repo_path = ensure_repo_synced(owner, repo, base_ref, head_sha, token)
+            config = load_from_repo(repo_path)
+        except Exception as e:  # noqa: BLE001
+            log(f"Failed to load repo config for post-merge {owner}/{repo}#{pr_number}: {e!r}")
+            return jsonify({"status": "post_merge_skipped", "reason": "config_load_failed"}), 200
+        _queue_post_merge(owner, repo, pr_number, installation_id, pr, config)
+        return jsonify({"status": "post_merge_queued", "pr": pr_number}), 200
+
+    # Closed-but-not-merged falls through to the ignore branch below; a
+    # status_ignore is the right answer for those.
+    if action == "closed":
+        log(f"Ignored pull_request/closed for unmerged PR #{pr.get('number')}")
+        return jsonify({"status": "ignored", "action": action, "reason": "closed_not_merged"}), 200
 
     # Only review on PR open or synchronize (new push).
     if action not in ("opened", "synchronize"):
         log(f"Ignored pull_request action: {action}")
         return jsonify({"status": "ignored", "action": action}), 200
 
-    pr = data["pull_request"]
     head_ref = pr["head"]["ref"]
     head_sha = pr["head"]["sha"]
 
