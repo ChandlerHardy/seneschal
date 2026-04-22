@@ -16,17 +16,25 @@ Other conventional types (chore, docs, test, build, ci) currently roll into
 `### Changed` so the changelog still acknowledges the PR rather than
 silently dropping it. Repos that want a stricter filter can layer that on
 top in P3 (standards enforcement).
+
+Breaking changes: a `feat!:` / `fix!:` / `<type>(scope)!:` prefix OR a
+`BREAKING CHANGE:` footer in the commit message signals a semver-major
+bump. We route those entries to `### Removed` (the Keep-a-Changelog
+convention for breaking changes) and prefix them with `**BREAKING**:`
+so downstream `release.bump_kind` can detect major bumps from the
+changelog text alone.
 """
 
 from __future__ import annotations
 
+import os
 import re
-import sys
 from typing import Optional
 
 # Single source of truth for valid prefixes. Imported (not duplicated) per the
 # campaign plan's "reused helpers" block.
-_THIS_DIR = "/".join(__file__.split("/")[:-2])
+_THIS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import sys  # noqa: E402 — kept only for the path prepend below
 sys.path.insert(0, _THIS_DIR)
 from title_check import CONVENTIONAL_TYPES  # noqa: E402
 
@@ -69,12 +77,19 @@ _PREFIX_RE = re.compile(
     r"^(?P<type>[a-zA-Z]+)(?:\([^)]*\))?(?P<bang>!?):\s*(?P<rest>.*)$",
 )
 
+# Breaking-change markers recognized in commit bodies / titles. Both the
+# spaced and hyphenated forms are valid per Conventional Commits.
+_BREAKING_TEXT_RE = re.compile(r"BREAKING[\s-]CHANGE", re.IGNORECASE)
+
 
 def classify_prefix(title: str) -> Optional[str]:
     """Classify the conventional-commit prefix of a PR title.
 
     Returns one of the values in CONVENTIONAL_TYPES (lowercased) or None
     if the title has no recognized prefix.
+
+    NOTE: the breaking-change `!` suffix is NOT reflected in the return
+    value — use `is_breaking_title()` separately for that signal.
     """
     if not title or not title.strip():
         return None
@@ -87,8 +102,34 @@ def classify_prefix(title: str) -> Optional[str]:
     return type_
 
 
-def _strip_prefix(title: str) -> str:
-    """Drop the `feat: ` / `fix(scope)!: ` style prefix from a title."""
+def is_breaking_title(title: str) -> bool:
+    """Return True if the PR title signals a breaking change.
+
+    Recognizes:
+      - `feat!:` / `fix(scope)!:` — Conventional Commits `!` marker
+      - `BREAKING CHANGE:` / `BREAKING-CHANGE:` — spec-compliant footer
+        form, even if it appears in the title body
+
+    Callers should also scan commit bodies via `release.bump_kind` or
+    the PR-commits API for `BREAKING CHANGE:` footers the title alone
+    would miss.
+    """
+    if not title:
+        return False
+    m = _PREFIX_RE.match(title.strip())
+    if m and m.group("bang") == "!":
+        type_ = m.group("type").lower()
+        if type_ in CONVENTIONAL_TYPES:
+            return True
+    return bool(_BREAKING_TEXT_RE.search(title))
+
+
+def strip_conventional_prefix(title: str) -> str:
+    """Drop the `feat: ` / `fix(scope)!: ` style prefix from a title.
+
+    Public alias for the old private `_strip_prefix`. Exists so the
+    orchestrator doesn't have to reach into a private helper.
+    """
     if not title:
         return ""
     m = _PREFIX_RE.match(title.strip())
@@ -100,13 +141,24 @@ def _strip_prefix(title: str) -> str:
     return m.group("rest").strip() or title.strip()
 
 
-def format_unreleased_entry(pr_number: int, title: str, url: str) -> str:
+# Back-compat alias — existing callers still import `_strip_prefix`.
+_strip_prefix = strip_conventional_prefix
+
+
+def format_unreleased_entry(pr_number: int, title: str, url: str, breaking: bool = False) -> str:
     """Render one markdown bullet for a merged PR.
 
     The conventional-commit prefix is stripped so the bullet reads as a
     human-friendly description rather than echoing the type taxonomy.
+
+    If `breaking=True`, the entry is prefixed with `**BREAKING**:` so
+    `release.bump_kind` can detect the major bump from the changelog
+    text alone (previously the `!` was silently dropped by the prefix
+    stripper).
     """
-    description = _strip_prefix(title)
+    description = strip_conventional_prefix(title)
+    if breaking:
+        return f"- **BREAKING**: {description} ([#{int(pr_number)}]({url}))"
     return f"- {description} ([#{int(pr_number)}]({url}))"
 
 
@@ -130,7 +182,12 @@ def _sub_for_kind(kind: str) -> str:
     return _PREFIX_TO_SUBSECTION.get(kind.lower(), "Changed")
 
 
-def insert_unreleased_entry(existing_changelog: str, entry: str, kind: str) -> str:
+def insert_unreleased_entry(
+    existing_changelog: str,
+    entry: str,
+    kind: str,
+    breaking: bool = False,
+) -> str:
     """Insert `entry` under the right `### <Subsection>` of `## [Unreleased]`.
 
     - Creates the Keep-a-Changelog header if missing.
@@ -139,9 +196,14 @@ def insert_unreleased_entry(existing_changelog: str, entry: str, kind: str) -> s
     - Creates the appropriate `### <Subsection>` if missing inside Unreleased.
     - Appends to the bottom of the subsection (preserves chronological order:
       oldest entries appear first within a subsection).
+
+    When `breaking=True`, the entry is routed to `### Removed` regardless
+    of `kind`. The caller is responsible for rendering the `entry` string
+    with a `**BREAKING**:` marker if downstream semver detection should
+    see it in the changelog text.
     """
     text = _ensure_header(existing_changelog)
-    subsection = _sub_for_kind(kind)
+    subsection = "Removed" if breaking else _sub_for_kind(kind)
 
     # Locate the Unreleased section.
     unreleased_match = re.search(

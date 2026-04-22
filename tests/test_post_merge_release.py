@@ -55,6 +55,21 @@ def test_bump_kind_no_conventional_prefix_is_patch():
     assert bump_kind(["- some random change ([#1](x))"]) == "patch"
 
 
+def test_bump_kind_double_starred_breaking_marker_is_major():
+    """Regression: `format_unreleased_entry(breaking=True)` emits
+    `**BREAKING**:` in the rendered changelog line. Previously the `!` on
+    a `feat!:` title was stripped before reaching the changelog, so
+    `bump_kind` saw plain `feat:` text and returned `minor`, silently
+    dropping the major-version bump."""
+    lines = ["- **BREAKING**: drop config X ([#10](https://x/10))"]
+    assert bump_kind(lines) == "major"
+
+
+def test_bump_kind_hyphenated_breaking_change_is_major():
+    lines = ["Note: BREAKING-CHANGE: old API gone"]
+    assert bump_kind(lines) == "major"
+
+
 # --------------------------------------------------------------------------
 # next_version
 # --------------------------------------------------------------------------

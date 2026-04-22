@@ -10,6 +10,8 @@ from post_merge.changelog import (  # noqa: E402
     classify_prefix,
     format_unreleased_entry,
     insert_unreleased_entry,
+    is_breaking_title,
+    strip_conventional_prefix,
 )
 
 
@@ -207,3 +209,57 @@ def test_insert_chore_goes_under_changed_default():
     out = insert_unreleased_entry(existing, entry, "chore")
     # chore/docs/test/build/ci/style fall back to Changed (or are filtered out)
     assert entry in out
+
+
+# --------------------------------------------------------------------------
+# Breaking-change detection
+# --------------------------------------------------------------------------
+
+
+def test_classify_prefix_detects_breaking_bang():
+    # Classification returns just the type; breaking is a separate signal.
+    assert classify_prefix("feat!: drop old API") == "feat"
+    assert is_breaking_title("feat!: drop old API") is True
+    assert is_breaking_title("feat(scope)!: drop old API") is True
+
+
+def test_classify_prefix_detects_breaking_text():
+    # Either spelling of the BREAKING CHANGE footer/text trips detection.
+    assert is_breaking_title("feat: rewrite; BREAKING CHANGE: old config dropped") is True
+    assert is_breaking_title("refactor: BREAKING-CHANGE: interface migrated") is True
+
+
+def test_non_breaking_title_returns_false():
+    assert is_breaking_title("feat: add thing") is False
+    assert is_breaking_title("chore: bump deps") is False
+    assert is_breaking_title("") is False
+
+
+def test_strip_conventional_prefix_public_alias():
+    # The public alias for `_strip_prefix` — orchestrator uses this form now.
+    assert strip_conventional_prefix("feat: add thing") == "add thing"
+    assert strip_conventional_prefix("fix(scope)!: do thing") == "do thing"
+    assert strip_conventional_prefix("no prefix") == "no prefix"
+
+
+def test_insert_unreleased_entry_routes_breaking_to_removed_section():
+    """A breaking-marked entry must land under `### Removed` regardless of
+    the conventional prefix, so `release.bump_kind` sees the BREAKING signal
+    preserved in the changelog text rather than losing the `!` in the strip."""
+    existing = _KEEP_A_CHANGELOG_HEADER + "\n## [Unreleased]\n"
+    entry = "- **BREAKING**: drop config X ([#10](https://x/10))"
+    out = insert_unreleased_entry(existing, entry, "feat", breaking=True)
+    assert "### Removed" in out
+    removed_idx = out.index("### Removed")
+    entry_idx = out.index(entry)
+    assert removed_idx < entry_idx
+    # Should NOT also appear under Added.
+    assert "### Added" not in out or out.index("### Added") > entry_idx or entry not in out[out.index("### Added"):entry_idx]
+
+
+def test_format_unreleased_entry_marks_breaking_visibly():
+    """The rendered entry must carry `**BREAKING**` so `bump_kind` can
+    detect a major bump from the changelog text alone."""
+    entry = format_unreleased_entry(9, "feat!: drop python 3.8", "https://x/9", breaking=True)
+    assert entry.startswith("- **BREAKING**:")
+    assert "drop python 3.8" in entry

@@ -45,6 +45,11 @@ class ReviewRecord:
     Frontmatter v2 (P1) added optional fields at the end of the dataclass:
     `head_sha`, `merged_at`, `followups_filed`. They have safe defaults so
     v1 records (no new keys) round-trip with the same code path.
+
+    `followups_filed_titles` (v2.1) stores the followup titles that were
+    filed as issues, so the orchestrator can dedupe by stable identity
+    (normalized title) rather than by count. v2 records (no titles key)
+    load with an empty list so the field is fully backward-compatible.
     """
 
     repo: str           # "owner/name"
@@ -56,6 +61,9 @@ class ReviewRecord:
     head_sha: str = ""  # PR head SHA at review time (v2)
     merged_at: Optional[str] = None  # ISO-8601 UTC, set by mark_merged (v2)
     followups_filed: List[int] = field(default_factory=list)  # issue numbers (v2)
+    # Parallel to followups_filed — the sanitized titles of already-filed
+    # followup issues, used for title-based idempotence on retried merges.
+    followups_filed_titles: List[str] = field(default_factory=list)
 
     def summary(self) -> dict:
         """A compact representation suitable for MCP tool responses."""
@@ -98,6 +106,7 @@ def save_review(
     head_sha: Optional[str] = None,
     merged_at: Optional[str] = None,
     followups_filed: Optional[List[int]] = None,
+    followups_filed_titles: Optional[List[str]] = None,
 ) -> Path:
     """Write a review to disk. Creates parent dirs.
 
@@ -127,6 +136,18 @@ def save_review(
         meta["merged_at"] = str(merged_at)
     if followups_filed:
         meta["followups_filed"] = sorted({int(n) for n in followups_filed})
+    if followups_filed_titles:
+        # Deduplicate by the normalized (whitespace-collapsed, casefolded)
+        # key but keep the original string for human-readable frontmatter.
+        seen: set = set()
+        titles_out: List[str] = []
+        for t in followups_filed_titles:
+            key = " ".join(str(t).split()).casefold()
+            if key and key not in seen:
+                seen.add(key)
+                titles_out.append(str(t))
+        if titles_out:
+            meta["followups_filed_titles"] = titles_out
 
     frontmatter = json.dumps(meta, indent=2)
     content = f"---\n{frontmatter}\n---\n{body or ''}"
@@ -167,6 +188,13 @@ def _parse_review_file(path: Path, repo_slug: str) -> Optional[ReviewRecord]:
             except (TypeError, ValueError):
                 continue
 
+    titles_raw = meta.get("followups_filed_titles") or []
+    followups_filed_titles: List[str] = []
+    if isinstance(titles_raw, list):
+        for t in titles_raw:
+            if isinstance(t, str):
+                followups_filed_titles.append(t)
+
     return ReviewRecord(
         repo=repo_slug,
         pr_number=pr_number,
@@ -177,6 +205,7 @@ def _parse_review_file(path: Path, repo_slug: str) -> Optional[ReviewRecord]:
         head_sha=head_sha,
         merged_at=merged_at,
         followups_filed=followups_filed,
+        followups_filed_titles=followups_filed_titles,
     )
 
 
@@ -224,6 +253,8 @@ def mark_merged(
     pr_number: int,
     merged_at: str,
     followup_issue_numbers: List[int],
+    *,
+    followup_titles: Optional[List[str]] = None,
 ) -> Optional[Path]:
     """Update an existing review record to reflect a merge.
 
@@ -231,7 +262,9 @@ def mark_merged(
       treat that as "no stored review to annotate" and move on).
     - Writes a new file with the same body but updated frontmatter, adding
       `merged_at` and merging `followup_issue_numbers` into any existing
-      `followups_filed` list (deduplicated, sorted).
+      `followups_filed` list (deduplicated, sorted). When `followup_titles`
+      is supplied, they are merged into `followups_filed_titles` (also
+      deduplicated by normalized key).
     - Atomic: writes to a sibling tempfile, then `os.replace`. Borrows the
       pattern from `review_memory.save` so a crash mid-write can't leave a
       half-written frontmatter the next read would barf on.
@@ -251,6 +284,19 @@ def mark_merged(
         | {int(n) for n in (followup_issue_numbers or [])}
     )
 
+    # Merge titles with order preservation (existing titles first, then
+    # any new ones) — dedupe by normalized (casefold + whitespace-collapse)
+    # key so reviewer casing / spacing variations don't create duplicates.
+    merged_titles: List[str] = []
+    seen_keys: set = set()
+    for t in list(existing.followups_filed_titles or []) + list(followup_titles or []):
+        if not isinstance(t, str):
+            continue
+        key = " ".join(t.split()).casefold()
+        if key and key not in seen_keys:
+            seen_keys.add(key)
+            merged_titles.append(t)
+
     meta = {
         "pr_number": existing.pr_number,
         "verdict": existing.verdict,
@@ -265,6 +311,8 @@ def mark_merged(
         meta["merged_at"] = existing.merged_at
     if merged_followups:
         meta["followups_filed"] = merged_followups
+    if merged_titles:
+        meta["followups_filed_titles"] = merged_titles
 
     frontmatter = json.dumps(meta, indent=2)
     new_content = f"---\n{frontmatter}\n---\n{existing.body}"

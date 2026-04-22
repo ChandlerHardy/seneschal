@@ -12,7 +12,11 @@ from typing import List
 # preserve it in the bumped string.
 _SEMVER_RE = re.compile(r"^(?P<v>v?)(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
 
-_BREAKING_LINE_RE = re.compile(r"BREAKING\s*CHANGE", re.IGNORECASE)
+_BREAKING_LINE_RE = re.compile(r"BREAKING[\s-]CHANGE", re.IGNORECASE)
+# `**BREAKING**:` marker that `changelog.format_unreleased_entry` emits
+# when the source PR was marked breaking. Survives prefix stripping so
+# major-bump detection isn't lost when the `!` gets dropped.
+_BREAKING_MARKER_RE = re.compile(r"\*\*BREAKING\*\*", re.IGNORECASE)
 # Conventional-commit `!` marker before the colon: `feat!:` / `fix(scope)!:`.
 _BANG_PREFIX_RE = re.compile(r"^\s*[-*]?\s*[a-zA-Z]+(?:\([^)]*\))?!:", re.MULTILINE)
 _FEAT_PREFIX_RE = re.compile(r"^\s*[-*]?\s*feat(?:\([^)]*\))?:", re.IGNORECASE | re.MULTILINE)
@@ -23,12 +27,17 @@ def bump_kind(unreleased_lines: List[str]) -> str:
 
     Rules:
       - Any `BREAKING CHANGE` marker -> major.
-      - Any `<type>!:` prefix       -> major.
+      - Any `**BREAKING**` marker    -> major (changelog-format signal).
+      - Any `<type>!:` prefix        -> major.
       - Any `feat:` / `feat(scope):` -> minor.
       - Otherwise (fix, chore, etc.) -> patch.
     """
     text = "\n".join(unreleased_lines)
-    if _BREAKING_LINE_RE.search(text) or _BANG_PREFIX_RE.search(text):
+    if (
+        _BREAKING_LINE_RE.search(text)
+        or _BREAKING_MARKER_RE.search(text)
+        or _BANG_PREFIX_RE.search(text)
+    ):
         return "major"
     if _FEAT_PREFIX_RE.search(text):
         return "minor"

@@ -278,3 +278,46 @@ def test_mark_merged_preserves_body(tmp_path, monkeypatch):
     rec = get_review("a/b", 11)
     assert "## Review" in rec.body
     assert "[FOLLOWUP]" in rec.body
+
+
+def test_mark_merged_persists_followup_titles(tmp_path, monkeypatch):
+    """The orchestrator hands mark_merged the sanitized titles of the
+    issues it just filed. Those must round-trip through the frontmatter
+    so the next webhook delivery dedupes correctly by title, not count."""
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("a/b", 20, "APPROVE", "", "body")
+    mark_merged(
+        "a/b",
+        20,
+        "2026-04-21T10:00:00Z",
+        [601],
+        followup_titles=["[seneschal followup] do the thing"],
+    )
+    rec = get_review("a/b", 20)
+    assert rec.followups_filed_titles == ["[seneschal followup] do the thing"]
+
+
+def test_mark_merged_dedupes_titles_across_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("a/b", 21, "APPROVE", "", "body")
+    mark_merged("a/b", 21, "2026-04-21T10:00:00Z", [601], followup_titles=["Alpha"])
+    # Second call with the same title (different casing/whitespace).
+    mark_merged("a/b", 21, "2026-04-21T10:00:00Z", [602], followup_titles=["  alpha  ", "Beta"])
+    rec = get_review("a/b", 21)
+    # Only one Alpha (casefold + whitespace collapse dedupe), Beta added.
+    assert len(rec.followups_filed_titles) == 2
+    assert rec.followups_filed_titles[0] == "Alpha"
+    assert "Beta" in rec.followups_filed_titles
+
+
+def test_review_record_defaults_followups_titles_to_empty_list():
+    """v2 records without the new titles field must round-trip with []."""
+    rec = ReviewRecord(
+        repo="a/b",
+        pr_number=1,
+        verdict="APPROVE",
+        timestamp="2026-04-21T10:00:00Z",
+        url="https://x",
+        body="",
+    )
+    assert rec.followups_filed_titles == []
