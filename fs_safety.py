@@ -281,8 +281,16 @@ def safe_open_in_repo(repo_path: str, rel_path: str) -> Optional[str]:
                 f"final path component is a symlink"
             )
         return None
+    # Pin `encoding="utf-8"` explicitly: `os.fdopen(fd, "r")` would
+    # default to `locale.getpreferredencoding()` which is ASCII on
+    # `LANG=C`. A CHANGELOG with emoji/accented chars would raise
+    # UnicodeDecodeError → caught here as OSError/UnicodeDecodeError →
+    # returns None → caller reads empty → `put_file` overwrites full
+    # release history. Locale-independent utf-8 is the correct default
+    # for every file we read via this path (CHANGELOG.md, VERSION,
+    # pyproject.toml, package.json).
     try:
-        with os.fdopen(fd, "r") as fh:
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
             return fh.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None

@@ -220,8 +220,16 @@ def parse_config(raw: str) -> RepoConfig:
 def load_from_path(path: str) -> RepoConfig:
     if not os.path.exists(path):
         return RepoConfig()
-    with open(path, "r") as fh:
-        raw = fh.read()
+    # Pin utf-8 explicitly: a `.seneschal.yml` with Unicode rule strings
+    # (café ☕, résumé, é, etc.) would otherwise raise UnicodeDecodeError
+    # under `LANG=C` → swallowed below → config silently falls back to
+    # all-defaults (no rules applied). Locale-independent decoding is
+    # the correct posture here.
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return RepoConfig()
     try:
         return parse_config(raw)
     except Exception:

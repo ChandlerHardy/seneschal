@@ -88,6 +88,43 @@ def test_load_from_path_missing_file():
     assert config.rules == []
 
 
+def test_load_from_path_pins_utf8_encoding(tmp_path, monkeypatch):
+    """Round-3 Warning companion to fs_safety: `open(path, "r")` without
+    `encoding=` decodes via `locale.getpreferredencoding()`. On `LANG=C`
+    a `.seneschal.yml` carrying a Unicode rule string would raise
+    UnicodeDecodeError → bare `except Exception` swallows it → config
+    silently falls back to all-defaults (no rules applied).
+
+    Verify the open() call pins `encoding="utf-8"`."""
+    from unittest.mock import patch
+
+    cfg_path = tmp_path / ".seneschal.yml"
+    cfg_path.write_text(
+        'rules:\n  - "Prefer résumé over CV, café ☕ tokens"\n',
+        encoding="utf-8",
+    )
+
+    captured = {}
+    real_open = open
+
+    def _spy_open(path, *args, **kwargs):
+        if str(path).endswith(".seneschal.yml"):
+            captured["encoding"] = kwargs.get("encoding")
+        return real_open(path, *args, **kwargs)
+
+    with patch("builtins.open", side_effect=_spy_open):
+        config = load_from_path(str(cfg_path))
+
+    assert captured.get("encoding") == "utf-8", (
+        "repo_config.load_from_path opened the config without "
+        "encoding='utf-8' — under LANG=C non-ASCII rule strings would "
+        "crash the parse and silently drop all config."
+    )
+    # And the rule loaded correctly.
+    assert len(config.rules) == 1
+    assert "résumé" in config.rules[0]
+
+
 def test_load_from_repo_finds_yml():
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, ".ch-code-reviewer.yml"), "w") as fh:
