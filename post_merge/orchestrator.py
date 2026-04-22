@@ -311,12 +311,15 @@ def _commit_changelog_direct(
     branch: str,
     message: str,
     token: str,
-) -> bool:
-    """Attempt a direct push to `branch`. Returns True on success.
+) -> None:
+    """Attempt a direct push to `branch`. Returns None on success.
 
-    Raises PushProtectedError on 403 so the caller can switch to auto-PR
-    mode. Other failures bubble up as exceptions to be caught by the
-    outer orchestrator.
+    Success is signaled by returning without raising. The previous
+    `return True` was load-bearing nowhere (callers only inspected
+    raised exceptions), so the bool was a type-lie. Failure modes:
+      - `PushProtectedError` on 403 → caller switches to auto-PR mode.
+      - `RuntimeError` on 409-retry-exhaustion → caller dead-letters.
+      - any other Exception → bubbles to the outer orchestrator.
     """
     sha = app.get_file_sha(owner, repo, path, branch, token)
     app.put_file(
@@ -329,7 +332,6 @@ def _commit_changelog_direct(
         sha=sha,
         token=token,
     )
-    return True
 
 
 def _commit_changelog_via_pr(
@@ -972,15 +974,15 @@ def _commits_signal_breaking(commits: List[dict]) -> bool:
     """Scan PR commit objects for a Conventional Commits breaking marker.
 
     GitHub's list-commits endpoint returns objects of the shape
-    `{"commit": {"message": "..."}, ...}`. Scans both the title and body
-    of each message for `BREAKING CHANGE:` / `BREAKING-CHANGE:`.
+    `{"commit": {"message": "..."}, ...}`. Each full message (title +
+    body) is handed to `changelog_mod.is_breaking_title`, which checks
+    both the `!` marker in the first line AND the line-anchored
+    `BREAKING CHANGE:` footer in the body.
 
-    Uses a line-anchored match (`^\\s*BREAKING[\\s-]CHANGE\\s*:`) so a
-    commit whose body merely mentions the phrase (e.g. `fix: restore
-    parser for BREAKING CHANGE footers in tests`) doesn't falsely force
-    a major bump. The footer form proper — at the start of its own
-    line, with a trailing colon — is what Conventional Commits
-    requires for the breaking signal.
+    Previously this function ran its own inline regex after the helper
+    call — redundant, since `is_breaking_title` already checks the
+    same line-anchored pattern. Unified via the helper so the breaking
+    detection rules live in one place (`changelog.py`).
     """
     for c in commits:
         if not isinstance(c, dict):
@@ -988,8 +990,6 @@ def _commits_signal_breaking(commits: List[dict]) -> bool:
         commit = c.get("commit") or {}
         msg = commit.get("message") or ""
         if changelog_mod.is_breaking_title(msg):
-            return True
-        if re.search(r"(?m)^\s*BREAKING[\s-]CHANGE\s*:", msg, re.IGNORECASE):
             return True
     return False
 

@@ -137,8 +137,7 @@ def is_breaking_title(title: str) -> bool:
 def strip_conventional_prefix(title: str) -> str:
     """Drop the `feat: ` / `fix(scope)!: ` style prefix from a title.
 
-    Public alias for the old private `_strip_prefix`. Exists so the
-    orchestrator doesn't have to reach into a private helper.
+    The orchestrator calls this directly — no private alias.
     """
     if not title:
         return ""
@@ -149,10 +148,6 @@ def strip_conventional_prefix(title: str) -> str:
     if type_ not in CONVENTIONAL_TYPES:
         return title.strip()
     return m.group("rest").strip() or title.strip()
-
-
-# Back-compat alias — existing callers still import `_strip_prefix`.
-_strip_prefix = strip_conventional_prefix
 
 
 def format_unreleased_entry(pr_number: int, title: str, url: str, breaking: bool = False) -> str:

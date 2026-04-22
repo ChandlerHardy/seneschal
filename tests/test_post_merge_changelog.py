@@ -255,7 +255,7 @@ def test_non_breaking_title_returns_false():
 
 
 def test_strip_conventional_prefix_public_alias():
-    # The public alias for `_strip_prefix` — orchestrator uses this form now.
+    # Public helper used by the orchestrator directly.
     assert strip_conventional_prefix("feat: add thing") == "add thing"
     assert strip_conventional_prefix("fix(scope)!: do thing") == "do thing"
     assert strip_conventional_prefix("no prefix") == "no prefix"
