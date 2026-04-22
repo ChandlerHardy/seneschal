@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/cover-image.png" alt="Seneschal — reviews with diligence, guides with wisdom, serves the greater work" width="640">
+</p>
+
 # Seneschal
 
 **A self-hosted AI code reviewer that sees more than the diff.**
