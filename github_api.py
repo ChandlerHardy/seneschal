@@ -31,7 +31,13 @@ from risk import PRFile
 
 
 # Config
-APP_ID = 3127694
+# `APP_ID` used to be duplicated here + in `seneschal_token` via a
+# bi-directional deferred import. Round-3 consolidation: the source of
+# truth lives in `seneschal_token.APP_ID`. Every consumer that needs the
+# value imports it from there. This module still re-exports the name
+# for backward-compat with `app.py`'s existing `from github_api import
+# APP_ID` until the next wave can churn the import site.
+from seneschal_token import APP_ID  # noqa: E402 — re-export for app.py compat
 INSTALL_DIR = os.path.expanduser("~/seneschal")
 PEM_PATH = os.path.join(INSTALL_DIR, "ch-code-reviewer.pem")
 

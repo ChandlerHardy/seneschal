@@ -202,6 +202,39 @@ def test_app_id_ignores_bad_env_value(monkeypatch):
     assert seneschal_token._get_app_id() == seneschal_token._DEFAULT_APP_ID
 
 
+def test_seneschal_token_import_does_not_pull_github_api():
+    """Round-3 warning #9: `seneschal_token._get_app_id` used to pull
+    `APP_ID` from `github_api` via a deferred import, and `github_api`
+    imported `seneschal_token._generate_jwt` — bi-directional coupling
+    on every token mint. After consolidating `APP_ID` onto
+    `seneschal_token` as the single source of truth, importing
+    seneschal_token in isolation must NOT drag github_api (and Flask's
+    transitive chain) into the process. This pins the invariant so a
+    future regression is caught at test time."""
+    import importlib
+    import subprocess
+    # Use a subprocess so this test's own `import github_api` side-effects
+    # (from other tests run in the same session) don't leak into the
+    # assertion. A fresh interpreter is the only clean measurement.
+    script = (
+        "import sys; import seneschal_token;\n"
+        "flask = [m for m in sys.modules if 'flask' in m.lower()];\n"
+        "github_loaded = 'github_api' in sys.modules;\n"
+        "assert not flask, f'flask leaked: {flask}';\n"
+        "assert not github_loaded, 'github_api leaked; bi-directional import re-introduced'\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+    assert proc.returncode == 0, (
+        f"isolated seneschal_token import re-introduced a heavy dependency\n"
+        f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+    )
+
+
 # --------------------------------------------------------------------------
 # CLI main — exit-code mapping for each exception.
 # --------------------------------------------------------------------------
