@@ -40,7 +40,7 @@ for f in app.py analyzer.py risk.py scope.py diff_parser.py test_gaps.py \
          related_prs.py repo_config.py review_memory.py context_loader.py \
          findings.py summary.py title_check.py breaking_changes.py \
          quality_scan.py secrets_scan.py full_review.py seneschal_token.py \
-         backend.py \
+         backend.py github_api.py fs_safety.py \
          __init__.py requirements.txt; do
   scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
 done

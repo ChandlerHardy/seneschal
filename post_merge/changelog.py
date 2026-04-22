@@ -86,10 +86,24 @@ _PREFIX_RE = re.compile(
 #
 # (?m) = re.MULTILINE so `^` anchors to each line beginning.
 # Accept ws/hyphen, case-insensitive, require `:` after CHANGE.
-_BREAKING_TEXT_RE = re.compile(
+BREAKING_RE = re.compile(
     r"(?m)^\s*BREAKING[\s-]CHANGE\s*:",
     re.IGNORECASE,
 )
+# Backward-compat alias: previously this was the only name.
+_BREAKING_TEXT_RE = BREAKING_RE
+
+
+def normalize_newlines(text: str) -> str:
+    """CRLF → LF + lone CR → LF for line-anchored regex work.
+
+    Shared between `insert_unreleased_entry` (below), the orchestrator's
+    changelog-compare short-circuit, and the release-PR amend path so
+    all three use one canonical newline-normalization rule. A Windows-
+    origin CHANGELOG (CRLF) would otherwise make `insert_unreleased_entry`
+    always emit a diff even when no entry actually changed.
+    """
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def classify_prefix(title: str) -> Optional[str]:
@@ -215,7 +229,7 @@ def insert_unreleased_entry(
     """
     # Normalize CRLF -> LF so line-anchored regexes (`^## `, `^### `)
     # match regardless of the input file's line endings.
-    existing_changelog = (existing_changelog or "").replace("\r\n", "\n").replace("\r", "\n")
+    existing_changelog = normalize_newlines(existing_changelog)
     text = _ensure_header(existing_changelog)
     subsection = "Removed" if breaking else _sub_for_kind(kind)
 

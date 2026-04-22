@@ -29,7 +29,7 @@ import app  # noqa: E402 — late binding so tests can patch `log`/`ensure_repo_
 import fs_safety  # noqa: E402 — path-safety primitives (safe_open_in_repo, etc.)
 import github_api  # noqa: E402 — GitHub REST helpers live here post-refactor
 import review_store  # noqa: E402
-from fs_safety import safe_open_in_repo  # noqa: E402
+from fs_safety import now_iso, safe_open_in_repo  # noqa: E402
 from github_api import PushProtectedError  # noqa: E402 — direct import, no re-export
 from post_merge import changelog as changelog_mod  # noqa: E402
 from post_merge import followups as followups_mod  # noqa: E402
@@ -73,10 +73,6 @@ def _is_protected(repo_slug: str) -> bool:
 def _mark_protected(repo_slug: str, protected: bool) -> None:
     """Record `repo_slug`'s protection state with a fresh timestamp."""
     _PROTECTED_REPOS[repo_slug] = (time.monotonic(), bool(protected))
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _read_local_changelog(repo_path: str, changelog_path: str) -> str:
@@ -396,7 +392,7 @@ def _changelog_step(
     # carry CRLF from a Windows-origin file) would always be unequal and
     # trigger a spurious rewrite commit on every merge. Normalize the
     # RHS before compare so we correctly detect the no-op case.
-    existing_normalized = (existing or "").replace("\r\n", "\n").replace("\r", "\n")
+    existing_normalized = changelog_mod.normalize_newlines(existing)
     if new_content == existing_normalized:
         # Nothing changed — skip the push.
         return (False, None)
@@ -796,7 +792,7 @@ def _amend_release_pr(
     # this helper grows another callsite someday, this defends against
     # accidentally writing CRLF back on a LF branch and producing a
     # diff that's 100% line-ending noise.
-    content_to_write = (changelog_content or "").replace("\r\n", "\n").replace("\r", "\n")
+    content_to_write = changelog_mod.normalize_newlines(changelog_content)
     try:
         fresh_content, _base_sha = github_api.get_file_content(
             owner, repo, changelog_path, release_base_branch, token,
@@ -804,7 +800,7 @@ def _amend_release_pr(
         if fresh_content:
             # Same CRLF normalization on fresh content — keeps the
             # release-branch commit diff free of line-ending churn.
-            content_to_write = fresh_content.replace("\r\n", "\n").replace("\r", "\n")
+            content_to_write = changelog_mod.normalize_newlines(fresh_content)
             fresh_fetch_ok = True
         else:
             # Empty body / 404 → fall back to snapshot.
@@ -965,7 +961,7 @@ def handle_pr_merged(
         # followup numbers + titles). Always do this when there's a stored
         # review, even if no followups fired this round — gives P2's index
         # a stable `merged_at` field.
-        merged_at = pr_meta.get("merged_at") or _now_iso()
+        merged_at = pr_meta.get("merged_at") or now_iso()
         try:
             review_store.mark_merged(
                 f"{owner}/{repo}",

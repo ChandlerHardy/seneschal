@@ -23,7 +23,23 @@ import errno
 import os
 import re
 import stat
+from datetime import datetime, timezone
 from typing import Optional
+
+
+# --------------------------------------------------------------------------
+# Shared utility helpers
+# --------------------------------------------------------------------------
+
+
+def now_iso() -> str:
+    """Return the current UTC time as an ISO-8601 Z-suffix string.
+
+    Shared between review_store (frontmatter `timestamp` / `merged_at`)
+    and post_merge.orchestrator (merge timestamps) so both paths produce
+    byte-identical stamps.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # --------------------------------------------------------------------------

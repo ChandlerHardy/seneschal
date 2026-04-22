@@ -20,11 +20,10 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
-from fs_safety import REPO_SLUG_RE, validate_repo_slug
+from fs_safety import REPO_SLUG_RE, now_iso, validate_repo_slug
 
 # Root of the per-review markdown files. Override via env for tests.
 STORE_ROOT = os.environ.get(
@@ -38,9 +37,10 @@ _FRONTMATTER_RE = re.compile(
 )
 
 # Backward-compat aliases: callers and tests import these private names.
-# `fs_safety` is the canonical home for the regex + validator.
+# `fs_safety` is the canonical home for the regex + validator + now_iso.
 _REPO_SLUG_RE = REPO_SLUG_RE
 _validate_repo_slug = validate_repo_slug
+_now_iso = now_iso
 
 
 @dataclass(frozen=True)
@@ -121,10 +121,6 @@ def _atomic_write(path: Path, content: str) -> None:
 def _repo_dir(repo_slug: str) -> Path:
     _validate_repo_slug(repo_slug)
     return Path(STORE_ROOT) / repo_slug
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def save_review(

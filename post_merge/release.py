@@ -8,18 +8,16 @@ from __future__ import annotations
 import re
 from typing import List
 
+from post_merge.changelog import BREAKING_RE
+
 # Match `1.2.3` or `v1.2.3`; capture the optional `v` prefix so we can
 # preserve it in the bumped string.
 _SEMVER_RE = re.compile(r"^(?P<v>v?)(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
 
-# Must be `BREAKING CHANGE:` / `BREAKING-CHANGE:` at the start of a line
-# (per Conventional Commits footer form). The unanchored previous matcher
-# fired on any title containing the phrase — so `fix: restore BREAKING
-# CHANGE regression-test parser` would force a major bump.
-_BREAKING_LINE_RE = re.compile(
-    r"(?m)^\s*BREAKING[\s-]CHANGE\s*:",
-    re.IGNORECASE,
-)
+# BREAKING CHANGE: line-anchored matcher. Shared with `changelog.BREAKING_RE`
+# so the breaking-detection rule lives in one place. The alias is kept for
+# backward-compat with callers that imported the underscore-private name.
+_BREAKING_LINE_RE = BREAKING_RE
 # `**BREAKING**:` marker that `changelog.format_unreleased_entry` emits
 # when the source PR was marked breaking. Survives prefix stripping so
 # major-bump detection isn't lost when the `!` gets dropped.
