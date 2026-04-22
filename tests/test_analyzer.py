@@ -452,6 +452,58 @@ def test_analyze_pr_head_ref_kwarg_optional():
     assert len(branch_findings) == 0
 
 
+def test_build_findings_standards_is_required():
+    """Fix J: build_findings should not fall back to a default StandardsConfig.
+
+    Callers always pass `config.standards`; the Optional[] sentinel was
+    dead code.
+    """
+    import inspect
+    from analyzer import build_findings
+    sig = inspect.signature(build_findings)
+    # standards parameter should have no default (or a non-None default
+    # representing "required caller input"). The point is removing the
+    # silent `None -> StandardsConfig()` fallback.
+    std_param = sig.parameters["standards"]
+    assert std_param.annotation is not type(None)
+    # Cannot be Optional[StandardsConfig] — the whole point of fix J.
+    import typing
+    ann_str = str(std_param.annotation)
+    assert "Optional" not in ann_str, (
+        f"build_findings(standards=...) should no longer accept None; "
+        f"annotation={ann_str!r}"
+    )
+
+
+def test_resolve_severity_logs_fallback_on_invalid_label(capsys):
+    """Fix O: invalid severity label should log to stderr before falling back."""
+    from analyzer import _resolve_severity
+    from findings import Severity
+    result = _resolve_severity("definitely-not-a-severity", Severity.WARNING)
+    assert result == Severity.WARNING
+    captured = capsys.readouterr()
+    assert "[seneschal]" in captured.err
+    assert "definitely-not-a-severity" in captured.err
+
+
+def test_resolve_severity_no_log_on_valid_label(capsys):
+    from analyzer import _resolve_severity
+    from findings import Severity
+    result = _resolve_severity("blocker", Severity.WARNING)
+    assert result == Severity.BLOCKER
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_resolve_severity_no_log_on_none_override(capsys):
+    from analyzer import _resolve_severity
+    from findings import Severity
+    result = _resolve_severity(None, Severity.NIT)
+    assert result == Severity.NIT
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
 def test_severity_override_license_upgrade_to_blocker():
     from repo_config import StandardsConfig
     from findings import Severity

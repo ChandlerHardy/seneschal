@@ -357,11 +357,25 @@ _SEVERITY_LABEL_MAP = {
 def _resolve_severity(override: Optional[str], default: Severity) -> Severity:
     """Translate an optional `.seneschal.yml` severity label to a Severity.
 
-    None / unrecognized value → use the default.
+    None  → use the default (silent — label wasn't configured).
+    Unknown label → use the default AND log to stderr (fix O): configs
+    should have been rejected at parse time, so reaching this branch
+    means either a bypass or a skew between the parser's accepted-set
+    and this map.
     """
     if override is None:
         return default
-    return _SEVERITY_LABEL_MAP.get(override, default)
+    if override in _SEVERITY_LABEL_MAP:
+        return _SEVERITY_LABEL_MAP[override]
+    # Mirror repo_config.py's stderr pattern — analyzer is imported by
+    # contexts (MCP server) that don't wire `app.log`.
+    import sys as _sys
+    print(
+        f"[seneschal] unknown severity label {override!r}; "
+        f"falling back to default {default.label}",
+        file=_sys.stderr,
+    )
+    return default
 
 
 def _license_to_findings(
@@ -431,6 +445,7 @@ def build_findings(
     gaps: Sequence[TestGap],
     related: Sequence[RelatedPR],
     title_report: TitleReport,
+    standards: StandardsConfig,
     breaking: Sequence[BreakingChange] = (),
     secrets: Sequence[SecretHit] = (),
     quality: Sequence[QualityHit] = (),
@@ -438,8 +453,13 @@ def build_findings(
     convention_violation: Optional[ConventionViolation] = None,
     branch_violation: Optional[BranchNameViolation] = None,
     suppress_soft_title: bool = False,
-    standards: Optional[StandardsConfig] = None,
 ) -> FindingSet:
+    """Compose a FindingSet from raw analysis outputs.
+
+    `standards` is a required positional-or-keyword parameter — callers
+    always supply `config.standards` (itself a default-factory), so the
+    previous `Optional[StandardsConfig]` sentinel was dead code.
+    """
     fs = FindingSet()
     # Secrets go first so they can never be buried.
     fs.extend(_secrets_to_findings(secrets))
@@ -467,16 +487,15 @@ def build_findings(
 
     # Standards enforcement (P3). Each block is independent and gated on
     # its own presence check — absent standards config = no new findings.
-    std = standards or StandardsConfig()
-    license_sev = _resolve_severity(std.license_severity, Severity.WARNING)
+    license_sev = _resolve_severity(standards.license_severity, Severity.WARNING)
     fs.extend(_license_to_findings(license_violations, severity=license_sev))
 
-    convention_sev = _resolve_severity(std.commit_convention_severity, Severity.WARNING)
+    convention_sev = _resolve_severity(standards.commit_convention_severity, Severity.WARNING)
     convention_f = _convention_to_finding(convention_violation, severity=convention_sev)
     if convention_f:
         fs.add(convention_f)
 
-    branch_sev = _resolve_severity(std.branch_name_severity, Severity.NIT)
+    branch_sev = _resolve_severity(standards.branch_name_severity, Severity.NIT)
     branch_f = _branch_name_to_finding(branch_violation, severity=branch_sev)
     if branch_f:
         fs.add(branch_f)
@@ -552,14 +571,14 @@ def analyze_pr(
         gaps,
         related,
         title_report,
-        breaking,
-        secrets,
-        quality,
+        config.standards,
+        breaking=breaking,
+        secrets=secrets,
+        quality=quality,
         license_violations=license_violations,
         convention_violation=convention_violation,
         branch_violation=branch_violation,
         suppress_soft_title=suppress_soft_title,
-        standards=config.standards,
     )
 
     # ADR relevance scoring — only runs if caller supplied ADRs.
