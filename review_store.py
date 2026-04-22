@@ -162,9 +162,15 @@ def save_review(
         meta["head_sha"] = str(head_sha)
     if merged_at:
         meta["merged_at"] = str(merged_at)
-    if followups_filed:
+    # Distinguish `None` (caller doesn't want to touch this field —
+    # omit the key) from `[]` (caller explicitly wants no followups —
+    # persist an empty list). The previous falsy guard collapsed both
+    # cases, so a retry that wanted to clear a prior `[101]` record via
+    # `save_review(followups_filed=[])` silently dropped the empty
+    # assignment. Same for followups_filed_titles.
+    if followups_filed is not None:
         meta["followups_filed"] = sorted({int(n) for n in followups_filed})
-    if followups_filed_titles:
+    if followups_filed_titles is not None:
         # Deduplicate by the normalized (whitespace-collapsed, casefolded)
         # key but keep the original string for human-readable frontmatter.
         seen: set = set()
@@ -174,8 +180,7 @@ def save_review(
             if key and key not in seen:
                 seen.add(key)
                 titles_out.append(str(t))
-        if titles_out:
-            meta["followups_filed_titles"] = titles_out
+        meta["followups_filed_titles"] = titles_out
 
     frontmatter = json.dumps(meta, indent=2)
     content = f"---\n{frontmatter}\n---\n{body or ''}"

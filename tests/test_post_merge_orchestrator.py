@@ -1501,3 +1501,265 @@ def test_amend_release_pr_empty_fetch_is_not_stale_tag():
     )
     # Snapshot (caller-provided) is what lands because fetch had nothing.
     assert call.kwargs["content"] == snapshot
+
+
+# --------------------------------------------------------------------------
+# Round 4: followups loop must BREAK on rate-limit (429), not continue.
+# W6 fixed the "single 5xx aborts the whole loop" regression by changing
+# `break` → `continue`, but that overcorrected for 429: hammering 9 more
+# create_issue calls after the first rate-limit response amplifies the
+# pressure that triggered it. Rate-limit is the one exception class
+# where break is the right answer.
+# --------------------------------------------------------------------------
+
+
+def test_followups_break_on_rate_limit_response(tmp_path, monkeypatch):
+    """If create_issue returns a 429 (rate limit), the loop MUST break —
+    continuing to hammer 9 more requests after the first rate-limit
+    response amplifies the pressure that triggered it. Other exception
+    classes still get `continue` per W6."""
+    import requests
+
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review(
+        "o/r",
+        60,
+        "APPROVE",
+        "https://x/60",
+        "## Review\n\n"
+        "- [FOLLOWUP] alpha\n"
+        "- [FOLLOWUP] beta\n"
+        "- [FOLLOWUP] gamma\n"
+        "- [FOLLOWUP] delta\n",
+    )
+
+    cfg = _config(followups=True)
+
+    # Build a real-looking HTTPError with response.status_code=429.
+    def _make_429_error():
+        resp = requests.Response()
+        resp.status_code = 429
+        err = requests.HTTPError("HTTP 429: rate limited", response=resp)
+        return err
+
+    def _flaky_create(**kwargs):
+        raise _make_429_error()
+
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
+        mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
+        (tmp_path / "clone").mkdir(exist_ok=True)
+        mock_gh.create_issue = MagicMock(side_effect=_flaky_create)
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=60,
+            installation_id=1,
+            pr_meta=_pr_meta(60, "feat: x"),
+            config=cfg,
+        )
+
+    # MUST break after the first 429 — exactly 1 call, NOT 4.
+    assert mock_gh.create_issue.call_count == 1, (
+        f"Round 4 regression: rate-limit (429) did not break the loop. "
+        f"Got {mock_gh.create_issue.call_count} create_issue calls "
+        "(expected 1). Continuing past 429 amplifies the pressure that "
+        "triggered the limit."
+    )
+
+
+def test_followups_break_on_rate_limit_message_substring(tmp_path, monkeypatch):
+    """For HTTP errors that don't carry a typed status_code (e.g. mock
+    objects in tests, or a wrapped runtime error), fall back to a
+    substring check on the message: 'rate limit' / '429' should also
+    trigger break.
+    """
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review(
+        "o/r",
+        61,
+        "APPROVE",
+        "https://x/61",
+        "## Review\n\n"
+        "- [FOLLOWUP] one\n"
+        "- [FOLLOWUP] two\n"
+        "- [FOLLOWUP] three\n",
+    )
+
+    cfg = _config(followups=True)
+
+    def _flaky_create(**kwargs):
+        raise RuntimeError("HTTP 429: rate limit exceeded")
+
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
+        mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
+        (tmp_path / "clone").mkdir(exist_ok=True)
+        mock_gh.create_issue = MagicMock(side_effect=_flaky_create)
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=61,
+            installation_id=1,
+            pr_meta=_pr_meta(61),
+            config=cfg,
+        )
+
+    assert mock_gh.create_issue.call_count == 1, (
+        "Rate-limit substring in error message did not break the loop."
+    )
+
+
+# --------------------------------------------------------------------------
+# Round 4: per-issue durability for followups.
+#
+# Previous behavior: orchestrator collected (numbers, titles) across all
+# create_issue calls, then called mark_merged ONCE at the end. If
+# mark_merged raised (disk full, permissions, atomic-rename failure
+# after 3 successful issue creations), all 3 successes were lost from
+# the persistent record — a re-fire would re-create them as duplicates.
+#
+# Fix: persist after each successful create_issue. Trade is more disk
+# writes (up to N per merged PR), but it survives any single failure
+# in either direction (issue-creation OR persistence).
+# --------------------------------------------------------------------------
+
+
+def test_followups_persist_each_issue_individually(tmp_path, monkeypatch):
+    """If mark_merged fails on the final batched call, the previously-
+    created issues must still be persisted in the record —
+    otherwise a retry re-creates duplicates.
+
+    Simulate: 3 issues succeed, then the FINAL (batched) mark_merged
+    call raises. Per-issue mark_merged calls during the loop persist
+    each title individually, so the record carries titles for issues
+    1-3 even when the trailing batched call fails.
+    """
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review(
+        "o/r",
+        70,
+        "APPROVE",
+        "https://x/70",
+        "## Review\n\n"
+        "- [FOLLOWUP] first\n"
+        "- [FOLLOWUP] second\n"
+        "- [FOLLOWUP] third\n",
+    )
+
+    cfg = _config(followups=True)
+
+    real_mark_merged = review_store.mark_merged
+
+    def _flaky_mark_merged(repo_slug, pr_number, merged_at, followups, **kw):
+        # Allow per-issue marks (single-element followups) to succeed.
+        # Fail only on the outer batched call (3 elements).
+        if len(followups) >= 3:
+            raise OSError("disk full")
+        return real_mark_merged(repo_slug, pr_number, merged_at, followups, **kw)
+
+    monkeypatch.setattr(review_store, "mark_merged", _flaky_mark_merged)
+
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
+        mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
+        (tmp_path / "clone").mkdir(exist_ok=True)
+        mock_gh.create_issue = MagicMock(side_effect=[
+            {"number": 801},
+            {"number": 802},
+            {"number": 803},
+        ])
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=70,
+            installation_id=1,
+            pr_meta=_pr_meta(70),
+            config=cfg,
+        )
+
+    rec = review_store.get_review("o/r", 70)
+    assert rec is not None, "review record vanished entirely"
+    # Per-issue persistence means titles landed during the loop even
+    # though the final batched mark_merged raised. The regression
+    # would leave titles empty.
+    assert len(rec.followups_filed_titles) >= 1, (
+        "Round 4 regression: per-issue persistence didn't fire — a "
+        "re-fire would re-create followups as duplicates."
+    )
+    assert len(rec.followups_filed) >= 1
+
+
+# --------------------------------------------------------------------------
+# Round 4: review_store.save_review must accept empty list `[]` as a
+# legitimate value, not silently drop it via `if followups_filed:`.
+#
+# Scenario: mark_merged persists `[101]`. A retry calls
+# `save_review(followups_filed=[])` to roll back / clear. The falsy
+# guard `if followups_filed:` skipped writing the empty list, so the
+# record still carried `[101]` — the rollback was lost.
+# --------------------------------------------------------------------------
+
+
+def test_save_review_persists_explicit_empty_followups_list(tmp_path, monkeypatch):
+    """`save_review(followups_filed=[])` must persist the empty list as
+    a present-but-empty field, not silently omit the key. The previous
+    falsy guard `if followups_filed:` treated `[]` the same as `None`
+    (skip), making it impossible for a caller to distinguish 'I want
+    no followups' from 'I'm not touching this field'.
+
+    The semantic distinction matters when save_review grows future
+    callsites that read-modify-write (today it overwrites whole files,
+    so the on-disk effect is the same — but the in-memory contract
+    `[] != None` should match the on-disk contract).
+    """
+    import review_store as rs
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    rs.save_review(
+        "a/b",
+        100,
+        "APPROVE",
+        "https://x/100",
+        "body",
+        followups_filed=[],
+        followups_filed_titles=[],
+    )
+    raw = (tmp_path / "a" / "b" / "100.md").read_text()
+    # Explicit empty list must land as `"followups_filed": []` in the
+    # frontmatter. The regression silently dropped the key.
+    assert '"followups_filed": []' in raw, (
+        "save_review(followups_filed=[]) silently omitted the key. The "
+        "falsy guard `if followups_filed:` must be `is not None` so "
+        "callers can express 'explicitly empty' distinctly from `None`."
+    )
+    assert '"followups_filed_titles": []' in raw, (
+        "Same issue for followups_filed_titles — empty list dropped."
+    )
+
+    # And the round-trip still produces an empty list.
+    rec = rs.get_review("a/b", 100)
+    assert rec.followups_filed == []
+    assert rec.followups_filed_titles == []
+
+
+def test_save_review_treats_none_as_skip(tmp_path, monkeypatch):
+    """Sanity: `None` (the default) still means 'omit the key' —
+    distinct from `[]` (explicit empty). Pre-existing v2 records
+    saved without these kwargs land on disk without the keys."""
+    import review_store as rs
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    rs.save_review("a/b", 200, "APPROVE", "", "body")
+    rec = rs.get_review("a/b", 200)
+    assert rec.followups_filed == []
+    raw = (tmp_path / "a" / "b" / "200.md").read_text()
+    assert "followups_filed" not in raw, (
+        "None should mean 'omit the key' — got the key in the file."
+    )

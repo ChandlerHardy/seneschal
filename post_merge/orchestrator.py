@@ -442,6 +442,37 @@ def _title_key(title: str) -> str:
     return " ".join((title or "").split()).casefold()
 
 
+def _is_rate_limit_error(err: Exception) -> bool:
+    """Return True if `err` looks like a GitHub 429 rate-limit response.
+
+    Two recognition paths:
+      - `requests.HTTPError` with `response.status_code == 429` (the
+        typed signal when the error came from `session.raise_for_status()`
+        in `github_api`)
+      - message substring match on "rate limit" / "429" — defends against
+        wrapped errors that lost the response object en route (e.g. an
+        adapter re-raising as RuntimeError with the status in the text)
+
+    W6 + Round 4 contract: other exception classes get `continue` so
+    one transient 500 doesn't abort the loop, but 429 is special —
+    continuing hammers 9 more requests that are GUARANTEED to fail
+    and amplifies the pressure that triggered the limit.
+    """
+    try:
+        import requests  # deferred — keeps fs_safety-style import ordering
+    except ImportError:
+        requests = None  # type: ignore
+
+    if requests is not None and isinstance(err, requests.HTTPError):
+        resp = getattr(err, "response", None)
+        if resp is not None and getattr(resp, "status_code", None) == 429:
+            return True
+    msg = str(err).lower()
+    if "429" in msg or "rate limit" in msg:
+        return True
+    return False
+
+
 def _followups_step(
     owner: str,
     repo: str,
@@ -454,6 +485,15 @@ def _followups_step(
 
     Returns (new_issue_numbers, new_titles) so the caller can persist both
     in the review record for future dedupe.
+
+    Durability model (Round 4): mark_merged is called inline after each
+    successful create_issue so a mid-loop persistence failure (disk
+    full, permissions) doesn't cost the record of issues that already
+    landed on GitHub. The outer caller in `handle_pr_merged` still calls
+    mark_merged one more time with the full batch as a belt-and-braces
+    consolidation, but per-issue persistence is the actual durability
+    guarantee — a future mark_merged failure after 3 successful issues
+    leaves all 3 titles persisted.
     """
     repo_slug = f"{owner}/{repo}"
     review = review_store.get_review(repo_slug, pr_number)
@@ -471,14 +511,19 @@ def _followups_step(
         return ([], [])
     label = config.post_merge.followup_label or "seneschal-followup"
     pr_url = pr_meta.get("html_url") or f"https://github.com/{owner}/{repo}/pull/{pr_number}"
+    merged_at = pr_meta.get("merged_at") or now_iso()
     new_numbers: List[int] = []
     new_titles: List[str] = []
     # W6: previously a single transient create_issue failure (500, rate
     # limit) aborted the whole loop via `break`, so issues N+1..M were
     # never attempted. Partial persistence + title-keyed dedupe in
-    # mark_merged makes retry safe: continue past individual failures,
-    # persist whatever succeeded, and let a future retry (re-delivery
-    # of the webhook, or a manual re-fire) pick up the missing ones.
+    # mark_merged makes retry safe for 5xx: continue past, persist
+    # what succeeded, let a future retry pick up the missing ones.
+    #
+    # Round 4: rate-limit (429) is the ONE exception class where
+    # `break` is the right answer. Continuing hammers 9 more requests
+    # that are guaranteed to fail and amplifies the pressure that
+    # triggered the limit in the first place.
     failures = 0
     for f in needed:
         try:
@@ -495,8 +540,34 @@ def _followups_step(
             if num:
                 new_numbers.append(num)
                 new_titles.append(f.title)
+                # Round 4 per-issue durability: persist IMMEDIATELY
+                # after each successful create_issue. If mark_merged
+                # itself raises (disk full, permissions), log and
+                # continue — the issue landed on GitHub, we just lost
+                # one dedupe record for it. The trailing batched
+                # mark_merged in handle_pr_merged still fires as a
+                # belt-and-braces consolidation.
+                try:
+                    review_store.mark_merged(
+                        repo_slug, pr_number, merged_at,
+                        [num], followup_titles=[f.title],
+                    )
+                except Exception as persist_err:  # noqa: BLE001
+                    app.log(
+                        f"[post_merge] per-issue mark_merged failed for "
+                        f"{repo_slug}#{pr_number} issue #{num}: "
+                        f"{persist_err!r} (issue was created; retry "
+                        f"may re-create as duplicate)"
+                    )
         except Exception as e:  # noqa: BLE001
             failures += 1
+            if _is_rate_limit_error(e):
+                app.log(
+                    f"[post_merge] create_issue hit rate limit on "
+                    f"{repo_slug}#{pr_number} after filing {len(new_numbers)} "
+                    f"issue(s); breaking to avoid amplifying pressure"
+                )
+                break
             app.log(
                 f"[post_merge] create_issue failed on {repo_slug}#{pr_number} "
                 f"for followup {f.title!r}: {e!r} (continuing; will retry "
