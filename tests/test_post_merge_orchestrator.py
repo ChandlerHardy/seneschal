@@ -865,6 +865,117 @@ def test_is_already_exists_error_requires_already_exists_substring():
     ) is False
 
 
+def test_release_pr_body_uses_render_release_notes(tmp_path, monkeypatch):
+    """W8: the release PR body should be built via render_release_notes
+    (structured `## [<version>] - <date>` section) rather than the
+    previous hand-rolled one-liner. The PR description is the easiest
+    place for a reviewer to see what's going into the tagged release,
+    so the structure matters."""
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True, release_threshold="patch")
+    captured_body = {}
+
+    def _capture_create(**kwargs):
+        captured_body["body"] = kwargs.get("body") or ""
+        return {"number": 99}
+
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        # Version discoverable → render_release_notes should fire.
+        (clone_dir / "pyproject.toml").write_text(
+            '[project]\nname = "thing"\nversion = "0.2.3"\n'
+        )
+        (clone_dir / "CHANGELOG.md").write_text(
+            "# Changelog\n\n"
+            "## [Unreleased]\n\n"
+            "### Fixed\n- broken thing ([#40](x))\n"
+        )
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_app.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_app.get_pr_commits = MagicMock(return_value=[])
+        mock_app.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
+        mock_app.create_pull_request = MagicMock(side_effect=_capture_create)
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "fix: tiny"),
+            config=cfg,
+        )
+
+    body = captured_body.get("body", "")
+    # Structured release-notes section is present.
+    assert "Release notes preview" in body
+    # The new version (0.2.3 + patch = 0.2.4) appears in the rendered header.
+    assert "## [0.2.4]" in body
+    # The Unreleased header itself is replaced — don't leak "Unreleased"
+    # inside the release-notes block (the wrapper text can still mention
+    # "## [Unreleased] entries warrant...").
+    # Count the notes-preview section and confirm it doesn't echo the
+    # Unreleased literal header.
+    after_preview = body.split("Release notes preview", 1)[1] if "Release notes preview" in body else ""
+    assert "## [Unreleased]" not in after_preview
+    # The underlying bullet survives.
+    assert "broken thing" in body
+
+
+def test_release_pr_body_falls_back_when_version_unknown(tmp_path, monkeypatch):
+    """If current_version returns None, render_release_notes can't be
+    called (no next_version target). Fall back to a minimal hand-rolled
+    body so the PR still opens."""
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True, release_threshold="patch")
+    captured_body = {}
+
+    def _capture_create(**kwargs):
+        captured_body["body"] = kwargs.get("body") or ""
+        return {"number": 99}
+
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        # No version source.
+        (clone_dir / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- x ([#1](x))\n"
+        )
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_app.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_app.get_pr_commits = MagicMock(return_value=[])
+        mock_app.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
+        mock_app.create_pull_request = MagicMock(side_effect=_capture_create)
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "fix: tiny"),
+            config=cfg,
+        )
+
+    body = captured_body.get("body", "")
+    assert "warrant a `patch` bump" in body
+    # No structured notes preview when version is unknown.
+    assert "Release notes preview" not in body
+
+
 def test_strip_md_images_handles_nested_parens():
     """Minor cleanup: `_IMAGE_MD_RE = r"!\\[.*\\]\\([^)]*\\)"` stops at
     the first `)` so a URL with nested parens `![alt](http://x/a(b).png)`

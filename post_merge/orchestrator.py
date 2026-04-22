@@ -698,6 +698,40 @@ def _release_step(
     # Open a fresh release PR.
     branch = _release_branch_name(repo_path, bump)
     base = config.post_merge.release_base_branch or "main"
+
+    # Build a structured release-notes body via `release.render_release_notes`
+    # instead of the previous hand-rolled string. The Unreleased block from
+    # the changelog gets its header rewritten to `## [<new_version>] - <date>`
+    # and the rest of the subsections (Added / Fixed / etc.) are preserved
+    # verbatim — so the PR description shows exactly what will land in the
+    # tagged release. Falls back to a minimal body if the version is
+    # unknown or `next_version` rejects the current string as non-semver.
+    unreleased_section = m.group(0) if m else ""
+    current_ver = _current_version(repo_path)
+    new_version_for_body: Optional[str] = None
+    if current_ver:
+        try:
+            new_version_for_body = release_mod.next_version(current_ver, bump)
+        except ValueError:
+            new_version_for_body = None
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if new_version_for_body and unreleased_section:
+        release_notes_md = release_mod.render_release_notes(
+            unreleased_section, new_version_for_body, today_iso,
+        )
+        pr_body = (
+            f"Accumulated `## [Unreleased]` entries warrant a `{bump}` bump.\n\n"
+            "## Release notes preview\n\n"
+            f"{release_notes_md}\n\n"
+            "---\n"
+            "Finalize the version + cut the tag when ready."
+        )
+    else:
+        pr_body = (
+            f"Accumulated `## [Unreleased]` entries warrant a `{bump}` bump.\n\n"
+            "Finalize the version + cut the tag when ready."
+        )
+
     try:
         base_sha = app.get_default_branch_sha(owner, repo, base, token)
         app.create_branch(owner, repo, branch, base_sha, token)
@@ -718,7 +752,7 @@ def _release_step(
                 owner=owner,
                 repo=repo,
                 title=f"chore(release): {bump} release prep",
-                body=f"Accumulated `## [Unreleased]` entries warrant a `{bump}` bump.\n\nFinalize the version + cut the tag when ready.",
+                body=pr_body,
                 head=branch,
                 base=base,
                 token=token,
