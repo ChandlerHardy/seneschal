@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from fs_safety import now_iso, validate_repo_slug
+from fs_safety import now_iso, safe_open_in_repo, validate_repo_slug
 
 # Root of the per-review markdown files. Override via env for tests.
 STORE_ROOT = os.environ.get(
@@ -370,16 +370,28 @@ def get_repo_memory(repo_slug: str, repo_root: str) -> str:
     Returns the file contents, or empty string if the file doesn't exist.
     Checks the two canonical filenames: `.seneschal-memory.md` and the
     legacy `.ch-code-reviewer-memory.md`.
+
+    Both reads are routed through `fs_safety.safe_open_in_repo`, which
+    refuses to follow symlinks at any path component and keeps the
+    resolved target confined to the repo tree. A malicious PR that
+    commits `.seneschal-memory.md` as a symlink to `~/seneschal/ch-code-
+    reviewer.pem` returns `""` (same as "file not found") instead of
+    exfiltrating the PEM via the MCP tool.
     """
     validate_repo_slug(repo_slug)
+    if not repo_root:
+        return ""
     for name in (".seneschal-memory.md", ".ch-code-reviewer-memory.md"):
-        p = os.path.join(repo_root, name)
-        if os.path.isfile(p):
-            try:
-                # Pin UTF-8 (BOM-tolerant) so locale doesn't choke on
-                # non-ASCII rules/context in the memory file.
-                with open(p, "r", encoding="utf-8-sig") as fh:
-                    return fh.read()
-            except (OSError, UnicodeDecodeError):
-                return ""
+        # Fast-skip when the file isn't present — `safe_open_in_repo` does
+        # its own existence check but we can avoid the full-walk overhead
+        # when neither canonical file is there.
+        if not os.path.isfile(os.path.join(repo_root, name)):
+            continue
+        text = safe_open_in_repo(repo_root, name)
+        if text is not None:
+            return text
+        # safe_open_in_repo returned None — could be a symlink, traversal,
+        # or decode error. Treat every case as "missing" to match the
+        # documented contract.
+        return ""
     return ""

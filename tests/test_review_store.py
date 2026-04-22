@@ -262,6 +262,43 @@ def test_get_repo_memory_empty_when_missing(tmp_path):
     assert get_repo_memory("a/b", str(tmp_path)) == ""
 
 
+def test_get_repo_memory_refuses_symlink_outside_repo(tmp_path):
+    """Blocker #1: a malicious PR that commits `.seneschal-memory.md`
+    as a symlink pointing OUTSIDE the repo (e.g. at the Seneschal PEM
+    or `/etc/passwd`) must return "" — same contract as missing file —
+    rather than exfiltrating the symlink target through the MCP tool."""
+    # Create a sensitive file outside the repo tree.
+    outside = tmp_path / "outside.secret"
+    outside.write_text("-----BEGIN RSA PRIVATE KEY-----\nSENSITIVE\n-----END RSA PRIVATE KEY-----")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    memory_link = repo_root / ".seneschal-memory.md"
+    os.symlink(str(outside), str(memory_link))
+
+    result = get_repo_memory("a/b", str(repo_root))
+    assert result == "", (
+        "symlink-escape must be treated as missing file; got non-empty body — "
+        "possible symlink traversal!"
+    )
+    assert "SENSITIVE" not in result
+
+
+def test_get_repo_memory_refuses_legacy_symlink_outside_repo(tmp_path):
+    """Same defense for the legacy .ch-code-reviewer-memory.md fallback."""
+    outside = tmp_path / "legacy.secret"
+    outside.write_text("DO NOT LEAK")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    legacy_link = repo_root / ".ch-code-reviewer-memory.md"
+    os.symlink(str(outside), str(legacy_link))
+
+    result = get_repo_memory("a/b", str(repo_root))
+    assert result == ""
+    assert "LEAK" not in result
+
+
 # --------------------------------------------------------------------------
 # Frontmatter v2: head_sha / merged_at / followups_filed (P1)
 # --------------------------------------------------------------------------

@@ -219,3 +219,32 @@ def test_scan_uses_explicit_root(tmp_path, monkeypatch):
     monkeypatch.setenv("SENESCHAL_REPOS_ROOT", "/nonexistent")
     hits = dependency_grep.scan_all("axios", root=str(tmp_path))
     assert len(hits) == 1
+
+
+def test_scan_refuses_symlinked_manifest(tmp_path, monkeypatch):
+    """Blocker #2: a malicious repo that symlinks `package.json` at a
+    host-sensitive file (e.g. the Seneschal PEM, /etc/passwd) must
+    produce zero hits for content inside that symlink target — not
+    exfiltrate bytes of the target via `scan_all`."""
+    # A file outside the repo tree holding a short prefix of a PEM
+    # (same string shape Seneschal's own PEM would expose).
+    sensitive = tmp_path / "outside_sensitive"
+    sensitive.write_text("-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQE...\n")
+
+    repo_dir = tmp_path / "repo-evil"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    (repo_dir / ".git" / "config").write_text(
+        '[remote "origin"]\n\turl = git@github.com:attacker/repo-evil.git\n'
+    )
+    os.symlink(str(sensitive), str(repo_dir / "package.json"))
+    monkeypatch.setenv("SENESCHAL_REPOS_ROOT", str(tmp_path))
+
+    # Caller tries to probe for the PEM prefix that the symlink would
+    # dereference to. With the fix in place the manifest reader refuses
+    # to follow the symlink and returns no hits.
+    hits = dependency_grep.scan_all("-----BEGIN")
+    assert hits == [], (
+        "symlinked manifest leaked bytes from outside the repo — "
+        "possible symlink traversal!"
+    )

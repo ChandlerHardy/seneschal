@@ -190,7 +190,12 @@ def seneschal_review_text(repo: str, pr_number: int) -> dict | None:
         return {"error": str(e)}
     if rec is None:
         return None
-    return {"summary": rec.summary(), "body": rec.body}
+    # Redact the body before returning — a reviewer's code block could
+    # embed a real token or the original PR diff could contain one in an
+    # added line. The MCP tool is a new egress channel; snippets in
+    # `search_reviews` are already scrubbed via `_redact_snippet`, and
+    # we apply the same policy to the full body here for consistency.
+    return {"summary": rec.summary(), "body": _redact(rec.body)}
 
 
 @mcp.tool

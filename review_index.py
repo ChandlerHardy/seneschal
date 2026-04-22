@@ -703,13 +703,21 @@ class Index:
         out: List[dict] = []
         for row in rows:
             body = row[5] or ""
+            # `_make_snippet` already runs the snippet through the
+            # secrets-scan redaction pipeline — ADR content comes from
+            # third-party cloned repos (the operator's `~/repos`), so a
+            # leaked key in an ADR body must be scrubbed before it flows
+            # out through this MCP tool. Same contract as search_reviews.
             excerpt = _make_snippet(body, query)
+            # Titles can also carry injection content if a cloned repo's
+            # ADR has a deliberately crafted H1. Redact uniformly.
+            title = _redact_snippet(row[3] or "")
             out.append(
                 {
                     "repo": row[0],
                     "path": row[1],
                     "id": row[2] or "",
-                    "title": row[3] or "",
+                    "title": title,
                     "status": row[4] or "",
                     "excerpt": excerpt,
                 }

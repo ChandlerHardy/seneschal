@@ -206,10 +206,12 @@ def safe_open_in_repo(repo_path: str, rel_path: str) -> Optional[str]:
     Returns the file contents as a string, or None on any safety
     violation or I/O error. Logs a warning when traversal is blocked.
     """
-    # Deferred import to avoid a top-level dependency on app.log (which
-    # lives in app.py and pulls Flask transitively). The safety helpers
-    # need to be importable from the MCP server too.
-    from app import log
+    # Neutral `log.log` lives in a stdlib-only module so the safety
+    # helpers stay importable from the MCP server (which can't pull in
+    # Flask via `app`). Historically this used a deferred `from app
+    # import log`; that broke when the module was imported through the
+    # MCP process before app.py was on the path.
+    from log import log
 
     if not repo_path or not rel_path:
         return None

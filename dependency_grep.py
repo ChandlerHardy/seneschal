@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import cross_repo
+from fs_safety import safe_open_in_repo
 
 
 # Per-repo manifests to probe. Keeping this tuple explicit makes it easy
@@ -69,19 +70,28 @@ def _log(msg: str) -> None:
         pass
 
 
-def _read_manifest(abs_path: str) -> Optional[str]:
-    """Read a manifest file, capped at _MAX_MANIFEST_BYTES."""
+def _read_manifest(repo_path: str, manifest_name: str) -> Optional[str]:
+    """Read a manifest file from `repo_path`, capped at _MAX_MANIFEST_BYTES.
+
+    Routes through `fs_safety.safe_open_in_repo` so a malicious repo that
+    commits `package.json` as a symlink to `~/seneschal/ch-code-reviewer.pem`
+    (or `/etc/passwd`, or any host path) returns None instead of reading
+    the symlink target. Without this guard, a caller asking for a short
+    prefix of the PEM via `seneschal_dependency_usage("-----BEGIN")`
+    would exfiltrate that content through the MCP tool response.
+
+    Size-capped BEFORE content read: we stat the candidate path first so
+    a pathological manifest (generated lockfile, test fixture) doesn't
+    hit the full-file read.
+    """
+    abs_path = os.path.join(repo_path, manifest_name)
     try:
         st = os.stat(abs_path)
     except OSError:
         return None
     if st.st_size > _MAX_MANIFEST_BYTES:
         return None
-    try:
-        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
-            return fh.read()
-    except OSError:
-        return None
+    return safe_open_in_repo(repo_path, manifest_name)
 
 
 def scan_all(
@@ -115,7 +125,7 @@ def scan_all(
             abs_path = os.path.join(kr.path, manifest_name)
             if not os.path.isfile(abs_path):
                 continue
-            text = _read_manifest(abs_path)
+            text = _read_manifest(kr.path, manifest_name)
             if text is None:
                 continue
             for lineno, raw in enumerate(text.splitlines(), start=1):
