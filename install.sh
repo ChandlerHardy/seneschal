@@ -14,8 +14,8 @@
 #   ~/seneschal/webhook-secret.txt       (GitHub App webhook secret, chmod 600)
 #
 # And edit /etc/systemd/system/seneschal.service to set:
+#   Environment=ANTHROPIC_API_KEY=sk-ant-...
 #   Environment=SENESCHAL_TRIGGER_AUTHORS=your-github-username
-#   Environment=SENESCHAL_AUTOFIX_AUTHORS=your-github-username
 
 set -euo pipefail
 
@@ -40,6 +40,7 @@ for f in app.py analyzer.py risk.py scope.py diff_parser.py test_gaps.py \
          related_prs.py repo_config.py review_memory.py context_loader.py \
          findings.py summary.py title_check.py breaking_changes.py \
          quality_scan.py secrets_scan.py full_review.py seneschal_token.py \
+         backend.py \
          __init__.py requirements.txt; do
   scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
 done
@@ -64,7 +65,7 @@ scp "$REPO_DIR/bin/seneschal-post" "${HOST}:~/bin/seneschal-post"
 ssh "$HOST" "chmod +x ~/bin/seneschal-post"
 
 # Smoke-import so we catch missing deps before systemd starts
-ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import diff_parser; import full_review; import seneschal_token' && echo 'seneschal imports: OK'"
+ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token' && echo 'seneschal imports: OK'"
 
 # Install / update the systemd unit
 scp "$REPO_DIR/systemd/seneschal.service" "${HOST}:/tmp/seneschal.service"
