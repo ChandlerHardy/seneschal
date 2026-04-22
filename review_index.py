@@ -376,6 +376,26 @@ class Index:
 
         if not os.path.isdir(store_root):
             return 0
+        # Wrap the sync in an explicit transaction so an insert failure
+        # mid-run doesn't leave reviews + reviews_fts inconsistent. With
+        # isolation_level=None (autocommit) every statement is its own
+        # transaction; `BEGIN IMMEDIATE` forces all subsequent writes to
+        # commit together or not at all. Any exception triggers ROLLBACK.
+        self._con.execute("BEGIN IMMEDIATE;")
+        try:
+            n = self._sync_reviews_inner(store_root)
+            self._con.execute("COMMIT;")
+            return n
+        except Exception:
+            try:
+                self._con.execute("ROLLBACK;")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _sync_reviews_inner(self, store_root: str) -> int:
+        import review_store
+
         cur = self._con.cursor()
         # Build the set of on-disk files first so we can diff against the DB.
         on_disk: dict = {}  # (repo, pr_number) -> (path, mtime)
@@ -488,6 +508,21 @@ class Index:
         import history_context
 
         repos = cross_repo.known_repos()
+        # Same transaction wrapping as _sync_reviews — atomic across all
+        # repos so an I/O failure halfway through doesn't leave half-
+        # indexed state.
+        self._con.execute("BEGIN IMMEDIATE;")
+        try:
+            self._sync_adrs_inner(repos, history_context)
+            self._con.execute("COMMIT;")
+        except Exception:
+            try:
+                self._con.execute("ROLLBACK;")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _sync_adrs_inner(self, repos, history_context) -> None:
         cur = self._con.cursor()
         # Track (repo, path) pairs we see on this pass so we can purge stale rows.
         seen: set = set()

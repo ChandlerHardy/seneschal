@@ -40,7 +40,8 @@ for f in app.py analyzer.py risk.py scope.py diff_parser.py test_gaps.py \
          related_prs.py repo_config.py review_memory.py context_loader.py \
          findings.py summary.py title_check.py breaking_changes.py \
          quality_scan.py secrets_scan.py full_review.py seneschal_token.py \
-         backend.py github_api.py fs_safety.py \
+         backend.py github_api.py fs_safety.py review_store.py \
+         review_index.py cross_repo.py dependency_grep.py \
          __init__.py requirements.txt; do
   scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
 done
@@ -74,8 +75,12 @@ ssh "$HOST" "mkdir -p ~/bin"
 scp "$REPO_DIR/bin/seneschal-post" "${HOST}:~/bin/seneschal-post"
 ssh "$HOST" "chmod +x ~/bin/seneschal-post"
 
-# Smoke-import so we catch missing deps before systemd starts
-ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token; from post_merge import orchestrator' && echo 'seneschal imports: OK'"
+# Smoke-import so we catch missing deps before systemd starts.
+# The review_index / cross_repo / dependency_grep trio is only imported
+# by the MCP server today, but lives in the same ~/seneschal/ dir as the
+# webhook code, so failing imports here catch broken deploys before they
+# surface in Claude Code sessions.
+ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token; import review_index; import cross_repo; import dependency_grep; from post_merge import orchestrator' && echo 'seneschal imports: OK'"
 
 # Install / update the systemd unit
 scp "$REPO_DIR/systemd/seneschal.service" "${HOST}:/tmp/seneschal.service"
