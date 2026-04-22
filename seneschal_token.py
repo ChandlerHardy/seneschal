@@ -51,6 +51,8 @@ from typing import Tuple
 import jwt
 import requests
 
+from fs_safety import validate_repo_slug
+
 
 # Public App ID for the `seneschal-cr` GitHub App. Overridable via env so
 # a fork or test instance can inject its own number without patching code.
@@ -159,12 +161,18 @@ def _installation_token(jwt_token: str, installation_id: int) -> str:
 
 
 def _parse_slug(slug: str) -> Tuple[str, str]:
-    """Validate + split an `owner/repo` slug. Raises ValueError otherwise."""
-    if not slug or "/" not in slug:
-        raise ValueError(f"slug must be in owner/repo form, got {slug!r}")
+    """Validate + split an `owner/repo` slug. Raises ValueError otherwise.
+
+    Delegates to `fs_safety.validate_repo_slug` as the single source of
+    truth for what counts as a safe slug — the earlier bespoke check
+    accepted characters (`?`, `#`, `&`, spaces, newlines) that would
+    then interpolate unescaped into the GitHub API URL at
+    `/repos/{owner}/{repo}/installation`, opening a URL-injection path.
+    """
+    if slug is None:
+        raise ValueError("slug must be in owner/repo form, got None")
+    validate_repo_slug(slug)
     owner, _, repo = slug.partition("/")
-    if not owner or not repo or "/" in repo:
-        raise ValueError(f"slug must be in owner/repo form, got {slug!r}")
     return owner, repo
 
 
@@ -192,13 +200,21 @@ def mint_installation_token(owner_or_slug: str) -> str:
       TokenMintError: any other failure (PEM missing, network error, 500
         from GitHub, etc.).
     """
+    # Validate the slug FIRST — before the PAT short-circuit — so a
+    # malformed slug can never reach the downstream GitHub API call,
+    # whether we're minting via App JWT or handing back a PAT. Previously
+    # the PAT path returned the token before any validation ran, so a
+    # caller with `SENESCHAL_GITHUB_TOKEN` set and any arbitrary string
+    # (including URL-injection payloads) got back a valid token and the
+    # caller's downstream code could then interpolate that untrusted
+    # slug into a request URL.
+    owner, repo = _parse_slug(owner_or_slug)
+    slug = f"{owner}/{repo}"
+
     # PAT override — one env var beats the whole App dance.
     pat = os.environ.get("SENESCHAL_GITHUB_TOKEN")
     if pat:
         return pat
-
-    owner, repo = _parse_slug(owner_or_slug)
-    slug = f"{owner}/{repo}"
 
     # Cache hit?
     cached = _CACHE.get(slug)

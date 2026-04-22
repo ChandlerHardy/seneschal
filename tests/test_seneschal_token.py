@@ -147,6 +147,40 @@ def test_mint_rejects_invalid_slug():
         seneschal_token.mint_installation_token("no-slash-in-this-one")
 
 
+def test_mint_rejects_slug_with_url_injection(monkeypatch):
+    """Blocker #3: `_parse_slug`'s bespoke check accepted chars like `?`,
+    `#`, `&`, spaces — those would interpolate unescaped into the
+    GitHub API URL. The slug validator now delegates to
+    `fs_safety.validate_repo_slug`, which matches only [A-Za-z0-9_.\\-]
+    on either side of `/`.
+    """
+    monkeypatch.delenv("SENESCHAL_GITHUB_TOKEN", raising=False)
+    bad_slugs = [
+        "foo/bar?admin=1",       # query-string injection
+        "foo/bar#frag",          # fragment
+        "foo/bar&other=1",       # ampersand
+        "foo /bar",              # whitespace in owner
+        "foo/bar\nX-Evil: 1",    # header-injection attempt
+        "foo/bar/extra",         # traversal
+        "../etc/passwd",         # traversal
+    ]
+    for slug in bad_slugs:
+        with pytest.raises(ValueError):
+            seneschal_token.mint_installation_token(slug)
+
+
+def test_mint_pat_override_still_validates_slug(monkeypatch):
+    """Blocker #3 (PAT-override warning): `SENESCHAL_GITHUB_TOKEN` set
+    used to short-circuit slug validation entirely, so a caller could
+    pass any string and still get a token back. The PAT path now
+    validates first — same contract as the App-JWT path."""
+    monkeypatch.setenv("SENESCHAL_GITHUB_TOKEN", "ghp_fake-pat-for-dev")
+    with pytest.raises(ValueError):
+        seneschal_token.mint_installation_token("foo/bar?admin=1")
+    # Confirm the PAT path still works on a GOOD slug.
+    assert seneschal_token.mint_installation_token("owner/repo") == "ghp_fake-pat-for-dev"
+
+
 # --------------------------------------------------------------------------
 # APP_ID env override.
 # --------------------------------------------------------------------------
