@@ -14,6 +14,7 @@ from review_store import (  # noqa: E402
     get_review,
     last_review,
     list_reviews,
+    mark_merged,
     save_review,
 )
 
@@ -185,3 +186,95 @@ def test_get_repo_memory_prefers_new_name(tmp_path):
 
 def test_get_repo_memory_empty_when_missing(tmp_path):
     assert get_repo_memory("a/b", str(tmp_path)) == ""
+
+
+# --------------------------------------------------------------------------
+# Frontmatter v2: head_sha / merged_at / followups_filed (P1)
+# --------------------------------------------------------------------------
+
+
+def test_save_review_with_head_sha_persists(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review(
+        "a/b",
+        7,
+        "APPROVE",
+        "https://x/7",
+        "body",
+        head_sha="abc123def",
+    )
+    rec = get_review("a/b", 7)
+    assert rec is not None
+    assert rec.head_sha == "abc123def"
+
+
+def test_save_review_default_head_sha_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("a/b", 1, "APPROVE", "", "body")
+    rec = get_review("a/b", 1)
+    assert rec.head_sha == ""
+    assert rec.merged_at is None
+    assert rec.followups_filed == []
+
+
+def test_v1_frontmatter_still_parses(tmp_path, monkeypatch):
+    """A review file without the new v2 fields must still parse with defaults."""
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    d = tmp_path / "a" / "b"
+    d.mkdir(parents=True)
+    # Hand-craft a v1-shaped file (no head_sha / merged_at / followups_filed).
+    (d / "12.md").write_text(
+        '---\n'
+        '{\n'
+        '  "pr_number": 12,\n'
+        '  "verdict": "APPROVE",\n'
+        '  "timestamp": "2026-04-18T12:00:00Z",\n'
+        '  "url": "https://x/12"\n'
+        '}\n'
+        '---\n'
+        'old body'
+    )
+    rec = get_review("a/b", 12)
+    assert rec is not None
+    assert rec.pr_number == 12
+    assert rec.verdict == "APPROVE"
+    assert rec.head_sha == ""
+    assert rec.merged_at is None
+    assert rec.followups_filed == []
+
+
+def test_mark_merged_updates_frontmatter(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("a/b", 5, "APPROVE", "https://x/5", "review body")
+    out = mark_merged("a/b", 5, "2026-04-21T10:00:00Z", [101, 102])
+    assert out is not None
+    assert out.exists()
+    rec = get_review("a/b", 5)
+    assert rec.merged_at == "2026-04-21T10:00:00Z"
+    assert sorted(rec.followups_filed) == [101, 102]
+    # Body preserved.
+    assert "review body" in rec.body
+
+
+def test_mark_merged_dedupes_followup_numbers(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("a/b", 5, "APPROVE", "", "body")
+    mark_merged("a/b", 5, "2026-04-21T10:00:00Z", [101, 102])
+    mark_merged("a/b", 5, "2026-04-21T10:00:00Z", [102, 103])
+    rec = get_review("a/b", 5)
+    assert sorted(rec.followups_filed) == [101, 102, 103]
+
+
+def test_mark_merged_returns_none_for_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    assert mark_merged("a/b", 999, "2026-04-21T10:00:00Z", []) is None
+
+
+def test_mark_merged_preserves_body(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    body = "## Review\n\n- finding 1\n- [FOLLOWUP] do later\n"
+    save_review("a/b", 11, "APPROVE", "", body)
+    mark_merged("a/b", 11, "2026-04-21T10:00:00Z", [501])
+    rec = get_review("a/b", 11)
+    assert "## Review" in rec.body
+    assert "[FOLLOWUP]" in rec.body
