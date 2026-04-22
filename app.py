@@ -131,6 +131,20 @@ def log(msg):
     print(f"{LOG_PREFIX} {msg}", flush=True)
 
 
+# GitHub installation tokens start with `ghs_` (modern) or the older
+# `v1.` form; both appear in the `x-access-token:<token>@github.com` URL
+# pattern that git echoes back in error messages. Redact the whole
+# authority span so neither the token nor the proxy user survives.
+_INSTALLATION_URL_PATTERN = re.compile(
+    r"https://[^@\s]+@github\.com", re.IGNORECASE
+)
+
+
+def _scrub_installation_token(text: str) -> str:
+    """Redact GitHub App installation tokens from log-bound strings."""
+    return _INSTALLATION_URL_PATTERN.sub("https://<redacted>@github.com", text)
+
+
 def get_webhook_secret():
     try:
         return Path(WEBHOOK_SECRET_PATH).read_text().strip()
@@ -518,10 +532,15 @@ def ensure_repo_synced(owner: str, repo: str, head_ref: str, head_sha: str, toke
                     capture_output=True,
                 )
         except subprocess.CalledProcessError as e:
+            # Git error output routinely echoes the full remote URL (which
+            # contains the 1-hour installation token). Scrub before logging
+            # so journalctl readers can't lift the token out of a transient
+            # fetch failure.
             stderr = (e.stderr or b"").decode("utf-8", errors="replace")[:300]
-            log(f"git sync failed for {owner}/{repo}: {e} :: {stderr}")
+            stderr = _scrub_installation_token(stderr)
+            log(f"git sync failed for {owner}/{repo}: {type(e).__name__} :: {stderr}")
         except subprocess.TimeoutExpired as e:
-            log(f"git sync timed out for {owner}/{repo}: {e}")
+            log(f"git sync timed out for {owner}/{repo}: {type(e).__name__}")
         finally:
             # Scrub the token out of the remote URL so it isn't sitting on disk
             # for the next caller to inadvertently leak. Runs even on fetch/
@@ -639,7 +658,6 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
             try:
                 result = run_full_review(
                     pr_number=pr_number,
-                    repo_path=repo_path,
                     personas=personas,
                     pr_meta=meta,
                     diff_text=diff,
@@ -655,10 +673,11 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
                     inline_comments=inline,
                 )
             except Exception as e:  # noqa: BLE001
-                log(f"Full review failed for {owner}/{repo}#{pr_number}: {e}")
+                log(f"Full review failed for {owner}/{repo}#{pr_number}: {e!r}")
                 post_comment(
                     owner, repo, pr_number,
-                    f"**[seneschal full-review]** failed before posting: `{e}`",
+                    f"**[seneschal full-review]** failed before posting: `{type(e).__name__}`. "
+                    "Check seneschal logs for details.",
                     token,
                 )
             return
@@ -702,14 +721,17 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
             text = get_backend().invoke(
                 review_prompt,
                 system_prompt=review_system,
-                max_turns=1,
                 timeout=300,
             )
         except Exception as e:  # noqa: BLE001
-            log(f"Backend invoke failed for {owner}/{repo}#{pr_number}: {e}")
+            # Log the full exception for the operator via journalctl, but
+            # post only the exception type to the public PR — the message
+            # can contain provider-specific URLs or metadata.
+            log(f"Backend invoke failed for {owner}/{repo}#{pr_number}: {e!r}")
             post_comment(
                 owner, repo, pr_number,
-                f"**[seneschal]** Review backend failed: `{e}`",
+                f"**[seneschal]** Review backend failed: `{type(e).__name__}`. "
+                "Check seneschal logs for details.",
                 token,
             )
             return
