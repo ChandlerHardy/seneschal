@@ -72,7 +72,6 @@ ignore_paths:
   - examples/
 review_style: concise        # concise | thorough | blunt
 full_review: true            # invoke multi-persona review
-auto_fix: false              # let the bot commit follow-up fixes
 
 # Multi-persona review: six builtins plus your own markdown files.
 # Omit `personas:` entirely and all six builtins run.

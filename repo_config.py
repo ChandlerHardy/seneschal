@@ -50,15 +50,13 @@ def _sanitize(text: str, max_len: int) -> str:
 class RepoConfig:
     rules: List[str] = field(default_factory=list)
     ignore_paths: List[str] = field(default_factory=list)
-    max_risk_for_auto_fix: str = "high"  # low/medium/high — up to which risk we auto-fix
+    max_risk_for_auto_fix: str = "high"  # low/medium/high — retained for config backward-compat
     review_style: str = "concise"  # concise, thorough, blunt
     full_review: bool = False  # if true, run the heavyweight multi-persona reviewer
-    # Default OFF. The fix loop invokes `claude -p --dangerously-skip-permissions
-    # --max-turns 40` and pushes commits to the PR branch, so it's expensive and
-    # behavior-changing. Opt in per-repo by setting `auto_fix: true` in
-    # `.ch-code-reviewer.yml`. Previously defaulted to True, which meant any
-    # review returning REQUEST_CHANGES on a trusted-author PR would silently
-    # kick off a 40-turn claude run.
+    # Retained as a parsed field so existing `.seneschal.yml` files with
+    # `auto_fix: true` continue to load without error. No code in the public
+    # repo consumes this value — the auto-fix loop required an agentic
+    # backend that is not shipped here.
     auto_fix: bool = False
     # Raw persona entries from `personas:` in YAML. Each entry is a dict
     # like {"builtin": "architect"} or {"file": ".seneschal/personas/x.md"}.

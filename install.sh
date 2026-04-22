@@ -48,8 +48,9 @@ done
 # Install Python deps
 ssh "$HOST" "~/seneschal/venv/bin/pip install -q -r ~/seneschal/requirements.txt && echo 'pip install: OK'"
 
-# Ship Claude Code helpers (the /seneschal-review slash command + persona subagents)
-ssh "$HOST" "mkdir -p ~/.claude/agents ~/.claude/commands"
+# Ship persona subagent definitions. full_review.py reads these at runtime
+# from ~/.claude/agents/seneschal-*.md when the full-review code path fires.
+ssh "$HOST" "mkdir -p ~/.claude/agents"
 for f in agents/seneschal-architect.md \
          agents/seneschal-security.md \
          agents/seneschal-data-integrity.md \
@@ -58,11 +59,6 @@ for f in agents/seneschal-architect.md \
          agents/seneschal-simplifier.md; do
   scp "$REPO_DIR/$f" "${HOST}:~/.claude/$(echo "$f" | sed 's#^#agents/#' 2>/dev/null || echo "$f")"
 done
-scp "$REPO_DIR/commands/seneschal-review.md" "${HOST}:~/.claude/commands/seneschal-review.md"
-
-# Ship the PR-review poster
-scp "$REPO_DIR/bin/seneschal-post" "${HOST}:~/bin/seneschal-post"
-ssh "$HOST" "chmod +x ~/bin/seneschal-post"
 
 # Smoke-import so we catch missing deps before systemd starts
 ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token' && echo 'seneschal imports: OK'"
