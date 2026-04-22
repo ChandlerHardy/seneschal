@@ -145,8 +145,15 @@ def test_handle_pr_merged_skips_already_filed_followups(tmp_path, monkeypatch):
         "https://x/42",
         "- [FOLLOWUP] do the thing later\n",
     )
-    # Pre-mark this review as already having filed an issue.
-    review_store.mark_merged("o/r", 42, "2026-04-21T10:00:00Z", [501])
+    # Pre-mark this review as already having filed an issue — include the
+    # sanitized title since the orchestrator now dedupes by title, not count.
+    review_store.mark_merged(
+        "o/r",
+        42,
+        "2026-04-21T10:00:00Z",
+        [501],
+        followup_titles=["[seneschal followup] do the thing later"],
+    )
 
     cfg = _config(followups=True)
     with patch("post_merge.orchestrator.app") as mock_app:
@@ -164,12 +171,53 @@ def test_handle_pr_merged_skips_already_filed_followups(tmp_path, monkeypatch):
         )
 
     # No new issues created because the only followup matches a previous title.
-    # We expect the orchestrator to skip if the title would be a duplicate;
-    # the simplest signal is no issue creation when followup count <= existing.
-    # If the orchestrator can't dedupe by title alone, at minimum it should
-    # not double-file: the followups_filed list still has 501.
+    # Title-based dedupe — the count-based heuristic would fire here since
+    # the only parsed followup would be "new" relative to a zero-length set,
+    # which is precisely the bug this regression guards.
     assert mock_app.create_issue.call_count == 0
-    assert 501 in result.get("followups_filed", []) or result.get("followups_filed") == []
+    assert result.get("followups_filed", []) == []
+
+
+def test_handle_pr_merged_files_new_followup_when_old_one_dropped(tmp_path, monkeypatch):
+    """Reviewer edits review: removes the old followup, adds a new one.
+    Count stays the same. The old count-based heuristic suppressed the
+    new followup; the title-keyed heuristic correctly files it."""
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review(
+        "o/r",
+        42,
+        "APPROVE",
+        "https://x/42",
+        "- [FOLLOWUP] brand new concern\n",
+    )
+    # Pre-mark a DIFFERENT followup title as already-filed (count=1).
+    review_store.mark_merged(
+        "o/r",
+        42,
+        "2026-04-21T10:00:00Z",
+        [501],
+        followup_titles=["[seneschal followup] old concern the reviewer has since deleted"],
+    )
+
+    cfg = _config(followups=True)
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
+        mock_app.create_issue = MagicMock(return_value={"number": 777})
+
+        result = handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42),
+            config=cfg,
+        )
+
+    # The new "brand new concern" followup IS filed even though the
+    # parsed-count equals the already-filed count.
+    assert mock_app.create_issue.call_count == 1
+    assert result["followups_filed"] == [777]
 
 
 # --------------------------------------------------------------------------
@@ -218,8 +266,12 @@ def test_handle_pr_merged_falls_back_to_pr_when_protected(tmp_path, monkeypatch)
 
     assert mock_app.create_branch.called
     assert mock_app.create_pull_request.called
-    # The protection cache now remembers o/r is protected.
-    assert _PROTECTED_REPOS.get("o/r") is True
+    # The protection cache now remembers o/r is protected (TTL-wrapped
+    # entry: (timestamp, protected_bool)).
+    entry = _PROTECTED_REPOS.get("o/r")
+    assert entry is not None
+    _, is_protected = entry
+    assert is_protected is True
 
 
 # --------------------------------------------------------------------------
@@ -307,3 +359,326 @@ def test_handle_pr_merged_swallows_exceptions(tmp_path, monkeypatch):
             config=cfg,
         )
     assert "error" in result
+
+
+# --------------------------------------------------------------------------
+# Issue-body sanitization: attacker-controllable review excerpt must not
+# fire @-mentions, cross-issue autolinks, tracking-pixel images, or HTML.
+# --------------------------------------------------------------------------
+
+
+def test_handle_pr_merged_sanitizes_issue_body(tmp_path, monkeypatch):
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    # A reviewer body crafted to abuse every vector we neutralize.
+    save_review(
+        "o/r",
+        42,
+        "APPROVE",
+        "https://x/42",
+        (
+            "- [FOLLOWUP] investigate leak\n"
+            "  ping @admin please also cc @security about #99\n"
+            "  ![pixel](https://evil.example/track?sess=x)\n"
+            "  <script>alert(1)</script>\n"
+        ),
+    )
+
+    cfg = _config(followups=True)
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return {"number": 501}
+
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
+        mock_app.create_issue = MagicMock(side_effect=_capture)
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42),
+            config=cfg,
+        )
+
+    body = captured.get("body") or ""
+    # Markdown image syntax stripped (tracking-pixel vector).
+    assert "![pixel]" not in body
+    assert "evil.example/track" not in body
+    # HTML tags stripped.
+    assert "<script>" not in body
+    assert "</script>" not in body
+    # @-mentions neutralized — GitHub's autolinker won't match
+    # `@` followed immediately by a zero-width space.
+    assert "@admin" not in body
+    assert "@security" not in body
+    # #-references neutralized too.
+    assert "#99" not in body
+    # The source PR link survives (we still want the back-reference).
+    assert "#42" in body or "pull/42" in body
+
+
+# --------------------------------------------------------------------------
+# Changelog dead-letter queue: put_file retry exhaustion must not silently
+# drop the PR's entry.
+# --------------------------------------------------------------------------
+
+
+def test_handle_pr_merged_dead_letters_changelog_on_conflict_exhaustion(tmp_path, monkeypatch):
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True, followup_label="followup")
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        (clone_dir / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        mock_app.PushProtectedError = PushProtectedError
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        # put_file exhausts sha-conflict retries.
+        mock_app.put_file = MagicMock(
+            side_effect=RuntimeError("put_file: gave up after 3 retries on o/r/CHANGELOG.md")
+        )
+        mock_app.create_issue = MagicMock(return_value={"number": 999})
+
+        result = handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "feat: add thing"),
+            config=cfg,
+        )
+
+    # Dead-letter issue filed exactly once.
+    assert mock_app.create_issue.call_count == 1
+    call = mock_app.create_issue.call_args
+    assert "#42" in (call.kwargs.get("title") or "")
+    assert result["changelog_updated"] is False
+
+
+# --------------------------------------------------------------------------
+# Release step fetches PR commits for BREAKING-CHANGE footer detection.
+# --------------------------------------------------------------------------
+
+
+def test_release_step_fetches_commits_for_breaking_detection(tmp_path, monkeypatch):
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    # Threshold is "minor" and the changelog shows only a fix (= patch).
+    # Without commit-body scan this stops at patch < minor and returns None.
+    # With the scan, a commit body carrying BREAKING CHANGE: must force
+    # the bump to major and trigger the release PR.
+    cfg = _config(changelog=True, release_threshold="minor")
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        (clone_dir / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- a fix ([#40](x))\n"
+        )
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_app.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_app.get_pr_commits = MagicMock(return_value=[
+            {"commit": {"message": "fix: patchy\n\nBREAKING CHANGE: drops config X"}},
+        ])
+        mock_app.create_pull_request = MagicMock(return_value={"number": 88})
+        mock_app.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
+
+        result = handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "fix: tiny"),
+            config=cfg,
+        )
+
+    # Commit-body scan escalated the bump from patch -> major, which
+    # crosses the "minor" threshold and opens a release PR.
+    assert mock_app.get_pr_commits.called
+    assert result.get("release_pr") == 88
+
+
+# --------------------------------------------------------------------------
+# TTL eviction on the protected-repos cache.
+# --------------------------------------------------------------------------
+
+
+def test_protected_cache_invalidates_after_ttl(monkeypatch):
+    from post_merge import orchestrator as orch
+    orch._PROTECTED_REPOS.clear()
+    orch._mark_protected("o/r", True)
+    assert orch._is_protected("o/r") is True
+
+    # Fast-forward past TTL.
+    orig_time = orch.time.time
+    try:
+        orch.time.time = lambda: orig_time() + orch._PROTECTED_TTL_SEC + 10
+        assert orch._is_protected("o/r") is False
+        # Entry got evicted, not just expired.
+        assert "o/r" not in orch._PROTECTED_REPOS
+    finally:
+        orch.time.time = orig_time
+
+
+# --------------------------------------------------------------------------
+# 422 race on release-PR create → fall back to amend.
+# --------------------------------------------------------------------------
+
+
+def test_release_step_422_race_falls_back_to_amend(tmp_path, monkeypatch):
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True, release_threshold="patch")
+    # First find_open_prs_with_label returns [] (no existing PR), but the
+    # create_pull_request call fails with 422 "already exists" (race), and
+    # the retry find_open_prs_with_label returns the PR that opened in the
+    # meantime.
+    find_calls = {"n": 0}
+
+    def _find(*args, **kwargs):
+        find_calls["n"] += 1
+        if find_calls["n"] == 1:
+            return []
+        return [{"number": 77, "head": {"ref": "seneschal/release-0.3.0"}}]
+
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        (clone_dir / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- x ([#1](x))\n"
+        )
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_app.find_open_prs_with_label = MagicMock(side_effect=_find)
+        mock_app.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
+        mock_app.create_pull_request = MagicMock(
+            side_effect=RuntimeError("HTTP 422: A pull request already exists for o:seneschal/release-x")
+        )
+        mock_app.get_pr_commits = MagicMock(return_value=[])
+
+        result = handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "fix: thing"),
+            config=cfg,
+        )
+
+    # 422 caught → re-check → amend the existing PR #77 instead of raising.
+    assert result.get("release_pr") == 77
+
+
+# --------------------------------------------------------------------------
+# Release-PR branch name reflects the computed next version when
+# discoverable (W3).
+# --------------------------------------------------------------------------
+
+
+def test_release_pr_branch_uses_next_semver_when_discoverable(tmp_path, monkeypatch):
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True, release_threshold="patch")
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        (clone_dir / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- x ([#1](x))\n"
+        )
+        # Current version = 1.2.3 via pyproject.toml.
+        (clone_dir / "pyproject.toml").write_text(
+            '[project]\nname = "thing"\nversion = "1.2.3"\n'
+        )
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_app.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_app.get_pr_commits = MagicMock(return_value=[])
+        created = {}
+
+        def _create_branch(owner, repo, new_ref, from_sha, token):
+            created["branch"] = new_ref
+            return {"ref": f"refs/heads/{new_ref}"}
+
+        mock_app.create_branch = MagicMock(side_effect=_create_branch)
+        mock_app.create_pull_request = MagicMock(return_value={"number": 99})
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "fix: tiny"),
+            config=cfg,
+        )
+
+    # Next patch version = 1.2.4, so branch should reflect that instead
+    # of the old "next" placeholder.
+    assert created.get("branch") == "seneschal/release-1.2.4"
+
+
+def test_release_pr_branch_falls_back_to_pending_when_version_unknown(tmp_path, monkeypatch):
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True, release_threshold="patch")
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        # No pyproject, package.json, VERSION, or git tags.
+        (clone_dir / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- x ([#1](x))\n"
+        )
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_app.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_app.get_pr_commits = MagicMock(return_value=[])
+        created = {}
+
+        def _create_branch(owner, repo, new_ref, from_sha, token):
+            created["branch"] = new_ref
+            return {"ref": f"refs/heads/{new_ref}"}
+
+        mock_app.create_branch = MagicMock(side_effect=_create_branch)
+        mock_app.create_pull_request = MagicMock(return_value={"number": 99})
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "fix: tiny"),
+            config=cfg,
+        )
+
+    # No version source → branch name uses "pending-<bump>" not "next".
+    branch = created.get("branch") or ""
+    assert branch.startswith("seneschal/release-pending-")
+    assert "next" not in branch

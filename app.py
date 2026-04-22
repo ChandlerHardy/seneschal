@@ -644,6 +644,50 @@ def _local_repo_path(repo: str) -> str:
     return os.path.join(REPOS_DIR, REPO_NAME_MAP.get(repo, repo))
 
 
+_PER_PR_LOCK_DIR = os.path.expanduser("~/.seneschal/locks")
+
+
+@contextmanager
+def _per_pr_lock(owner: str, repo: str, pr_number: int):
+    """Serialize post-merge work for a single PR across webhook retries.
+
+    GitHub retries webhook delivery on 5xx. Without this lock, two
+    background threads for the same merge event could both read
+    `followups_filed_titles=[]` and both file the same followup issue
+    before either writes the updated review record back to disk.
+
+    Advisory fcntl lock on a sidecar file under `~/.seneschal/locks/`.
+    File naming is safe because `owner`/`repo` come from the GitHub
+    webhook payload (controlled) and `pr_number` is an integer — we
+    still pass the components through a conservative regex to catch
+    any hypothetical injection before it reaches the filesystem.
+    """
+    safe_owner = re.sub(r"[^A-Za-z0-9_.\-]", "_", str(owner))[:100]
+    safe_repo = re.sub(r"[^A-Za-z0-9_.\-]", "_", str(repo))[:100]
+    try:
+        safe_pr = int(pr_number)
+    except (TypeError, ValueError):
+        safe_pr = 0
+    os.makedirs(_PER_PR_LOCK_DIR, exist_ok=True)
+    lock_path = os.path.join(
+        _PER_PR_LOCK_DIR, f"{safe_owner}_{safe_repo}_{safe_pr}.lock",
+    )
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError as e:
+            if e.errno != errno.EBADF:
+                raise
+
+
 @contextmanager
 def _repo_sync_lock(repo_path: str):
     """Serialize git fetch+checkout against a shared worktree.
@@ -991,14 +1035,20 @@ def _queue_post_merge(owner, repo, pr_number, installation_id, pr_meta, config):
     log(f"Queueing post-merge for {owner}/{repo}#{pr_number}")
 
     def _runner():
-        result = handle_pr_merged(
-            owner=owner,
-            repo=repo,
-            pr_number=pr_number,
-            installation_id=installation_id,
-            pr_meta=pr_meta,
-            config=config,
-        )
+        # Per-PR advisory lock: GitHub retries webhook delivery on 5xx,
+        # so two threads might enter the orchestrator for the same merge
+        # event. Without this, both read followups_filed_titles=[] and
+        # both file the followup issue. Lock-holder wins, the retry
+        # sees the persisted state and no-ops.
+        with _per_pr_lock(owner, repo, pr_number):
+            result = handle_pr_merged(
+                owner=owner,
+                repo=repo,
+                pr_number=pr_number,
+                installation_id=installation_id,
+                pr_meta=pr_meta,
+                config=config,
+            )
         log(f"[post_merge] {owner}/{repo}#{pr_number} done: {result}")
 
     thread = threading.Thread(target=_runner, daemon=True)

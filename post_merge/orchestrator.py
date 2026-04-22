@@ -12,11 +12,15 @@ caller can log a single line and move on.
 
 from __future__ import annotations
 
+import json
 import os
+import re
+import subprocess
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # Local sibling modules (these are pure).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,9 +35,34 @@ from post_merge import release as release_mod  # noqa: E402
 PushProtectedError = app.PushProtectedError
 
 # Process-local cache of which `owner/repo` combinations had `put_file` to
-# main return 403. Once seen, we skip the direct-commit attempt and go
-# straight to auto-PR mode for subsequent commits in the same process.
-_PROTECTED_REPOS: Dict[str, bool] = {}
+# main return 403. Entries are (timestamp_seconds, protected_bool). After
+# `_PROTECTED_TTL_SEC` we re-probe — branch protection may have been
+# removed and staying in auto-PR mode forever is wasteful.
+_PROTECTED_REPOS: Dict[str, Tuple[float, bool]] = {}
+_PROTECTED_TTL_SEC = 3600  # 1 hour
+
+
+def _is_protected(repo_slug: str) -> bool:
+    """Return True if `repo_slug` is currently known-protected (cache + TTL).
+
+    An expired entry is evicted so the caller re-probes on the next write.
+    """
+    entry = _PROTECTED_REPOS.get(repo_slug)
+    if entry is None:
+        return False
+    ts, protected = entry
+    if not protected:
+        return False
+    if time.time() - ts > _PROTECTED_TTL_SEC:
+        # Expire: the next commit attempt will re-probe direct push.
+        _PROTECTED_REPOS.pop(repo_slug, None)
+        return False
+    return True
+
+
+def _mark_protected(repo_slug: str, protected: bool) -> None:
+    """Record `repo_slug`'s protection state with a fresh timestamp."""
+    _PROTECTED_REPOS[repo_slug] = (time.time(), bool(protected))
 
 
 def _now_iso() -> str:
@@ -50,6 +79,62 @@ def _read_local_changelog(repo_path: str, changelog_path: str) -> str:
             return fh.read()
     except OSError:
         return ""
+
+
+# --------------------------------------------------------------------------
+# Issue-body sanitization
+# --------------------------------------------------------------------------
+
+# The `body_excerpt` on a Followup is attacker-controllable (anyone who can
+# post a review can seed the excerpt). When that excerpt is dropped into a
+# `create_issue(body=...)` call, raw `@mentions` ping real users, `#123`
+# autolinks cross-issues, markdown-image syntax loads tracking pixels on
+# render, and HTML tags can reshape the issue body in unexpected ways.
+#
+# Strategy: wrap the excerpt in a fenced code block (so markdown doesn't
+# interpret anything inside), and additionally neutralize @/# on each line
+# by inserting a zero-width space so GitHub's autolinker doesn't match.
+# Drop markdown-image syntax + HTML tags outright.
+
+_IMAGE_MD_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_ZERO_WIDTH_SPACE = "​"
+
+
+def _sanitize_issue_body(body_excerpt: str, pr_number: int, pr_url: str) -> str:
+    """Turn a reviewer-supplied excerpt into a safe issue body.
+
+    - strips markdown-image syntax (tracking-pixel vector)
+    - strips HTML tags
+    - neutralizes `@mention` / `#123` sigils with a zero-width space so
+      GitHub's autolinker won't fire on issue creation
+    - wraps the result in a fenced code block for an extra layer of
+      literal rendering
+    - appends a plain link back to the source PR so the issue is
+      traceable
+    """
+    excerpt = body_excerpt or ""
+    excerpt = _IMAGE_MD_RE.sub("[image removed]", excerpt)
+    excerpt = _HTML_TAG_RE.sub("", excerpt)
+    # Neutralize @/# by inserting a zero-width space after each, which
+    # breaks GitHub's autolinker but keeps the text readable.
+    excerpt = excerpt.replace("@", "@" + _ZERO_WIDTH_SPACE)
+    excerpt = excerpt.replace("#", "#" + _ZERO_WIDTH_SPACE)
+    # Defensive: ensure the fence itself isn't broken by a ``` in the
+    # excerpt. Replace any triple-backtick with a single-backtick run.
+    excerpt = excerpt.replace("```", "``​`")
+    return (
+        "```\n"
+        f"{excerpt}\n"
+        "```\n"
+        "\n"
+        f"Filed by Seneschal from PR #{int(pr_number)}: {pr_url}\n"
+    )
+
+
+# --------------------------------------------------------------------------
+# Changelog step
+# --------------------------------------------------------------------------
 
 
 def _commit_changelog_direct(
@@ -123,11 +208,97 @@ def _commit_changelog_via_pr(
         # Apply the seneschal:changelog label so the operator can filter.
         try:
             app.apply_labels(owner, repo, pr.get("number"), ["seneschal:changelog"], token)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            app.log(f"[post_merge] apply_labels (changelog PR) failed: {e!r}")
         return int(pr.get("number") or 0) or None
     except Exception as e:  # noqa: BLE001
         app.log(f"[post_merge] changelog auto-PR failed for {owner}/{repo}#{pr_number}: {e!r}")
+        return None
+
+
+def _attempt_changelog_commit(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    changelog_path: str,
+    new_content: str,
+    base_branch: str,
+    commit_message: str,
+    token: str,
+) -> Tuple[str, Optional[str]]:
+    """Attempt the direct-commit path. Returns (status, detail).
+
+    Status values:
+      - `"success"`  — direct commit went through
+      - `"protected"`— branch rejected with 403; caller should fall back
+                        to auto-PR mode
+      - `"conflict"` — put_file gave up after 3 sha-conflict retries; the
+                        change is LOST unless the caller dead-letters it
+      - `"error"`    — any other exception
+    """
+    repo_slug = f"{owner}/{repo}"
+    if _is_protected(repo_slug):
+        return ("protected", None)
+    try:
+        _commit_changelog_direct(
+            owner, repo, changelog_path, new_content,
+            base_branch, commit_message, token,
+        )
+        return ("success", None)
+    except PushProtectedError:
+        app.log(f"[post_merge] {repo_slug} main protected — switching to auto-PR mode")
+        _mark_protected(repo_slug, True)
+        return ("protected", None)
+    except RuntimeError as e:
+        # put_file exhausts retries on repeated 409s and raises RuntimeError.
+        msg = str(e)
+        if "retries" in msg.lower() or "gave up" in msg.lower():
+            return ("conflict", msg)
+        return ("error", msg)
+    except Exception as e:  # noqa: BLE001
+        return ("error", repr(e))
+
+
+def _dead_letter_changelog(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    pr_title: str,
+    config,
+    token: str,
+) -> Optional[int]:
+    """File a GitHub issue when a changelog update couldn't be committed.
+
+    Without this the merged-PR entry silently disappears from the
+    changelog on sha-conflict-retry exhaustion.
+    """
+    label = config.post_merge.followup_label or "seneschal-followup"
+    try:
+        issue = app.create_issue(
+            owner=owner,
+            repo=repo,
+            title=f"Seneschal: changelog update dropped for PR #{pr_number}",
+            body=(
+                f"Seneschal tried to append a changelog entry for "
+                f"PR #{pr_number} ({pr_title!r}) but gave up after repeated "
+                f"sha conflicts on the Contents API.\n\n"
+                f"Manual fix: add the entry under `## [Unreleased]` in the "
+                f"changelog yourself, or re-run the orchestrator.\n"
+            ),
+            labels=[label],
+            token=token,
+        )
+        num = int(issue.get("number") or 0) or None
+        app.log(
+            f"[post_merge] dead-lettered changelog drop for "
+            f"{owner}/{repo}#{pr_number} as issue #{num}"
+        )
+        return num
+    except Exception as e:  # noqa: BLE001
+        app.log(
+            f"[post_merge] FAILED to dead-letter changelog drop "
+            f"for {owner}/{repo}#{pr_number}: {e!r}"
+        )
         return None
 
 
@@ -139,45 +310,66 @@ def _changelog_step(
     config,
     token: str,
     repo_path: str,
-) -> bool:
-    """Read CHANGELOG.md, insert the entry, push it. Returns True on success."""
+    breaking: bool = False,
+) -> Tuple[bool, Optional[str]]:
+    """Read CHANGELOG.md, insert the entry, push it.
+
+    Returns (success, error_detail). `error_detail` is non-None only on
+    the `"error"` terminal state so the orchestrator can surface it.
+    """
     title = pr_meta.get("title") or ""
     pr_url = pr_meta.get("html_url") or f"https://github.com/{owner}/{repo}/pull/{pr_number}"
     kind = changelog_mod.classify_prefix(title) or "chore"
-    entry = changelog_mod.format_unreleased_entry(pr_number, title, pr_url)
+    entry = changelog_mod.format_unreleased_entry(pr_number, title, pr_url, breaking=breaking)
     existing = _read_local_changelog(repo_path, config.post_merge.changelog_path)
-    new_content = changelog_mod.insert_unreleased_entry(existing, entry, kind)
+    new_content = changelog_mod.insert_unreleased_entry(existing, entry, kind, breaking=breaking)
     if new_content == existing:
         # Nothing changed — skip the push.
-        return False
+        return (False, None)
 
-    repo_slug = f"{owner}/{repo}"
     base_branch = config.post_merge.release_base_branch or "main"
-    stripped = changelog_mod._strip_prefix(title)
+    stripped = changelog_mod.strip_conventional_prefix(title)
     commit_message = f"chore(changelog): add #{pr_number} {stripped}"
 
-    # If we already know main is protected, skip the direct attempt.
-    if _PROTECTED_REPOS.get(repo_slug):
-        pr_no = _commit_changelog_via_pr(
-            owner, repo, config.post_merge.changelog_path, new_content,
-            base_branch, pr_number, commit_message, token,
-        )
-        return pr_no is not None
+    status, detail = _attempt_changelog_commit(
+        owner, repo, pr_number,
+        config.post_merge.changelog_path, new_content,
+        base_branch, commit_message, token,
+    )
 
-    try:
-        _commit_changelog_direct(
-            owner, repo, config.post_merge.changelog_path, new_content,
-            base_branch, commit_message, token,
-        )
-        return True
-    except PushProtectedError:
-        app.log(f"[post_merge] {repo_slug} main protected — switching to auto-PR mode")
-        _PROTECTED_REPOS[repo_slug] = True
+    if status == "success":
+        return (True, None)
+    if status == "protected":
         pr_no = _commit_changelog_via_pr(
             owner, repo, config.post_merge.changelog_path, new_content,
             base_branch, pr_number, commit_message, token,
         )
-        return pr_no is not None
+        return (pr_no is not None, None)
+    if status == "conflict":
+        app.log(
+            f"[post_merge] changelog commit gave up after retries for "
+            f"{owner}/{repo}#{pr_number}: {detail}"
+        )
+        _dead_letter_changelog(owner, repo, pr_number, title, config, token)
+        return (False, f"conflict: {detail}")
+    # status == "error"
+    app.log(
+        f"[post_merge] changelog commit failed for {owner}/{repo}#{pr_number}: {detail}"
+    )
+    return (False, detail)
+
+
+# --------------------------------------------------------------------------
+# Followups step
+# --------------------------------------------------------------------------
+
+
+def _title_key(title: str) -> str:
+    """Normalize a followup title for idempotent dedupe.
+
+    Case-folded, whitespace-collapsed.
+    """
+    return " ".join((title or "").split()).casefold()
 
 
 def _followups_step(
@@ -187,31 +379,33 @@ def _followups_step(
     pr_meta: dict,
     config,
     token: str,
-) -> List[int]:
-    """Parse [FOLLOWUP] markers from the stored review and file issues for new ones."""
+) -> Tuple[List[int], List[str]]:
+    """Parse [FOLLOWUP] markers from the stored review and file issues for new ones.
+
+    Returns (new_issue_numbers, new_titles) so the caller can persist both
+    in the review record for future dedupe.
+    """
     repo_slug = f"{owner}/{repo}"
     review = review_store.get_review(repo_slug, pr_number)
     if review is None:
-        return []
+        return ([], [])
     parsed = followups_mod.parse_followups(review.body)
     if not parsed:
-        return []
-    # Idempotence: skip followups whose normalized titles match issues we've
-    # already filed (best-effort — we don't have title-of-issue stored, so
-    # the cheap heuristic is "if followups_filed already has N entries and
-    # there are <=N parsed, do nothing"). The accurate dedupe lives in P2's
-    # SQLite index; this is the cheap-but-good-enough version.
-    already = list(review.followups_filed or [])
-    if len(parsed) <= len(already):
-        return []
-    # File the surplus.
-    needed = parsed[len(already):]
+        return ([], [])
+    # Idempotence: dedupe by normalized title against the record's
+    # previously-filed titles. Without this, any reviewer edit that
+    # changes the followup *count* would re-file the whole set.
+    already_titles = {_title_key(t) for t in (review.followups_filed_titles or [])}
+    needed = [f for f in parsed if _title_key(f.title) not in already_titles]
+    if not needed:
+        return ([], [])
     label = config.post_merge.followup_label or "seneschal-followup"
     pr_url = pr_meta.get("html_url") or f"https://github.com/{owner}/{repo}/pull/{pr_number}"
     new_numbers: List[int] = []
+    new_titles: List[str] = []
     for f in needed:
         try:
-            body = f"{f.body_excerpt}\n\n---\nFiled by Seneschal from #{pr_number}: {pr_url}"
+            body = _sanitize_issue_body(f.body_excerpt, pr_number, pr_url)
             issue = app.create_issue(
                 owner=owner,
                 repo=repo,
@@ -223,15 +417,108 @@ def _followups_step(
             num = int(issue.get("number") or 0)
             if num:
                 new_numbers.append(num)
+                new_titles.append(f.title)
         except Exception as e:  # noqa: BLE001
             app.log(f"[post_merge] create_issue failed on {repo_slug}#{pr_number}: {e!r}")
             break
-    return new_numbers
+    return (new_numbers, new_titles)
+
+
+# --------------------------------------------------------------------------
+# Release step
+# --------------------------------------------------------------------------
+
+
+_UNRELEASED_RE = re.compile(
+    r"^## \[Unreleased\][^\n]*\n(.*?)(?=^## |\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+_PYPROJECT_VERSION_RE = re.compile(
+    r'^\s*version\s*=\s*"([^"]+)"',
+    re.MULTILINE,
+)
+
+
+def _current_version(repo_path: str) -> Optional[str]:
+    """Best-effort: discover the repo's current semver.
+
+    Checks, in order:
+      1. `pyproject.toml` — `version = "X"` in either `[project]` or
+         `[tool.poetry]` table (we don't parse TOML, just match the line)
+      2. `package.json` — `version` key
+      3. `VERSION` file (literal)
+      4. `git describe --tags --abbrev=0`
+
+    Returns None if none of those yield a value that parses as semver.
+    """
+    # 1. pyproject.toml
+    py = os.path.join(repo_path, "pyproject.toml")
+    if os.path.isfile(py):
+        try:
+            with open(py, "r") as fh:
+                m = _PYPROJECT_VERSION_RE.search(fh.read())
+                if m:
+                    return m.group(1).strip()
+        except OSError:
+            pass
+    # 2. package.json
+    pkg = os.path.join(repo_path, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            with open(pkg, "r") as fh:
+                data = json.load(fh)
+            ver = data.get("version")
+            if isinstance(ver, str) and ver.strip():
+                return ver.strip()
+        except (OSError, json.JSONDecodeError):
+            pass
+    # 3. VERSION
+    ver_file = os.path.join(repo_path, "VERSION")
+    if os.path.isfile(ver_file):
+        try:
+            with open(ver_file, "r") as fh:
+                ver = fh.read().strip()
+            if ver:
+                return ver
+        except OSError:
+            pass
+    # 4. git describe
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_path, "describe", "--tags", "--abbrev=0"],
+            capture_output=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            out = proc.stdout.decode("utf-8", errors="replace").strip()
+            if out:
+                return out
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return None
+
+
+def _release_branch_name(repo_path: str, bump_kind: str) -> str:
+    """Compute the release-PR branch name.
+
+    If a current version is discoverable, compute the next version and
+    use it. Otherwise use `seneschal/release-pending-<bump_kind>` (NOT
+    `-next` — that placeholder hid the bump intent in the branch name).
+    """
+    current = _current_version(repo_path)
+    if current:
+        try:
+            new_version = release_mod.next_version(current, bump_kind)
+            return f"seneschal/release-{new_version}"
+        except ValueError:
+            pass
+    return f"seneschal/release-pending-{bump_kind}"
 
 
 def _release_step(
     owner: str,
     repo: str,
+    pr_number: int,
     pr_meta: dict,
     config,
     token: str,
@@ -245,12 +532,24 @@ def _release_step(
     if not existing:
         return None
     # Extract the Unreleased block.
-    import re as _re
-    m = _re.search(r"^## \[Unreleased\][^\n]*\n(.*?)(?=^## |\Z)", existing, _re.MULTILINE | _re.DOTALL)
+    m = _UNRELEASED_RE.search(existing)
     if not m:
         return None
     unreleased_lines = m.group(1).split("\n")
     bump = release_mod.bump_kind(unreleased_lines)
+
+    # Commit-body scan: a PR body may not carry `!` in the title but may
+    # still include `BREAKING CHANGE:` in a commit message. Fetching the
+    # PR's commits is the only way to catch that signal. If any commit
+    # message body has that marker, force a major bump.
+    try:
+        commits = app.get_pr_commits(owner, repo, pr_number, token) or []
+    except Exception as e:  # noqa: BLE001
+        app.log(f"[post_merge] get_pr_commits failed for {owner}/{repo}#{pr_number}: {e!r}")
+        commits = []
+    if commits and _commits_signal_breaking(commits):
+        bump = "major"
+
     order = {"patch": 0, "minor": 1, "major": 2}
     if order.get(bump, 0) < order.get(threshold, 0):
         return None
@@ -258,34 +557,17 @@ def _release_step(
     # If a release PR is already open, amend it instead of opening another.
     try:
         existing_prs = app.find_open_prs_with_label(owner, repo, "seneschal:release", token)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        app.log(f"[post_merge] find_open_prs_with_label failed: {e!r}")
         existing_prs = []
     if existing_prs:
-        # Race: amend the changelog on the existing branch and bail.
-        head_ref = (existing_prs[0].get("head") or {}).get("ref")
-        if head_ref:
-            try:
-                sha = app.get_file_sha(owner, repo, config.post_merge.changelog_path, head_ref, token)
-                app.put_file(
-                    owner=owner,
-                    repo=repo,
-                    path=config.post_merge.changelog_path,
-                    content=existing,
-                    message=f"chore(release): refresh CHANGELOG (Seneschal)",
-                    branch=head_ref,
-                    sha=sha,
-                    token=token,
-                )
-            except Exception as e:  # noqa: BLE001
-                app.log(f"[post_merge] amend release-PR failed: {e!r}")
-        return int(existing_prs[0].get("number") or 0) or None
+        return _amend_release_pr(
+            owner, repo, existing_prs[0],
+            config.post_merge.changelog_path, existing, token,
+        )
 
     # Open a fresh release PR.
-    # We don't currently extract the prior version — leave the version
-    # bump computation as informational; the operator decides the final
-    # tag at merge time.
-    new_version = "next"  # placeholder; the PR body explains the bump kind
-    branch = f"seneschal/release-{new_version}"
+    branch = _release_branch_name(repo_path, bump)
     base = config.post_merge.release_base_branch or "main"
     try:
         base_sha = app.get_default_branch_sha(owner, repo, base, token)
@@ -302,24 +584,118 @@ def _release_step(
             sha=sha,
             token=token,
         )
-        pr = app.create_pull_request(
-            owner=owner,
-            repo=repo,
-            title=f"chore(release): {bump} release prep",
-            body=f"Accumulated `## [Unreleased]` entries warrant a `{bump}` bump.\n\nFinalize the version + cut the tag when ready.",
-            head=branch,
-            base=base,
-            token=token,
-            draft=bool(config.post_merge.release_pr_draft),
-        )
+        try:
+            pr = app.create_pull_request(
+                owner=owner,
+                repo=repo,
+                title=f"chore(release): {bump} release prep",
+                body=f"Accumulated `## [Unreleased]` entries warrant a `{bump}` bump.\n\nFinalize the version + cut the tag when ready.",
+                head=branch,
+                base=base,
+                token=token,
+                draft=bool(config.post_merge.release_pr_draft),
+            )
+        except Exception as pr_err:  # noqa: BLE001
+            # 422 race: another post-merge thread opened the release PR
+            # between our find_open_prs_with_label + create_pull_request.
+            # Re-check and fall through to amend-mode rather than bubbling.
+            if _is_already_exists_error(pr_err):
+                app.log(
+                    f"[post_merge] release PR create hit 422 race; "
+                    f"re-checking open PRs for {owner}/{repo}"
+                )
+                try:
+                    retry_prs = app.find_open_prs_with_label(
+                        owner, repo, "seneschal:release", token,
+                    )
+                except Exception:  # noqa: BLE001
+                    retry_prs = []
+                if retry_prs:
+                    return _amend_release_pr(
+                        owner, repo, retry_prs[0],
+                        config.post_merge.changelog_path, existing, token,
+                    )
+            raise
         try:
             app.apply_labels(owner, repo, pr.get("number"), ["seneschal:release"], token)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            app.log(f"[post_merge] apply_labels (release PR) failed: {e!r}")
         return int(pr.get("number") or 0) or None
     except Exception as e:  # noqa: BLE001
         app.log(f"[post_merge] open release-PR failed for {owner}/{repo}: {e!r}")
         return None
+
+
+def _amend_release_pr(
+    owner: str,
+    repo: str,
+    existing_pr: dict,
+    changelog_path: str,
+    changelog_content: str,
+    token: str,
+) -> Optional[int]:
+    """Refresh the changelog on an already-open seneschal:release PR's branch."""
+    head_ref = (existing_pr.get("head") or {}).get("ref")
+    if head_ref:
+        try:
+            sha = app.get_file_sha(owner, repo, changelog_path, head_ref, token)
+            app.put_file(
+                owner=owner,
+                repo=repo,
+                path=changelog_path,
+                content=changelog_content,
+                message="chore(release): refresh CHANGELOG (Seneschal)",
+                branch=head_ref,
+                sha=sha,
+                token=token,
+            )
+        except Exception as e:  # noqa: BLE001
+            app.log(f"[post_merge] amend release-PR failed: {e!r}")
+    return int(existing_pr.get("number") or 0) or None
+
+
+def _is_already_exists_error(err: Exception) -> bool:
+    """Return True if `err` looks like a GitHub 422 "PR already exists"."""
+    # requests-style HTTP errors carry a `response` attribute on
+    # `HTTPError`. The API returns 422 with a body containing
+    # "A pull request already exists for ...".
+    msg = str(err).lower()
+    if "422" in msg and ("already exists" in msg or "pull request" in msg):
+        return True
+    resp = getattr(err, "response", None)
+    if resp is None:
+        return False
+    try:
+        if getattr(resp, "status_code", None) == 422:
+            text = (getattr(resp, "text", "") or "").lower()
+            return "already exists" in text or "pull request" in text
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def _commits_signal_breaking(commits: List[dict]) -> bool:
+    """Scan PR commit objects for a Conventional Commits breaking marker.
+
+    GitHub's list-commits endpoint returns objects of the shape
+    `{"commit": {"message": "..."}, ...}`. Scans both the title and body
+    of each message for `BREAKING CHANGE:` / `BREAKING-CHANGE:`.
+    """
+    for c in commits:
+        if not isinstance(c, dict):
+            continue
+        commit = c.get("commit") or {}
+        msg = commit.get("message") or ""
+        if changelog_mod.is_breaking_title(msg):
+            return True
+        if re.search(r"BREAKING[\s-]CHANGE", msg, re.IGNORECASE):
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# Top-level entrypoint
+# --------------------------------------------------------------------------
 
 
 def handle_pr_merged(
@@ -332,9 +708,11 @@ def handle_pr_merged(
 ) -> dict:
     """Top-level entrypoint. Sequences changelog → followups → release.
 
-    Returns a status dict for caller logging; never raises.
+    Returns a status dict for caller logging; never raises. Per-PR locking
+    happens at the app.py layer (`_per_pr_lock`) so retried webhook
+    deliveries don't double-fire this function.
     """
-    result = {
+    result: Dict = {
         "changelog_updated": False,
         "followups_filed": [],
         "release_pr": None,
@@ -352,20 +730,30 @@ def handle_pr_merged(
             app.log(f"[post_merge] repo sync failed for {owner}/{repo}#{pr_number}: {e!r}")
             repo_path = ""
 
+        # Detect breaking-change intent early so the changelog entry can
+        # be routed to `### Removed` + marked `**BREAKING**`.
+        title = pr_meta.get("title") or ""
+        breaking = changelog_mod.is_breaking_title(title)
+
         # 1. Changelog.
         if config.post_merge.changelog and repo_path:
             try:
-                result["changelog_updated"] = _changelog_step(
+                ok, err_detail = _changelog_step(
                     owner, repo, pr_number, pr_meta, config, token, repo_path,
+                    breaking=breaking,
                 )
+                result["changelog_updated"] = ok
+                if err_detail:
+                    result.setdefault("error", err_detail)
             except Exception as e:  # noqa: BLE001
                 app.log(f"[post_merge] changelog step failed for {owner}/{repo}#{pr_number}: {e!r}")
 
         # 2. Followups.
         new_followups: List[int] = []
+        new_titles: List[str] = []
         if config.post_merge.followups:
             try:
-                new_followups = _followups_step(
+                new_followups, new_titles = _followups_step(
                     owner, repo, pr_number, pr_meta, config, token,
                 )
             except Exception as e:  # noqa: BLE001
@@ -373,12 +761,18 @@ def handle_pr_merged(
         result["followups_filed"] = new_followups
 
         # 3. Mark merged in the review store (records merged_at + dedup the
-        # followup numbers). Always do this when there's a stored review,
-        # even if no followups fired this round — gives P2's index a stable
-        # `merged_at` field.
+        # followup numbers + titles). Always do this when there's a stored
+        # review, even if no followups fired this round — gives P2's index
+        # a stable `merged_at` field.
         merged_at = pr_meta.get("merged_at") or _now_iso()
         try:
-            review_store.mark_merged(f"{owner}/{repo}", pr_number, merged_at, new_followups)
+            review_store.mark_merged(
+                f"{owner}/{repo}",
+                pr_number,
+                merged_at,
+                new_followups,
+                followup_titles=new_titles,
+            )
         except Exception as e:  # noqa: BLE001
             app.log(f"[post_merge] mark_merged failed for {owner}/{repo}#{pr_number}: {e!r}")
 
@@ -386,7 +780,7 @@ def handle_pr_merged(
         if config.post_merge.release_threshold and repo_path:
             try:
                 result["release_pr"] = _release_step(
-                    owner, repo, pr_meta, config, token, repo_path,
+                    owner, repo, pr_number, pr_meta, config, token, repo_path,
                 )
             except Exception as e:  # noqa: BLE001
                 app.log(f"[post_merge] release step failed for {owner}/{repo}#{pr_number}: {e!r}")
