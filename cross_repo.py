@@ -45,6 +45,12 @@ _GITHUB_URL_RE = re.compile(
     re.MULTILINE,
 )
 
+# Cap per-`.git/config` read at 1 MB. A legitimate git config is a few
+# KB at most; a malicious repo whose attacker committed a huge config
+# (or a broken checkout with runaway content) could OOM the MCP server
+# if we slurped it whole. Matches dependency_grep's _MAX_MANIFEST_BYTES.
+_MAX_CONFIG_BYTES = 1_048_576
+
 # In-process cache keyed by the resolved root path. Module-level dict so
 # all callers share state — the MCP server is single-process; multiple
 # tool calls in one session hit the cache on reuse.
@@ -148,6 +154,17 @@ def known_repos(root: Optional[str] = None) -> List[KnownRepo]:
             continue
         git_config = os.path.join(p, ".git", "config")
         if not os.path.isfile(git_config):
+            continue
+        try:
+            st = os.stat(git_config)
+        except OSError as e:
+            _log(f"failed to stat {git_config}: {e}")
+            continue
+        if st.st_size > _MAX_CONFIG_BYTES:
+            _log(
+                f"refusing to read {git_config}: size {st.st_size} exceeds "
+                f"{_MAX_CONFIG_BYTES}; possible OOM vector"
+            )
             continue
         try:
             with open(git_config, "r", encoding="utf-8", errors="replace") as fh:

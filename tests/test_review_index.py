@@ -456,6 +456,50 @@ def test_wal_mode_is_enabled(tmp_path):
 # --------------------------------------------------------------------------
 
 
+def test_list_merged_prs_rejects_invalid_since(tmp_path, store, idx):
+    """`since` is used in a lexicographic SQL comparison against the
+    stored `merged_at` (ISO-8601). A caller typo like `"yesterday"` or
+    a date-only string would silently return an empty window — we now
+    raise ValueError so the MCP layer can return an error payload."""
+    import pytest
+    _write_review(store, "a/b", 1, "body", merged_at="2026-04-20T00:00:00Z")
+    idx.sync_from_markdown(str(store))
+    # Date-only is valid (ISO-8601 allows bare dates).
+    assert idx.list_merged_prs(since="2026-01-01") != []
+    # Full ISO datetime works.
+    assert idx.list_merged_prs(since="2026-01-01T00:00:00Z") != []
+    # Bogus strings raise.
+    with pytest.raises(ValueError):
+        idx.list_merged_prs(since="yesterday")
+    with pytest.raises(ValueError):
+        idx.list_merged_prs(since="not-a-date")
+
+
+def test_search_adrs_returns_snippet_key_not_excerpt(tmp_path, store, idx, monkeypatch):
+    """Key unification: search_reviews returns `snippet`, search_adrs
+    used to return `excerpt`. Same concept → same key."""
+    cross_repo = pytest.importorskip("cross_repo")
+
+    repos_root = tmp_path / "repos"
+    repos_root.mkdir()
+    repo_dir = repos_root / "b"
+    adr_dir = repo_dir / "docs" / "adr"
+    adr_dir.mkdir(parents=True)
+    (adr_dir / "0001-snippet-key.md").write_text("# Key unification\n\nbody")
+    (repo_dir / ".git").mkdir()
+    (repo_dir / ".git" / "config").write_text(
+        '[remote "origin"]\n\turl = git@github.com:a/b.git\n'
+    )
+    monkeypatch.setenv("SENESCHAL_REPOS_ROOT", str(repos_root))
+    cross_repo._clear_cache()
+
+    idx.sync_from_markdown(str(store))
+    hits = idx.search_adrs("unification")
+    assert len(hits) >= 1
+    assert "snippet" in hits[0]
+    assert "excerpt" not in hits[0]
+
+
 def test_open_index_uses_env_var(tmp_path, monkeypatch):
     db_path = tmp_path / "custom.db"
     monkeypatch.setenv("SENESCHAL_INDEX_PATH", str(db_path))

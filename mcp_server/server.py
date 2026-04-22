@@ -45,6 +45,11 @@ import dependency_grep  # noqa: E402
 import review_index  # noqa: E402
 import seneschal_token  # noqa: E402
 from fs_safety import validate_repo_slug  # noqa: E402
+from review_index import (  # noqa: E402
+    DEFAULT_LIST_LIMIT,
+    DEFAULT_SEARCH_LIMIT,
+    MAX_LIMIT,
+)
 from review_store import (  # noqa: E402
     get_repo_memory,
     get_review,
@@ -52,6 +57,28 @@ from review_store import (  # noqa: E402
     list_reviews,
 )
 from secrets_scan import redact as _redact  # noqa: E402
+
+
+# --------------------------------------------------------------------------
+# Error contract helpers.
+# --------------------------------------------------------------------------
+
+# Tools that return a list use `[{"error": msg}]`; tools that return a
+# single dict use `{"error": msg}`. This pair of helpers is the one
+# place that shape lives so the prefix format stays uniform.
+#
+# We deliberately do NOT echo raw exception strings into tool responses
+# — those can carry secrets (GitHub API errors embed tokens in request
+# URLs, stack traces leak local paths). `_log` gets the full detail,
+# the tool consumer gets a scrubbed, fixed-shape payload.
+
+
+def _error_list(tool_name: str, context: str) -> list[dict]:
+    return [{"error": f"{tool_name} failed: {context}"}]
+
+
+def _error_dict(tool_name: str, context: str) -> dict:
+    return {"error": f"{tool_name} failed: {context}"}
 
 try:
     from fastmcp import FastMCP
@@ -168,7 +195,7 @@ def seneschal_review_history(repo: str, limit: int = 10) -> list[dict]:
         malformed, returns a one-element list with an error payload.
     """
     try:
-        recs = list_reviews(repo, limit=min(max(1, int(limit)), 100))
+        recs = list_reviews(repo, limit=min(max(1, int(limit)), MAX_LIMIT))
     except ValueError as e:
         return [{"error": str(e)}]
     return [r.summary() for r in recs]
@@ -227,7 +254,7 @@ def seneschal_repo_memory(repo: str, repo_root: str) -> str:
 
 @mcp.tool
 def seneschal_search_reviews(
-    query: str, repo: Optional[str] = None, limit: int = 20
+    query: str, repo: Optional[str] = None, limit: int = DEFAULT_SEARCH_LIMIT
 ) -> list[dict]:
     """Full-text search across every indexed Seneschal review.
 
@@ -249,25 +276,29 @@ def seneschal_search_reviews(
         idx = _get_index()
         return idx.search_reviews(query, repo=repo, limit=int(limit))
     except ValueError as e:
+        # ValueError is caller-facing (malformed slug / limit) — pass
+        # the raw message through so they can correct the input.
         return [{"error": str(e)}]
     except Exception as e:  # noqa: BLE001
-        _log(f"search_reviews failed: {e}")
-        return [{"error": f"search failed: {e}"}]
+        _log(f"seneschal_search_reviews failed for repo={repo!r}: {e}")
+        return _error_list("seneschal_search_reviews", "internal error; see server logs")
 
 
 @mcp.tool
 def seneschal_search_adrs(
-    query: str, repo: Optional[str] = None, limit: int = 10
+    query: str, repo: Optional[str] = None, limit: int = DEFAULT_SEARCH_LIMIT
 ) -> list[dict]:
     """Full-text search across ADRs discovered in every known repo.
 
     Args:
         query: Free-text phrase to search for.
         repo: Optional owner/name filter.
-        limit: Max ADRs to return (default 10, max 100).
+        limit: Max ADRs to return (default 20, max 200).
 
     Returns:
-        List of dicts with keys: repo, path, id, title, status, excerpt.
+        List of dicts with keys: repo, path, id, title, status, snippet.
+        The `snippet` key matches `search_reviews` — the previous
+        `excerpt` key was renamed for consistency.
     """
     try:
         idx = _get_index()
@@ -275,21 +306,25 @@ def seneschal_search_adrs(
     except ValueError as e:
         return [{"error": str(e)}]
     except Exception as e:  # noqa: BLE001
-        _log(f"search_adrs failed: {e}")
-        return [{"error": f"search failed: {e}"}]
+        _log(f"seneschal_search_adrs failed for repo={repo!r}: {e}")
+        return _error_list("seneschal_search_adrs", "internal error; see server logs")
 
 
 @mcp.tool
 def seneschal_merged_prs(
     repo: Optional[str] = None,
     since: Optional[str] = None,
-    limit: int = 20,
+    limit: int = DEFAULT_SEARCH_LIMIT,
 ) -> list[dict]:
     """Return merged PRs from the index, newest-first.
 
     Args:
         repo: Optional owner/name filter.
-        since: ISO-8601 lower bound on `merged_at` (inclusive).
+        since: ISO-8601 lower bound on `merged_at` (inclusive). Invalid
+            strings (e.g. `"yesterday"`) return an error payload rather
+            than silently producing an empty list — the index compares
+            lexicographically against ISO-8601 stamps, so any other
+            shape would silently skew results.
         limit: Max rows to return (default 20, max 200).
 
     Returns:
@@ -302,15 +337,15 @@ def seneschal_merged_prs(
     except ValueError as e:
         return [{"error": str(e)}]
     except Exception as e:  # noqa: BLE001
-        _log(f"list_merged_prs failed: {e}")
-        return [{"error": f"query failed: {e}"}]
+        _log(f"seneschal_merged_prs failed for repo={repo!r}: {e}")
+        return _error_list("seneschal_merged_prs", "internal error; see server logs")
 
 
 @mcp.tool
 def seneschal_followups(
     repo: Optional[str] = None,
     status: str = "open",
-    limit: int = 50,
+    limit: int = DEFAULT_LIST_LIMIT,
 ) -> list[dict]:
     """List open seneschal-followup issues across known repos.
 
@@ -336,7 +371,7 @@ def seneschal_followups(
             return [{"error": str(e)}]
     if status not in ("open", "closed", "all"):
         return [{"error": f"invalid status: {status!r} (want open/closed/all)"}]
-    limit = max(1, min(int(limit), 200))
+    limit = max(1, min(int(limit), MAX_LIMIT))
 
     if repo is not None:
         slugs = [repo]
@@ -344,7 +379,8 @@ def seneschal_followups(
         try:
             slugs = [kr.slug for kr in cross_repo.known_repos()]
         except Exception as e:  # noqa: BLE001
-            return [{"error": f"known_repos failed: {e}"}]
+            _log(f"seneschal_followups: known_repos failed: {e}")
+            return _error_list("seneschal_followups", "repo enumeration failed; see server logs")
 
     out: list[dict] = []
     for slug in slugs:
@@ -359,7 +395,8 @@ def seneschal_followups(
         except seneschal_token.TokenMintError as e:
             # A single-repo request that can't mint — surface as error.
             if repo is not None:
-                return [{"error": f"token mint failed for {slug}: {e}"}]
+                _log(f"seneschal_followups: token mint failed for {slug}: {e}")
+                return _error_list("seneschal_followups", f"token mint failed for {slug}")
             # Cross-repo sweep: skip and continue.
             _log(f"token mint failed for {slug}: {e}; skipping")
             continue
@@ -378,12 +415,24 @@ def seneschal_followups(
                 params=params,
                 timeout=10,
             )
+            # Rate-limit cascade guard: if GitHub tells us we're throttled
+            # or forbidden, every subsequent repo in this sweep will hit
+            # the same wall. Break the loop so we don't burn the rest of
+            # the tokens (and the caller's stdio buffer) on predictable
+            # failures. 5 extra lines, stops a real bug observed in the
+            # followup-heavy mornings.
+            if resp.status_code in (403, 429):
+                _log(
+                    f"seneschal_followups: GitHub returned {resp.status_code} for {slug}; "
+                    f"breaking loop to avoid cascading rate-limit failures"
+                )
+                break
             resp.raise_for_status()
             issues = resp.json()
         except (requests.HTTPError, requests.RequestException) as e:
             _log(f"issues fetch failed for {slug}: {e}")
             if repo is not None:
-                return [{"error": f"issues fetch failed for {slug}: {e}"}]
+                return _error_list("seneschal_followups", f"issues fetch failed for {slug}")
             continue
         if not isinstance(issues, list):
             continue
@@ -407,13 +456,17 @@ def seneschal_followups(
 
 @mcp.tool
 def seneschal_dependency_usage(
-    package_name: str, limit: int = 50
+    package_name: str, limit: int = DEFAULT_LIST_LIMIT
 ) -> list[dict]:
     """Grep every known repo's manifests for a package reference.
 
     Answers "if this package has a CVE, which repos do I need to patch?"
-    No parsing — straight substring match across package.json,
-    requirements.txt, pyproject.toml, go.mod, Package.swift, Cargo.toml.
+    Substring match across package.json, requirements.txt, pyproject.toml,
+    go.mod, Package.swift, Cargo.toml. Because it's a raw substring
+    match (no ecosystem-specific parser), short or common names can
+    produce false positives — `scan_all("requests")` also matches
+    `test-requests`, `requests-mock`, etc. Treat results as a
+    "manifests to eyeball" list, not a proof of usage.
 
     Args:
         package_name: Package name / substring to match.
@@ -425,8 +478,8 @@ def seneschal_dependency_usage(
     try:
         hits = dependency_grep.scan_all(package_name, limit=int(limit))
     except Exception as e:  # noqa: BLE001
-        _log(f"dependency scan failed: {e}")
-        return [{"error": f"scan failed: {e}"}]
+        _log(f"seneschal_dependency_usage failed for package={package_name!r}: {e}")
+        return _error_list("seneschal_dependency_usage", "internal error; see server logs")
     return [
         {"repo": h.repo, "path": h.path, "line": h.line, "matched": h.matched}
         for h in hits

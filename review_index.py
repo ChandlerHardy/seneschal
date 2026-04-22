@@ -55,6 +55,14 @@ _DEFAULT_INDEX_PATH = os.path.expanduser("~/.seneschal/index.db")
 _SNIPPET_WINDOW = 200    # chars on either side of the match
 _SNIPPET_MAX = 500       # hard cap regardless of window
 
+# Limit defaults shared between the Index layer and MCP tools. Centralised
+# so the MCP server and the Index agree on what "default" and "too much"
+# mean — previously every method had its own drifting defaults (20/50/50
+# at the server, 50/20/20 at the Index).
+DEFAULT_SEARCH_LIMIT = 20
+DEFAULT_LIST_LIMIT = 50
+MAX_LIMIT = 200
+
 # FTS tokens we must sanitize before handing to MATCH. FTS5 treats
 # `"`, `-`, `AND`/`OR`/`NOT`, `NEAR(` and parentheses as syntax; a raw
 # user query that happens to contain any of these crashes the query.
@@ -67,6 +75,34 @@ def _log(msg: str) -> None:
     neutral `log.log` so every module shares one formatter; the module
     tag stays local so stderr output remains grep-able."""
     _neutral_log(f"[review_index] {msg}")
+
+
+_ISO_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$"
+)
+
+
+def _parse_iso_or_raise(value: str) -> str:
+    """Validate that `value` is an ISO-8601 date or datetime string.
+
+    `list_merged_prs` uses `since` in a lexicographic SQL comparison.
+    Human input like `"yesterday"` or a date-only string mismatched
+    against `merged_at`'s "YYYY-MM-DDTHH:MM:SSZ" shape used to
+    silently return empty lists — a caller typo was indistinguishable
+    from an honestly-empty window.
+
+    Accepts `YYYY-MM-DD` and full ISO datetimes with optional
+    fractional seconds and a `Z` / `+HH:MM` offset. Returns the input
+    unchanged (SQL comparison stays string-based); raises ValueError
+    on anything that won't safely sort against the stored `merged_at`.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"since must be an ISO-8601 string, got {value!r}")
+    if not _ISO_DATETIME_RE.match(value):
+        raise ValueError(
+            f"since must be an ISO-8601 date or datetime, got {value!r}"
+        )
+    return value
 
 
 def _sanitize_fts_query(q: str) -> str:
@@ -688,7 +724,7 @@ class Index:
         a sane upper bound to bound MCP response size."""
         if repo is not None:
             validate_repo_slug(repo)
-        limit = max(1, min(int(limit), 200))
+        limit = max(1, min(int(limit), MAX_LIMIT))
 
         with self._lock:
             cur = self._con.cursor()
@@ -757,7 +793,7 @@ class Index:
         """Full-text search across indexed ADRs from every known repo."""
         if repo is not None:
             validate_repo_slug(repo)
-        limit = max(1, min(int(limit), 100))
+        limit = max(1, min(int(limit), MAX_LIMIT))
 
         with self._lock:
             cur = self._con.cursor()
@@ -805,7 +841,7 @@ class Index:
             # third-party cloned repos (the operator's `~/repos`), so a
             # leaked key in an ADR body must be scrubbed before it flows
             # out through this MCP tool. Same contract as search_reviews.
-            excerpt = _make_snippet(body, query)
+            snippet = _make_snippet(body, query)
             # Titles can also carry injection content if a cloned repo's
             # ADR has a deliberately crafted H1. Redact uniformly.
             title = _redact_snippet(row[3] or "")
@@ -816,7 +852,11 @@ class Index:
                     "id": row[2] or "",
                     "title": title,
                     "status": row[4] or "",
-                    "excerpt": excerpt,
+                    # Unified with `search_reviews`' `snippet` key.
+                    # search_reviews returns "snippet"; search_adrs
+                    # used to return "excerpt" for the same concept.
+                    # One name across both tools.
+                    "snippet": snippet,
                 }
             )
         return out
@@ -833,7 +873,15 @@ class Index:
         tool doesn't have to reach into private SQL itself."""
         if repo is not None:
             validate_repo_slug(repo)
-        limit = max(1, min(int(limit), 200))
+        limit = max(1, min(int(limit), MAX_LIMIT))
+        # Validate `since` before it reaches the SQL comparison so a
+        # caller typo like `"yesterday"` fails loudly (caller returns
+        # an error payload) instead of silently producing an empty
+        # window. The stored `merged_at` is ISO-8601 and comparison is
+        # lexicographic, so any non-ISO input can skew results in
+        # surprising ways.
+        if since is not None:
+            since = _parse_iso_or_raise(since)
         sql = (
             "SELECT repo, pr_number, verdict, timestamp, merged_at, head_sha, url "
             "FROM reviews WHERE merged_at IS NOT NULL "

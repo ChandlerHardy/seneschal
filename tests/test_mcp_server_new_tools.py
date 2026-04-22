@@ -60,12 +60,16 @@ def test_search_adrs_returns_list_of_dicts():
     mock_idx = MagicMock()
     mock_idx.search_adrs.return_value = [
         {"repo": "a/b", "path": "docs/adr/0001.md", "id": "0001",
-         "title": "T", "status": "accepted", "excerpt": "body"},
+         "title": "T", "status": "accepted", "snippet": "body"},
     ]
     with patch.object(server, "_get_index", return_value=mock_idx):
         out = server.seneschal_search_adrs("postgres")
     assert isinstance(out, list)
     assert out[0]["id"] == "0001"
+    # `snippet` is the unified key across search_reviews and search_adrs;
+    # the old `excerpt` key has been renamed.
+    assert "snippet" in out[0]
+    assert "excerpt" not in out[0]
 
 
 def test_search_adrs_error_payload_on_invalid_repo():
@@ -174,6 +178,74 @@ def test_followups_respects_limit():
         rget.return_value = _issue_response(page)
         out = server.seneschal_followups(repo="owner/r", limit=5)
     assert len(out) == 5
+
+
+def test_dependency_usage_error_does_not_leak_exception_detail():
+    """Catch-all error paths must not echo raw exception strings back to
+    the MCP client. Those strings can embed tokens (GitHub API errors
+    include URLs with tokens in the query string), local paths, and
+    other host-sensitive detail. The response should be a fixed-shape
+    'internal error; see server logs' message instead."""
+    import dependency_grep
+
+    sensitive_msg = "boom ghs_SENSITIVE_TOKEN_XYZ /home/user/.config/secret"
+    with patch.object(dependency_grep, "scan_all", side_effect=RuntimeError(sensitive_msg)):
+        out = server.seneschal_dependency_usage("foo")
+    assert len(out) == 1
+    err = out[0].get("error", "")
+    assert "SENSITIVE" not in err
+    assert "secret" not in err.lower()
+    # The error prefix carries the tool name for grep-ability.
+    assert "seneschal_dependency_usage" in err
+
+
+def test_search_reviews_error_does_not_leak_exception_detail():
+    """Same contract for search_reviews. The ValueError path is allowed
+    to echo (caller-facing validation messages); the catch-all path is
+    not."""
+    mock_idx = MagicMock()
+    mock_idx.search_reviews.side_effect = RuntimeError("boom ghs_LEAK_TOKEN /etc/secret")
+    with patch.object(server, "_get_index", return_value=mock_idx):
+        out = server.seneschal_search_reviews("q")
+    assert len(out) == 1
+    err = out[0].get("error", "")
+    assert "LEAK" not in err
+    assert "/etc/secret" not in err
+
+
+def test_followups_breaks_loop_on_rate_limit():
+    """When GitHub returns 403/429 for one repo, every subsequent repo
+    in the sweep will hit the same rate limit — the loop must break
+    rather than burning through tokens + cluttering the response."""
+    import cross_repo
+
+    fake_repos = [
+        cross_repo.KnownRepo(slug="a/one", path="/tmp/a/one"),
+        cross_repo.KnownRepo(slug="a/two", path="/tmp/a/two"),
+        cross_repo.KnownRepo(slug="a/three", path="/tmp/a/three"),
+    ]
+
+    rate_limited = MagicMock()
+    rate_limited.status_code = 429
+    rate_limited.raise_for_status = MagicMock()
+    rate_limited.json.return_value = []
+    rate_limited.headers = {}
+
+    get_call_count = {"n": 0}
+
+    def _fake_get(*args, **kwargs):
+        get_call_count["n"] += 1
+        return rate_limited
+
+    with patch.object(cross_repo, "known_repos", return_value=fake_repos), patch.object(
+        seneschal_token, "mint_installation_token", return_value="tok"
+    ), patch("mcp_server.server.requests.get", side_effect=_fake_get):
+        out = server.seneschal_followups()
+
+    # The loop must STOP on the first rate-limit response — not call
+    # requests.get for every subsequent repo.
+    assert get_call_count["n"] == 1
+    assert out == []
 
 
 def test_followups_rejects_invalid_repo_slug():
