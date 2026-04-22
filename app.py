@@ -174,38 +174,6 @@ def verify_signature(payload, signature):
     return hmac.compare_digest(expected, signature)
 
 
-def parse_verdict(review_text):
-    """Determine the GitHub review event from the review body text.
-
-    Recognizes both formats Seneschal produces:
-
-    1. Single-pass review (analyzer.py + one Claude call) — looks for the
-       "NEEDS CHANGES" / "NEEDS_CHANGES" sentinel from that prompt's
-       verdict rule, defaulting to APPROVE when absent.
-    2. Full multi-persona review (full_review.py + slash command) —
-       looks for the explicit ``**Verdict:** REQUEST_CHANGES|COMMENT|APPROVE``
-       line that the /seneschal-review command writes near the top.
-
-    The full-review path's COMMENT verdict is preserved so the bot can
-    leave non-blocking feedback (warnings + minor) without auto-approving
-    or hard-blocking the PR.
-    """
-    first_lines = review_text[:1000].upper()
-
-    # Seneschal full-review explicit verdict line (most specific, check first).
-    if "**VERDICT:** REQUEST_CHANGES" in first_lines or "**VERDICT:** REQUEST CHANGES" in first_lines:
-        return "REQUEST_CHANGES"
-    if "**VERDICT:** APPROVE" in first_lines:
-        return "APPROVE"
-    if "**VERDICT:** COMMENT" in first_lines:
-        return "COMMENT"
-
-    # Single-pass legacy format.
-    if "NEEDS CHANGES" in first_lines or "NEEDS_CHANGES" in first_lines:
-        return "REQUEST_CHANGES"
-    return "APPROVE"
-
-
 def _local_repo_path(repo: str) -> str:
     return os.path.join(REPOS_DIR, REPO_NAME_MAP.get(repo, repo))
 

@@ -131,3 +131,55 @@ def test_get_pr_commits_caps_at_page_limit():
     assert any("truncated" in msg.lower() for msg in captured_logs), (
         f"expected a truncation warning in logs; got {captured_logs!r}"
     )
+
+
+# --------------------------------------------------------------------------
+# parse_verdict — round 5 W3 moved this from `app.py` to `github_api.py`
+# to colocate with its sole caller `post_review` and remove the cross-
+# module deferred import. Add sanity tests at the new location.
+# --------------------------------------------------------------------------
+
+
+def test_parse_verdict_explicit_request_changes():
+    """Full-review explicit verdict line: `**Verdict:** REQUEST_CHANGES`
+    wins over anything else in the body."""
+    body = (
+        "## Review\n\n**Verdict:** REQUEST_CHANGES\n\n"
+        "- nit: minor issue\n"
+    )
+    assert github_api.parse_verdict(body) == "REQUEST_CHANGES"
+
+
+def test_parse_verdict_explicit_approve():
+    body = "## Review\n\n**Verdict:** APPROVE\n\nLGTM.\n"
+    assert github_api.parse_verdict(body) == "APPROVE"
+
+
+def test_parse_verdict_explicit_comment():
+    """COMMENT verdict preserves the non-blocking-feedback path so the
+    bot can leave warnings without auto-approving or blocking."""
+    body = "## Review\n\n**Verdict:** COMMENT\n\nFYI only.\n"
+    assert github_api.parse_verdict(body) == "COMMENT"
+
+
+def test_parse_verdict_legacy_needs_changes_sentinel():
+    """Single-pass legacy format: `NEEDS CHANGES` / `NEEDS_CHANGES`
+    sentinel from analyzer.py's prompt still maps to REQUEST_CHANGES."""
+    body = "Review body: this PR NEEDS CHANGES before merge."
+    assert github_api.parse_verdict(body) == "REQUEST_CHANGES"
+    body2 = "Review body: NEEDS_CHANGES."
+    assert github_api.parse_verdict(body2) == "REQUEST_CHANGES"
+
+
+def test_parse_verdict_defaults_to_approve_when_no_sentinel():
+    """No verdict line + no NEEDS CHANGES sentinel → APPROVE (the
+    analyzer prompt's default when no issues need fixing)."""
+    body = "LGTM. Nothing to fix here."
+    assert github_api.parse_verdict(body) == "APPROVE"
+
+
+def test_parse_verdict_request_changes_space_variant():
+    """Accept both `REQUEST_CHANGES` and `REQUEST CHANGES` (space) since
+    the full-review template has varied across iterations."""
+    body = "**Verdict:** REQUEST CHANGES\n\nnit."
+    assert github_api.parse_verdict(body) == "REQUEST_CHANGES"

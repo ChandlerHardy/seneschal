@@ -491,6 +491,44 @@ def apply_labels(owner, repo, pr_number, labels, token):
         log(f"Failed to apply labels {labels}: {e}")
 
 
+def parse_verdict(review_text):
+    """Determine the GitHub review event from the review body text.
+
+    Recognizes both formats Seneschal produces:
+
+    1. Single-pass review (analyzer.py + one Claude call) — looks for the
+       "NEEDS CHANGES" / "NEEDS_CHANGES" sentinel from that prompt's
+       verdict rule, defaulting to APPROVE when absent.
+    2. Full multi-persona review (full_review.py + slash command) —
+       looks for the explicit ``**Verdict:** REQUEST_CHANGES|COMMENT|APPROVE``
+       line that the /seneschal-review command writes near the top.
+
+    The full-review path's COMMENT verdict is preserved so the bot can
+    leave non-blocking feedback (warnings + minor) without auto-approving
+    or hard-blocking the PR.
+
+    Relocated from `app.py` in round 5 W3: the only caller was
+    `post_review` here, which used to do a deferred `from app import
+    parse_verdict` to reach it. Colocating the function with its sole
+    caller removes the cross-module deferred import and shrinks
+    `app.py`'s public surface.
+    """
+    first_lines = review_text[:1000].upper()
+
+    # Seneschal full-review explicit verdict line (most specific, check first).
+    if "**VERDICT:** REQUEST_CHANGES" in first_lines or "**VERDICT:** REQUEST CHANGES" in first_lines:
+        return "REQUEST_CHANGES"
+    if "**VERDICT:** APPROVE" in first_lines:
+        return "APPROVE"
+    if "**VERDICT:** COMMENT" in first_lines:
+        return "COMMENT"
+
+    # Single-pass legacy format.
+    if "NEEDS CHANGES" in first_lines or "NEEDS_CHANGES" in first_lines:
+        return "REQUEST_CHANGES"
+    return "APPROVE"
+
+
 def post_review(owner, repo, pr_number, body, token, inline_comments=None, *, head_sha=""):
     """Post a formal PR review (APPROVE or REQUEST_CHANGES).
 
@@ -507,10 +545,11 @@ def post_review(owner, repo, pr_number, body, token, inline_comments=None, *, he
     review-store frontmatter so P2's SQLite index carries the actual
     PR head SHA instead of a blank column.
     """
-    # Deferred import — app.py imports from github_api, so a top-level
-    # `from app import ...` here would be circular. parse_verdict + log +
-    # _per_pr_lock + save_review all live elsewhere; we reach them lazily.
-    from app import parse_verdict, log, _per_pr_lock
+    # Deferred imports — `app.py` imports from `github_api`, so a top-level
+    # `from app import ...` here would be circular. `log` + `_per_pr_lock`
+    # still live in app.py; reach them lazily. `parse_verdict` now lives
+    # in this module (round 5 W3).
+    from app import log, _per_pr_lock
     from review_store import save_review
 
     verdict = parse_verdict(body)
