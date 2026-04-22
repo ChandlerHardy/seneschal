@@ -47,8 +47,9 @@ def test_handle_pr_merged_updates_changelog(tmp_path, monkeypatch):
     save_review("o/r", 42, "APPROVE", "https://x/42", "review body without followups")
 
     cfg = _config(changelog=True)
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "token123"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "token123"
         mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
         os.makedirs(tmp_path / "clone", exist_ok=True)
         # CHANGELOG.md already exists in the clone.
@@ -56,8 +57,8 @@ def test_handle_pr_merged_updates_changelog(tmp_path, monkeypatch):
             "# Changelog\n\n## [Unreleased]\n"
         )
         # Mock the github file-API helpers.
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
 
         result = handle_pr_merged(
             owner="o",
@@ -69,10 +70,10 @@ def test_handle_pr_merged_updates_changelog(tmp_path, monkeypatch):
         )
 
     assert result["changelog_updated"] is True
-    assert mock_app.put_file.called
+    assert mock_gh.put_file.called
     # Confirm the put_file payload contained the new entry.
-    call_kwargs = mock_app.put_file.call_args.kwargs
-    posted_content = call_kwargs.get("content") or mock_app.put_file.call_args.args[3]
+    call_kwargs = mock_gh.put_file.call_args.kwargs
+    posted_content = call_kwargs.get("content") or mock_gh.put_file.call_args.args[3]
     assert "add thing" in posted_content
 
 
@@ -87,11 +88,12 @@ def test_handle_pr_merged_files_followups(tmp_path, monkeypatch):
     )
 
     cfg = _config(followups=True)
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "token123"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "token123"
         mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
         # Two issues created.
-        mock_app.create_issue = MagicMock(side_effect=[
+        mock_gh.create_issue = MagicMock(side_effect=[
             {"number": 501}, {"number": 502}
         ])
 
@@ -105,7 +107,7 @@ def test_handle_pr_merged_files_followups(tmp_path, monkeypatch):
         )
 
     assert sorted(result["followups_filed"]) == [501, 502]
-    assert mock_app.create_issue.call_count == 2
+    assert mock_gh.create_issue.call_count == 2
 
 
 def test_handle_pr_merged_marks_review_merged(tmp_path, monkeypatch):
@@ -113,10 +115,11 @@ def test_handle_pr_merged_marks_review_merged(tmp_path, monkeypatch):
     save_review("o/r", 42, "APPROVE", "https://x/42", "body")
 
     cfg = _config(followups=True)
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
-        mock_app.create_issue = MagicMock(return_value={"number": 999})
+        mock_gh.create_issue = MagicMock(return_value={"number": 999})
 
         handle_pr_merged(
             owner="o",
@@ -156,10 +159,11 @@ def test_handle_pr_merged_skips_already_filed_followups(tmp_path, monkeypatch):
     )
 
     cfg = _config(followups=True)
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
-        mock_app.create_issue = MagicMock()
+        mock_gh.create_issue = MagicMock()
 
         result = handle_pr_merged(
             owner="o",
@@ -174,7 +178,7 @@ def test_handle_pr_merged_skips_already_filed_followups(tmp_path, monkeypatch):
     # Title-based dedupe — the count-based heuristic would fire here since
     # the only parsed followup would be "new" relative to a zero-length set,
     # which is precisely the bug this regression guards.
-    assert mock_app.create_issue.call_count == 0
+    assert mock_gh.create_issue.call_count == 0
     assert result.get("followups_filed", []) == []
 
 
@@ -200,10 +204,11 @@ def test_handle_pr_merged_files_new_followup_when_old_one_dropped(tmp_path, monk
     )
 
     cfg = _config(followups=True)
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
-        mock_app.create_issue = MagicMock(return_value={"number": 777})
+        mock_gh.create_issue = MagicMock(return_value={"number": 777})
 
         result = handle_pr_merged(
             owner="o",
@@ -216,7 +221,7 @@ def test_handle_pr_merged_files_new_followup_when_old_one_dropped(tmp_path, monk
 
     # The new "brand new concern" followup IS filed even though the
     # parsed-count equals the already-filed count.
-    assert mock_app.create_issue.call_count == 1
+    assert mock_gh.create_issue.call_count == 1
     assert result["followups_filed"] == [777]
 
 
@@ -232,13 +237,14 @@ def test_handle_pr_merged_falls_back_to_pr_when_protected(tmp_path, monkeypatch)
     save_review("o/r", 42, "APPROVE", "https://x/42", "body")
 
     cfg = _config(changelog=True)
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         (clone_dir / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.PushProtectedError = PushProtectedError
+        mock_gh.PushProtectedError = PushProtectedError
 
         # First put_file (direct to main) raises PushProtectedError;
         # subsequent ones (on the auto-PR branch) succeed.
@@ -249,11 +255,11 @@ def test_handle_pr_merged_falls_back_to_pr_when_protected(tmp_path, monkeypatch)
             if call_count["n"] == 1 and branch == "main":
                 raise PushProtectedError("main is protected")
             return {"commit": {"sha": "abc"}}
-        mock_app.put_file = MagicMock(side_effect=_put_file)
-        mock_app.create_branch = MagicMock(return_value={"ref": "refs/heads/seneschal/changelog-42"})
-        mock_app.create_pull_request = MagicMock(return_value={"number": 99})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_gh.put_file = MagicMock(side_effect=_put_file)
+        mock_gh.create_branch = MagicMock(return_value={"ref": "refs/heads/seneschal/changelog-42"})
+        mock_gh.create_pull_request = MagicMock(return_value={"number": 99})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.get_default_branch_sha = MagicMock(return_value="defaultsha")
 
         result = handle_pr_merged(
             owner="o",
@@ -264,8 +270,8 @@ def test_handle_pr_merged_falls_back_to_pr_when_protected(tmp_path, monkeypatch)
             config=cfg,
         )
 
-    assert mock_app.create_branch.called
-    assert mock_app.create_pull_request.called
+    assert mock_gh.create_branch.called
+    assert mock_gh.create_pull_request.called
     # The protection cache now remembers o/r is protected (TTL-wrapped
     # entry: (timestamp, protected_bool)).
     entry = _PROTECTED_REPOS.get("o/r")
@@ -285,22 +291,23 @@ def test_handle_pr_merged_amends_existing_release_pr(tmp_path, monkeypatch):
     save_review("o/r", 42, "APPROVE", "https://x/42", "body")
 
     cfg = _config(changelog=True, release_threshold="patch")
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         (clone_dir / "CHANGELOG.md").write_text(
             "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- earlier ([#41](x))\n"
         )
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.get_default_branch_sha = MagicMock(return_value="defaultsha")
         # An existing release PR is open.
-        mock_app.find_open_prs_with_label = MagicMock(return_value=[
+        mock_gh.find_open_prs_with_label = MagicMock(return_value=[
             {"number": 77, "head": {"ref": "seneschal/release-0.3.0"}},
         ])
-        mock_app.create_pull_request = MagicMock()
+        mock_gh.create_pull_request = MagicMock()
 
         result = handle_pr_merged(
             owner="o",
@@ -312,7 +319,7 @@ def test_handle_pr_merged_amends_existing_release_pr(tmp_path, monkeypatch):
         )
 
     # No new release PR created — amended the existing one instead.
-    assert mock_app.create_pull_request.called is False or result.get("release_pr") == 77
+    assert mock_gh.create_pull_request.called is False or result.get("release_pr") == 77
 
 
 # --------------------------------------------------------------------------
@@ -324,7 +331,8 @@ def test_handle_pr_merged_no_ops_on_default_config(tmp_path, monkeypatch):
     monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
     save_review("o/r", 42, "APPROVE", "", "body")
     cfg = RepoConfig()  # all off
-    with patch("post_merge.orchestrator.app") as mock_app:
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
         result = handle_pr_merged(
             owner="o",
             repo="r",
@@ -335,7 +343,7 @@ def test_handle_pr_merged_no_ops_on_default_config(tmp_path, monkeypatch):
         )
     assert result["changelog_updated"] is False
     assert result["followups_filed"] == []
-    assert mock_app.create_issue.called is False
+    assert mock_gh.create_issue.called is False
 
 
 # --------------------------------------------------------------------------
@@ -347,8 +355,9 @@ def test_handle_pr_merged_swallows_exceptions(tmp_path, monkeypatch):
     monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
     save_review("o/r", 42, "APPROVE", "", "body")
     cfg = _config(changelog=True)
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.side_effect = RuntimeError("boom")
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.side_effect = RuntimeError("boom")
         # Must not raise.
         result = handle_pr_merged(
             owner="o",
@@ -391,10 +400,11 @@ def test_handle_pr_merged_sanitizes_issue_body(tmp_path, monkeypatch):
         captured.update(kwargs)
         return {"number": 501}
 
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
-        mock_app.create_issue = MagicMock(side_effect=_capture)
+        mock_gh.create_issue = MagicMock(side_effect=_capture)
 
         handle_pr_merged(
             owner="o",
@@ -434,19 +444,20 @@ def test_handle_pr_merged_dead_letters_changelog_on_conflict_exhaustion(tmp_path
     save_review("o/r", 42, "APPROVE", "https://x/42", "body")
 
     cfg = _config(changelog=True, followup_label="followup")
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         (clone_dir / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.PushProtectedError = PushProtectedError
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.PushProtectedError = PushProtectedError
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
         # put_file exhausts sha-conflict retries.
-        mock_app.put_file = MagicMock(
+        mock_gh.put_file = MagicMock(
             side_effect=RuntimeError("put_file: gave up after 3 retries on o/r/CHANGELOG.md")
         )
-        mock_app.create_issue = MagicMock(return_value={"number": 999})
+        mock_gh.create_issue = MagicMock(return_value={"number": 999})
 
         result = handle_pr_merged(
             owner="o",
@@ -458,8 +469,8 @@ def test_handle_pr_merged_dead_letters_changelog_on_conflict_exhaustion(tmp_path
         )
 
     # Dead-letter issue filed exactly once.
-    assert mock_app.create_issue.call_count == 1
-    call = mock_app.create_issue.call_args
+    assert mock_gh.create_issue.call_count == 1
+    call = mock_gh.create_issue.call_args
     assert "#42" in (call.kwargs.get("title") or "")
     assert result["changelog_updated"] is False
 
@@ -479,23 +490,24 @@ def test_release_step_fetches_commits_for_breaking_detection(tmp_path, monkeypat
     # With the scan, a commit body carrying BREAKING CHANGE: must force
     # the bump to major and trigger the release PR.
     cfg = _config(changelog=True, release_threshold="minor")
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         (clone_dir / "CHANGELOG.md").write_text(
             "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- a fix ([#40](x))\n"
         )
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
-        mock_app.find_open_prs_with_label = MagicMock(return_value=[])
-        mock_app.get_pr_commits = MagicMock(return_value=[
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_gh.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_gh.get_pr_commits = MagicMock(return_value=[
             {"commit": {"message": "fix: patchy\n\nBREAKING CHANGE: drops config X"}},
         ])
-        mock_app.create_pull_request = MagicMock(return_value={"number": 88})
-        mock_app.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
+        mock_gh.create_pull_request = MagicMock(return_value={"number": 88})
+        mock_gh.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
 
         result = handle_pr_merged(
             owner="o",
@@ -508,7 +520,7 @@ def test_release_step_fetches_commits_for_breaking_detection(tmp_path, monkeypat
 
     # Commit-body scan escalated the bump from patch -> major, which
     # crosses the "minor" threshold and opens a release PR.
-    assert mock_app.get_pr_commits.called
+    assert mock_gh.get_pr_commits.called
     assert result.get("release_pr") == 88
 
 
@@ -559,23 +571,24 @@ def test_release_step_422_race_falls_back_to_amend(tmp_path, monkeypatch):
             return []
         return [{"number": 77, "head": {"ref": "seneschal/release-0.3.0"}}]
 
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         (clone_dir / "CHANGELOG.md").write_text(
             "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- x ([#1](x))\n"
         )
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
-        mock_app.find_open_prs_with_label = MagicMock(side_effect=_find)
-        mock_app.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
-        mock_app.create_pull_request = MagicMock(
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_gh.find_open_prs_with_label = MagicMock(side_effect=_find)
+        mock_gh.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
+        mock_gh.create_pull_request = MagicMock(
             side_effect=RuntimeError("HTTP 422: A pull request already exists for o:seneschal/release-x")
         )
-        mock_app.get_pr_commits = MagicMock(return_value=[])
+        mock_gh.get_pr_commits = MagicMock(return_value=[])
 
         result = handle_pr_merged(
             owner="o",
@@ -602,8 +615,9 @@ def test_release_pr_branch_uses_next_semver_when_discoverable(tmp_path, monkeypa
     save_review("o/r", 42, "APPROVE", "https://x/42", "body")
 
     cfg = _config(changelog=True, release_threshold="patch")
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         (clone_dir / "CHANGELOG.md").write_text(
@@ -614,19 +628,19 @@ def test_release_pr_branch_uses_next_semver_when_discoverable(tmp_path, monkeypa
             '[project]\nname = "thing"\nversion = "1.2.3"\n'
         )
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
-        mock_app.find_open_prs_with_label = MagicMock(return_value=[])
-        mock_app.get_pr_commits = MagicMock(return_value=[])
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_gh.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_gh.get_pr_commits = MagicMock(return_value=[])
         created = {}
 
         def _create_branch(owner, repo, new_ref, from_sha, token):
             created["branch"] = new_ref
             return {"ref": f"refs/heads/{new_ref}"}
 
-        mock_app.create_branch = MagicMock(side_effect=_create_branch)
-        mock_app.create_pull_request = MagicMock(return_value={"number": 99})
+        mock_gh.create_branch = MagicMock(side_effect=_create_branch)
+        mock_gh.create_pull_request = MagicMock(return_value={"number": 99})
 
         handle_pr_merged(
             owner="o",
@@ -648,8 +662,9 @@ def test_release_pr_branch_falls_back_to_pending_when_version_unknown(tmp_path, 
     save_review("o/r", 42, "APPROVE", "https://x/42", "body")
 
     cfg = _config(changelog=True, release_threshold="patch")
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         # No pyproject, package.json, VERSION, or git tags.
@@ -657,19 +672,19 @@ def test_release_pr_branch_falls_back_to_pending_when_version_unknown(tmp_path, 
             "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- x ([#1](x))\n"
         )
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
-        mock_app.find_open_prs_with_label = MagicMock(return_value=[])
-        mock_app.get_pr_commits = MagicMock(return_value=[])
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_gh.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_gh.get_pr_commits = MagicMock(return_value=[])
         created = {}
 
         def _create_branch(owner, repo, new_ref, from_sha, token):
             created["branch"] = new_ref
             return {"ref": f"refs/heads/{new_ref}"}
 
-        mock_app.create_branch = MagicMock(side_effect=_create_branch)
-        mock_app.create_pull_request = MagicMock(return_value={"number": 99})
+        mock_gh.create_branch = MagicMock(side_effect=_create_branch)
+        mock_gh.create_pull_request = MagicMock(return_value={"number": 99})
 
         handle_pr_merged(
             owner="o",
@@ -781,8 +796,9 @@ def test_amend_release_pr_refetches_changelog_before_writing(tmp_path, monkeypat
     save_review("o/r", 42, "APPROVE", "https://x/42", "body")
 
     cfg = _config(changelog=True, release_threshold="patch")
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         # Stale local clone — this is the `existing` snapshot the caller
@@ -791,10 +807,10 @@ def test_amend_release_pr_refetches_changelog_before_writing(tmp_path, monkeypat
             "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- old ([#40](x))\n"
         )
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
-        mock_app.find_open_prs_with_label = MagicMock(return_value=[
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_gh.find_open_prs_with_label = MagicMock(return_value=[
             {"number": 77, "head": {"ref": "seneschal/release-0.3.0"}},
         ])
         # Fresh content from main — includes a NEW entry pushed between
@@ -804,11 +820,11 @@ def test_amend_release_pr_refetches_changelog_before_writing(tmp_path, monkeypat
             "# Changelog\n\n## [Unreleased]\n\n"
             "### Fixed\n- old ([#40](x))\n- NEW ([#42](x))\n"
         )
-        mock_app.get_file_content = MagicMock(
+        mock_gh.get_file_content = MagicMock(
             return_value=(fresh_from_main, "freshsha")
         )
-        mock_app.create_pull_request = MagicMock()
-        mock_app.get_pr_commits = MagicMock(return_value=[])
+        mock_gh.create_pull_request = MagicMock()
+        mock_gh.get_pr_commits = MagicMock(return_value=[])
 
         handle_pr_merged(
             owner="o",
@@ -820,14 +836,14 @@ def test_amend_release_pr_refetches_changelog_before_writing(tmp_path, monkeypat
         )
 
     # Amend call must have happened.
-    assert mock_app.get_file_content.called, (
+    assert mock_gh.get_file_content.called, (
         "_amend_release_pr didn't re-fetch CHANGELOG from main — "
         "W2 regression: stale snapshot would have been written back."
     )
     # The put_file that wrote the release branch must have used the
     # fresh content, not the stale one. Find that specific call.
     amend_calls = [
-        c for c in mock_app.put_file.call_args_list
+        c for c in mock_gh.put_file.call_args_list
         if (c.kwargs.get("branch") or "").startswith("seneschal/release")
     ]
     assert amend_calls, "No put_file targeted the release branch"
@@ -861,13 +877,14 @@ def test_amend_release_pr_falls_back_to_snapshot_when_fetch_fails(tmp_path, monk
     )
     existing_pr = {"number": 77, "head": {"ref": "seneschal/release-0.3.0"}}
 
-    with patch("post_merge.orchestrator.app") as mock_app:
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
         # get_file_content raises — simulates a 404 / transient 5xx.
-        mock_app.get_file_content = MagicMock(
+        mock_gh.get_file_content = MagicMock(
             side_effect=RuntimeError("HTTP 500: upstream")
         )
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
 
         result = _amend_release_pr(
             owner="o",
@@ -881,11 +898,11 @@ def test_amend_release_pr_falls_back_to_snapshot_when_fetch_fails(tmp_path, monk
     # Should still return the PR number.
     assert result == 77
     # put_file MUST have been called despite the fetch failure.
-    assert mock_app.put_file.called, (
+    assert mock_gh.put_file.called, (
         "Blocker 2 regression: fetch failure short-circuited the write — "
         "_amend_release_pr should fall back to the snapshot."
     )
-    call = mock_app.put_file.call_args
+    call = mock_gh.put_file.call_args
     # Snapshot content was written.
     assert call.kwargs["content"] == snapshot
     # Commit message carries the stale-snapshot tag.
@@ -903,8 +920,9 @@ def test_changelog_step_crlf_compare_is_normalized(tmp_path, monkeypatch):
     save_review("o/r", 42, "APPROVE", "https://x/42", "body")
 
     cfg = _config(changelog=True)
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         # Write CHANGELOG with CRLF line endings (Windows-origin).
@@ -918,8 +936,8 @@ def test_changelog_step_crlf_compare_is_normalized(tmp_path, monkeypatch):
             existing.replace("\n", "\r\n").encode("utf-8")
         )
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
 
         handle_pr_merged(
             owner="o",
@@ -933,8 +951,8 @@ def test_changelog_step_crlf_compare_is_normalized(tmp_path, monkeypatch):
     # The content written to GitHub must be LF-only (insert produces
     # LF; compare against normalized existing so the "skip" path is
     # reachable for future dedupe logic).
-    assert mock_app.put_file.called
-    written = mock_app.put_file.call_args.kwargs.get("content") or ""
+    assert mock_gh.put_file.called
+    written = mock_gh.put_file.call_args.kwargs.get("content") or ""
     assert "\r\n" not in written, (
         "put_file received CRLF content — W2 fix should normalize "
         "existing to LF on compare + carry LF through the write."
@@ -957,10 +975,11 @@ def test_amend_release_pr_uses_fresh_when_fetch_succeeds(tmp_path, monkeypatch):
     )
     existing_pr = {"number": 77, "head": {"ref": "seneschal/release-0.3.0"}}
 
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_file_content = MagicMock(return_value=(fresh, "freshsha"))
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_file_content = MagicMock(return_value=(fresh, "freshsha"))
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
 
         _amend_release_pr(
             owner="o",
@@ -971,7 +990,7 @@ def test_amend_release_pr_uses_fresh_when_fetch_succeeds(tmp_path, monkeypatch):
             token="tok",
         )
 
-    call = mock_app.put_file.call_args
+    call = mock_gh.put_file.call_args
     assert call.kwargs["content"] == fresh
     # Fresh fetch succeeded → no stale-snapshot tag.
     assert "stale" not in call.kwargs["message"].lower()
@@ -1022,8 +1041,9 @@ def test_release_pr_body_uses_render_release_notes(tmp_path, monkeypatch):
         captured_body["body"] = kwargs.get("body") or ""
         return {"number": 99}
 
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         # Version discoverable → render_release_notes should fire.
@@ -1036,13 +1056,13 @@ def test_release_pr_body_uses_render_release_notes(tmp_path, monkeypatch):
             "### Fixed\n- broken thing ([#40](x))\n"
         )
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
-        mock_app.find_open_prs_with_label = MagicMock(return_value=[])
-        mock_app.get_pr_commits = MagicMock(return_value=[])
-        mock_app.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
-        mock_app.create_pull_request = MagicMock(side_effect=_capture_create)
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_gh.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_gh.get_pr_commits = MagicMock(return_value=[])
+        mock_gh.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
+        mock_gh.create_pull_request = MagicMock(side_effect=_capture_create)
 
         handle_pr_merged(
             owner="o",
@@ -1084,8 +1104,9 @@ def test_release_pr_body_falls_back_when_version_unknown(tmp_path, monkeypatch):
         captured_body["body"] = kwargs.get("body") or ""
         return {"number": 99}
 
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         clone_dir = tmp_path / "clone"
         clone_dir.mkdir()
         # No version source.
@@ -1093,13 +1114,13 @@ def test_release_pr_body_falls_back_when_version_unknown(tmp_path, monkeypatch):
             "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- x ([#1](x))\n"
         )
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
-        mock_app.get_file_sha = MagicMock(return_value="oldsha")
-        mock_app.get_default_branch_sha = MagicMock(return_value="defaultsha")
-        mock_app.find_open_prs_with_label = MagicMock(return_value=[])
-        mock_app.get_pr_commits = MagicMock(return_value=[])
-        mock_app.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
-        mock_app.create_pull_request = MagicMock(side_effect=_capture_create)
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_gh.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_gh.get_pr_commits = MagicMock(return_value=[])
+        mock_gh.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
+        mock_gh.create_pull_request = MagicMock(side_effect=_capture_create)
 
         handle_pr_merged(
             owner="o",
@@ -1173,11 +1194,12 @@ def test_followups_continue_past_transient_create_issue_failure(tmp_path, monkey
             raise RuntimeError("HTTP 500: transient server error")
         return {"number": 900 + call_count["n"]}
 
-    with patch("post_merge.orchestrator.app") as mock_app:
-        mock_app.get_installation_token.return_value = "tok"
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
         mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
         (tmp_path / "clone").mkdir(exist_ok=True)
-        mock_app.create_issue = MagicMock(side_effect=_flaky_create_issue)
+        mock_gh.create_issue = MagicMock(side_effect=_flaky_create_issue)
 
         result = handle_pr_merged(
             owner="o",
@@ -1189,9 +1211,9 @@ def test_followups_continue_past_transient_create_issue_failure(tmp_path, monkey
         )
 
     # Three attempts total — one failed, two succeeded.
-    assert mock_app.create_issue.call_count == 3, (
+    assert mock_gh.create_issue.call_count == 3, (
         f"W6 regression: expected 3 create_issue attempts, got "
-        f"{mock_app.create_issue.call_count}. Loop broke on first failure?"
+        f"{mock_gh.create_issue.call_count}. Loop broke on first failure?"
     )
     # Two issue numbers persisted (the successful ones).
     assert len(result["followups_filed"]) == 2

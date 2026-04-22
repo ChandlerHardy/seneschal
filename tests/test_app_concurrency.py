@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
 import app  # noqa: E402
+import github_api  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -117,10 +118,10 @@ def test_put_file_raises_runtime_error_on_exhausted_409_retries(monkeypatch):
     mock_session = MagicMock()
     mock_session.put.return_value = mock_resp
 
-    with patch.object(app, "_github_session", return_value=mock_session):
-        with patch.object(app, "get_file_sha", return_value="newsha"):
+    with patch.object(github_api, "_github_session", return_value=mock_session):
+        with patch.object(github_api, "get_file_sha", return_value="newsha"):
             with pytest.raises(RuntimeError) as exc_info:
-                app.put_file(
+                github_api.put_file(
                     "o", "r", "CHANGELOG.md",
                     content="body",
                     message="msg",
@@ -145,9 +146,9 @@ def test_put_file_on_403_raises_push_protected_not_runtime():
     mock_session = MagicMock()
     mock_session.put.return_value = mock_resp
 
-    with patch.object(app, "_github_session", return_value=mock_session):
-        with pytest.raises(app.PushProtectedError):
-            app.put_file(
+    with patch.object(github_api, "_github_session", return_value=mock_session):
+        with pytest.raises(github_api.PushProtectedError):
+            github_api.put_file(
                 "o", "r", "CHANGELOG.md",
                 content="body",
                 message="msg",
@@ -172,9 +173,9 @@ def test_put_file_retries_409_once_then_succeeds(monkeypatch):
     # First call: 409. Second call: 201 OK.
     mock_session.put.side_effect = [conflict_resp, ok_resp]
 
-    with patch.object(app, "_github_session", return_value=mock_session):
-        with patch.object(app, "get_file_sha", return_value="freshsha") as mock_sha:
-            result = app.put_file(
+    with patch.object(github_api, "_github_session", return_value=mock_session):
+        with patch.object(github_api, "get_file_sha", return_value="freshsha") as mock_sha:
+            result = github_api.put_file(
                 "o", "r", "CHANGELOG.md",
                 content="body",
                 message="msg",
@@ -294,8 +295,8 @@ def test_post_review_passes_head_sha_to_save_review(tmp_path, monkeypatch):
     mock_session = MagicMock()
     mock_session.post.return_value = ok_resp
 
-    with patch.object(app, "_github_session", return_value=mock_session):
-        app.post_review(
+    with patch.object(github_api, "_github_session", return_value=mock_session):
+        github_api.post_review(
             "o", "r", 7,
             body="APPROVE\n\nLGTM",
             token="tok",
@@ -356,8 +357,8 @@ def test_post_review_holds_per_pr_lock_during_save(tmp_path, monkeypatch):
     done = threading.Event()
 
     def _call():
-        with patch.object(app, "_github_session", return_value=mock_session):
-            app.post_review(
+        with patch.object(github_api, "_github_session", return_value=mock_session):
+            github_api.post_review(
                 "o", "r", 55,
                 body="APPROVE",
                 token="tok",

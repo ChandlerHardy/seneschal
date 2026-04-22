@@ -27,14 +27,13 @@ from typing import Dict, List, Optional, Tuple
 # Local sibling modules (these are pure).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import app  # noqa: E402 — late binding so tests can patch helpers wholesale
+import app  # noqa: E402 — late binding so tests can patch `log`/`ensure_repo_synced` wholesale
+import github_api  # noqa: E402 — GitHub REST helpers live here post-refactor
 import review_store  # noqa: E402
+from github_api import PushProtectedError  # noqa: E402 — direct import, no re-export
 from post_merge import changelog as changelog_mod  # noqa: E402
 from post_merge import followups as followups_mod  # noqa: E402
 from post_merge import release as release_mod  # noqa: E402
-
-# Re-export so tests + callers don't have to dig into app.py for it.
-PushProtectedError = app.PushProtectedError
 
 # Process-local cache of which `owner/repo` combinations had `put_file` to
 # main return 403. Entries are (monotonic_seconds, protected_bool). After
@@ -321,8 +320,8 @@ def _commit_changelog_direct(
       - `RuntimeError` on 409-retry-exhaustion → caller dead-letters.
       - any other Exception → bubbles to the outer orchestrator.
     """
-    sha = app.get_file_sha(owner, repo, path, branch, token)
-    app.put_file(
+    sha = github_api.get_file_sha(owner, repo, path, branch, token)
+    github_api.put_file(
         owner=owner,
         repo=repo,
         path=path,
@@ -350,10 +349,10 @@ def _commit_changelog_via_pr(
     """
     branch_name = f"seneschal/changelog-{pr_number}"
     try:
-        base_sha = app.get_default_branch_sha(owner, repo, base_branch, token)
-        app.create_branch(owner, repo, branch_name, base_sha, token)
-        sha = app.get_file_sha(owner, repo, path, branch_name, token)
-        app.put_file(
+        base_sha = github_api.get_default_branch_sha(owner, repo, base_branch, token)
+        github_api.create_branch(owner, repo, branch_name, base_sha, token)
+        sha = github_api.get_file_sha(owner, repo, path, branch_name, token)
+        github_api.put_file(
             owner=owner,
             repo=repo,
             path=path,
@@ -363,7 +362,7 @@ def _commit_changelog_via_pr(
             sha=sha,
             token=token,
         )
-        pr = app.create_pull_request(
+        pr = github_api.create_pull_request(
             owner=owner,
             repo=repo,
             title=f"chore(changelog): record #{pr_number}",
@@ -375,7 +374,7 @@ def _commit_changelog_via_pr(
         )
         # Apply the seneschal:changelog label so the operator can filter.
         try:
-            app.apply_labels(owner, repo, pr.get("number"), ["seneschal:changelog"], token)
+            github_api.apply_labels(owner, repo, pr.get("number"), ["seneschal:changelog"], token)
         except Exception as e:  # noqa: BLE001
             app.log(f"[post_merge] apply_labels (changelog PR) failed: {e!r}")
         return int(pr.get("number") or 0) or None
@@ -442,7 +441,7 @@ def _dead_letter_changelog(
     """
     label = config.post_merge.followup_label or "seneschal-followup"
     try:
-        issue = app.create_issue(
+        issue = github_api.create_issue(
             owner=owner,
             repo=repo,
             title=f"Seneschal: changelog update dropped for PR #{pr_number}",
@@ -587,7 +586,7 @@ def _followups_step(
     for f in needed:
         try:
             body = _sanitize_issue_body(f.body_excerpt, pr_number, pr_url)
-            issue = app.create_issue(
+            issue = github_api.create_issue(
                 owner=owner,
                 repo=repo,
                 title=f.title,
@@ -734,7 +733,7 @@ def _release_step(
     # PR's commits is the only way to catch that signal. If any commit
     # message body has that marker, force a major bump.
     try:
-        commits = app.get_pr_commits(owner, repo, pr_number, token) or []
+        commits = github_api.get_pr_commits(owner, repo, pr_number, token) or []
     except Exception as e:  # noqa: BLE001
         app.log(f"[post_merge] get_pr_commits failed for {owner}/{repo}#{pr_number}: {e!r}")
         commits = []
@@ -747,7 +746,7 @@ def _release_step(
 
     # If a release PR is already open, amend it instead of opening another.
     try:
-        existing_prs = app.find_open_prs_with_label(owner, repo, "seneschal:release", token)
+        existing_prs = github_api.find_open_prs_with_label(owner, repo, "seneschal:release", token)
     except Exception as e:  # noqa: BLE001
         app.log(f"[post_merge] find_open_prs_with_label failed: {e!r}")
         existing_prs = []
@@ -796,11 +795,11 @@ def _release_step(
         )
 
     try:
-        base_sha = app.get_default_branch_sha(owner, repo, base, token)
-        app.create_branch(owner, repo, branch, base_sha, token)
+        base_sha = github_api.get_default_branch_sha(owner, repo, base, token)
+        github_api.create_branch(owner, repo, branch, base_sha, token)
         # Touch the changelog on the new branch so the PR has a diff.
-        sha = app.get_file_sha(owner, repo, config.post_merge.changelog_path, branch, token)
-        app.put_file(
+        sha = github_api.get_file_sha(owner, repo, config.post_merge.changelog_path, branch, token)
+        github_api.put_file(
             owner=owner,
             repo=repo,
             path=config.post_merge.changelog_path,
@@ -811,7 +810,7 @@ def _release_step(
             token=token,
         )
         try:
-            pr = app.create_pull_request(
+            pr = github_api.create_pull_request(
                 owner=owner,
                 repo=repo,
                 title=f"chore(release): {bump} release prep",
@@ -831,7 +830,7 @@ def _release_step(
                     f"re-checking open PRs for {owner}/{repo}"
                 )
                 try:
-                    retry_prs = app.find_open_prs_with_label(
+                    retry_prs = github_api.find_open_prs_with_label(
                         owner, repo, "seneschal:release", token,
                     )
                 except Exception:  # noqa: BLE001
@@ -844,7 +843,7 @@ def _release_step(
                     )
             raise
         try:
-            app.apply_labels(owner, repo, pr.get("number"), ["seneschal:release"], token)
+            github_api.apply_labels(owner, repo, pr.get("number"), ["seneschal:release"], token)
         except Exception as e:  # noqa: BLE001
             app.log(f"[post_merge] apply_labels (release PR) failed: {e!r}")
         return int(pr.get("number") or 0) or None
@@ -898,7 +897,7 @@ def _amend_release_pr(
     # diff that's 100% line-ending noise.
     content_to_write = (changelog_content or "").replace("\r\n", "\n").replace("\r", "\n")
     try:
-        fresh_content, _base_sha = app.get_file_content(
+        fresh_content, _base_sha = github_api.get_file_content(
             owner, repo, changelog_path, release_base_branch, token,
         )
         if fresh_content:
@@ -925,8 +924,8 @@ def _amend_release_pr(
 
     # Put-step: independent try so a fetch miss doesn't skip the write.
     try:
-        sha = app.get_file_sha(owner, repo, changelog_path, head_ref, token)
-        app.put_file(
+        sha = github_api.get_file_sha(owner, repo, changelog_path, head_ref, token)
+        github_api.put_file(
             owner=owner,
             repo=repo,
             path=changelog_path,
@@ -1019,7 +1018,7 @@ def handle_pr_merged(
         "release_pr": None,
     }
     try:
-        token = app.get_installation_token(installation_id)
+        token = github_api.get_installation_token(installation_id)
 
         # Sync the local clone so changelog reads + analyzer-style ops can
         # see the post-merge tree.
