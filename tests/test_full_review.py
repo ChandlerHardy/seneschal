@@ -149,7 +149,6 @@ def test_run_full_review_calls_backend_once_per_persona():
     with tempfile.TemporaryDirectory() as repo:
         result = run_full_review(
             pr_number=42,
-            repo_path=repo,
             personas=personas,
             pr_meta={"title": "test pr"},
             diff_text="diff --git a/x b/x\n",
@@ -168,7 +167,6 @@ def test_run_full_review_body_contains_per_persona_sections():
     with tempfile.TemporaryDirectory() as repo:
         result = run_full_review(
             pr_number=1,
-            repo_path=repo,
             personas=personas,
             pr_meta={"title": "feat: x"},
             diff_text="+added line",
@@ -195,7 +193,6 @@ def test_run_full_review_request_changes_when_any_persona_blocks():
     with tempfile.TemporaryDirectory() as repo:
         result = run_full_review(
             pr_number=1,
-            repo_path=repo,
             personas=personas,
             pr_meta={"title": "t"},
             diff_text="d",
@@ -211,7 +208,6 @@ def test_run_full_review_passes_persona_prompt_as_system_prompt_for_file_persona
     with tempfile.TemporaryDirectory() as repo:
         run_full_review(
             pr_number=1,
-            repo_path=repo,
             personas=personas,
             pr_meta={"title": "t"},
             diff_text="d",
@@ -248,7 +244,6 @@ def test_run_full_review_loads_builtin_agent_body_when_available(tmp_path_factor
             with tempfile.TemporaryDirectory() as repo:
                 run_full_review(
                     pr_number=1,
-                    repo_path=repo,
                     personas=personas,
                     pr_meta={"title": "t"},
                     diff_text="d",
@@ -274,7 +269,6 @@ def test_run_full_review_builtin_falls_back_to_generic_when_file_missing():
             with tempfile.TemporaryDirectory() as repo:
                 run_full_review(
                     pr_number=1,
-                    repo_path=repo,
                     personas=personas,
                     pr_meta={"title": "t"},
                     diff_text="d",
@@ -296,7 +290,6 @@ def test_run_full_review_invokes_in_parallel():
         start = time.time()
         run_full_review(
             pr_number=1,
-            repo_path=repo,
             personas=personas,
             pr_meta={"title": "t"},
             diff_text="d",
@@ -315,7 +308,6 @@ def test_run_full_review_empty_personas_returns_skeleton():
     with tempfile.TemporaryDirectory() as repo:
         result = run_full_review(
             pr_number=7,
-            repo_path=repo,
             personas=[],
             pr_meta={"title": "t"},
             diff_text="d",
@@ -335,7 +327,6 @@ def test_run_full_review_persona_failure_surfaces_in_body_without_crashing():
     with tempfile.TemporaryDirectory() as repo:
         result = run_full_review(
             pr_number=1,
-            repo_path=repo,
             personas=personas,
             pr_meta={"title": "t"},
             diff_text="d",
@@ -354,7 +345,6 @@ def test_run_full_review_truncates_large_diff_before_backend_call():
     with tempfile.TemporaryDirectory() as repo:
         run_full_review(
             pr_number=1,
-            repo_path=repo,
             personas=personas,
             pr_meta={"title": "t"},
             diff_text=huge_diff,

@@ -31,12 +31,13 @@ from backend import (  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def _mock_anthropic_response(text: str = "ok"):
+def _mock_anthropic_response(text: str = "ok", stop_reason: str = "end_turn"):
     """Build an object shaped like an Anthropic Messages API response."""
     response = MagicMock()
     content_block = MagicMock()
     content_block.text = text
     response.content = [content_block]
+    response.stop_reason = stop_reason
     return response
 
 
@@ -171,8 +172,11 @@ def test_invoke_without_system_prompt_omits_system_key():
             assert "system" not in kwargs or not kwargs["system"]
 
 
-def test_invoke_uses_small_max_tokens_when_max_turns_is_one():
-    """max_turns=1 → single short response → conservative max_tokens cap."""
+def test_invoke_uses_generous_default_max_tokens():
+    """Default max_tokens must be generous — a truncated review loses its
+    verdict line. Earlier versions coupled max_tokens to max_turns and
+    capped a 1-turn review at 256 tokens, which silently auto-APPROVEd any
+    review long enough to truncate. Guard against that regression."""
     with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test"}, clear=True):
         with patch("backend.anthropic.Anthropic") as AnthropicCls:
             client = MagicMock()
@@ -180,26 +184,61 @@ def test_invoke_uses_small_max_tokens_when_max_turns_is_one():
             client.messages.create.return_value = _mock_anthropic_response()
 
             b = ApiBackend()
-            b.invoke("p", max_turns=1)
-            # Review path caps max_tokens at a higher number (4096 is the PR
-            # review default) — this assertion guards against ballooning the
-            # cost of a 1-turn probe-style call.
+            b.invoke("p")
             kwargs = client.messages.create.call_args.kwargs
-            # Accept any reasonable small cap; the intent is: 1-turn != 4096.
-            assert kwargs["max_tokens"] <= 1024
-
-
-def test_invoke_uses_larger_max_tokens_when_max_turns_gt_one():
-    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test"}, clear=True):
-        with patch("backend.anthropic.Anthropic") as AnthropicCls:
-            client = MagicMock()
-            AnthropicCls.return_value = client
-            client.messages.create.return_value = _mock_anthropic_response()
-
-            b = ApiBackend()
-            b.invoke("p", max_turns=25)
-            kwargs = client.messages.create.call_args.kwargs
+            # At least enough headroom for a thorough persona review.
             assert kwargs["max_tokens"] >= 2048
+
+
+def test_invoke_accepts_explicit_max_tokens_override():
+    """Callers can pass max_tokens explicitly for probe-style calls."""
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test"}, clear=True):
+        with patch("backend.anthropic.Anthropic") as AnthropicCls:
+            client = MagicMock()
+            AnthropicCls.return_value = client
+            client.messages.create.return_value = _mock_anthropic_response()
+
+            b = ApiBackend()
+            b.invoke("p", max_tokens=128)
+            kwargs = client.messages.create.call_args.kwargs
+            assert kwargs["max_tokens"] == 128
+
+
+def test_invoke_raises_on_max_tokens_truncation():
+    """stop_reason='max_tokens' means the verdict line was likely cut;
+    bubble the failure rather than silently returning a truncated body."""
+    from backend import TruncatedResponseError
+    with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test"}, clear=True):
+        with patch("backend.anthropic.Anthropic") as AnthropicCls:
+            client = MagicMock()
+            AnthropicCls.return_value = client
+            truncated = _mock_anthropic_response("partial...")
+            truncated.stop_reason = "max_tokens"
+            client.messages.create.return_value = truncated
+
+            b = ApiBackend()
+            try:
+                b.invoke("p")
+                raise AssertionError("expected TruncatedResponseError")
+            except TruncatedResponseError:
+                pass
+
+
+def test_scrub_api_key_redacts_anthropic_keys():
+    """Exception messages on auth paths can echo the API key. Redact."""
+    from backend import _scrub_api_key
+    msg = "Auth failed: key sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890 invalid"
+    scrubbed = _scrub_api_key(msg)
+    assert "sk-ant-" not in scrubbed
+    assert "<redacted>" in scrubbed
+
+
+def test_scrub_api_key_redacts_bearer_tokens():
+    from backend import _scrub_api_key
+    msg = "401: Bearer abcdef0123456789ABCDEF0123 expired"
+    scrubbed = _scrub_api_key(msg)
+    assert "Bearer abcdef" not in scrubbed
+    assert "<redacted>" in scrubbed
 
 
 def test_invoke_uses_model_from_env_when_set():

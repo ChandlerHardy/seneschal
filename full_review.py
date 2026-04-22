@@ -178,17 +178,17 @@ def _invoke_persona(
         text = backend.invoke(
             _build_user_prompt(persona.name, pr_meta, diff_text),
             system_prompt=_resolve_system_prompt(persona),
-            max_turns=1,
             timeout=timeout,
         )
     except Exception as e:  # noqa: BLE001
-        text = f"_(persona `{persona.name}` failed: {e})_"
+        # Stringify type + message but without leaking credentials if the
+        # backend wrapped them into the message.
+        text = f"_(persona `{persona.name}` failed: {type(e).__name__})_"
     return persona.name, (text or "").strip()
 
 
 def run_full_review(
     pr_number: int,
-    repo_path: str,
     *,
     personas: Optional[List[Persona]] = None,
     pr_meta: Optional[dict] = None,
@@ -200,7 +200,6 @@ def run_full_review(
 
     Args:
         pr_number: PR the review is for (used in the body header).
-        repo_path: local clone path (reserved for future context loading).
         personas: personas to run. Required — the caller resolves via
             persona_loader and passes in the resolved list.
         pr_meta: GitHub PR metadata dict; uses `title` for the prompt.
