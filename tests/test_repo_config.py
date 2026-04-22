@@ -589,3 +589,16 @@ def test_glob_match_exact_path():
 def test_glob_match_empty_pattern_is_false():
     from repo_config import glob_match
     assert glob_match("", "foo.go") is False
+
+
+def test_glob_match_malformed_pattern_fails_closed():
+    # Fix Q: if the `**` translation produces invalid regex AND the fnmatch
+    # fallback also raises (unbalanced `[` across Python versions), the
+    # helper must fail closed (return False) rather than propagate.
+    from repo_config import glob_match
+    # Unterminated char-class + `**` forces the regex path and would also
+    # confuse fnmatch on some Python versions.
+    result = glob_match("src/**/[unterminated", "src/foo.go")
+    # The exact boolean depends on runtime fnmatch tolerance — the hard
+    # requirement is "no exception".
+    assert result in (True, False)

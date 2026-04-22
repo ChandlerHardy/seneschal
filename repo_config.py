@@ -34,6 +34,7 @@ from fs_safety import (
     SENSITIVE_PATH_SEGMENTS,
     safe_branch_name,
     safe_changelog_path,
+    safe_open_in_repo,
 )
 
 # Backward-compat aliases for the *_SENSITIVE_*_ constants: only
@@ -73,11 +74,19 @@ _HEADER_MAX_BYTES = 2048
 
 
 def _sanitize_header_text(text: str) -> str:
-    """Sanitize license-header text: strip control chars (keep \n), cap 2KB."""
+    """Sanitize license-header text: strip control chars (keep \n), cap 2KB.
+
+    Fix E: strip trailing newlines before the 2KB cap. YAML block-scalar
+    syntax (`license_header: |\n    // Copyright\n`) naturally carries a
+    trailing `\n` that would otherwise split into a phantom empty required
+    line during `_header_matches`, making a legitimate header fail.
+    """
     # Keep newlines, tabs, carriage returns — strip the rest.
     cleaned = _CONTROL_CHARS.sub("", text)
     # Normalize CRLF to LF so the scan compares consistently.
     cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    # Strip trailing newlines (YAML block-scalar + friendly author habit).
+    cleaned = cleaned.rstrip("\n")
     return cleaned[:_HEADER_MAX_BYTES]
 
 
@@ -103,7 +112,13 @@ def glob_match(pattern: str, path: str) -> bool:
     if not pattern:
         return False
     if "**" not in pattern:
-        return fnmatch.fnmatch(path, pattern)
+        try:
+            return fnmatch.fnmatch(path, pattern)
+        except re.error:
+            # Some Python versions raise on unbalanced `[` in the pattern.
+            # Fail closed — a malformed glob should never silently "match
+            # everything" or propagate an exception up to the webhook.
+            return False
 
     # Translate ** glob to regex. Use two sentinels:
     #  - STAR_SLASH for the `**/` prefix idiom (zero-or-more segments
@@ -124,7 +139,13 @@ def glob_match(pattern: str, path: str) -> bool:
         return re.match(f"^{work}$", path) is not None
     except re.error:
         # Degrade to fnmatch if our translation produced invalid regex.
-        return fnmatch.fnmatch(path, pattern)
+        # Fix Q: fnmatch itself can raise on unbalanced `[`; wrap so a
+        # malformed operator pattern fails closed instead of crashing
+        # the scan.
+        try:
+            return fnmatch.fnmatch(path, pattern)
+        except re.error:
+            return False
 
 
 @dataclass
@@ -385,10 +406,18 @@ def load_from_path(path: str) -> RepoConfig:
 def _resolve_license_header_file(repo_dir: str, rel_path: str) -> str:
     """Safely read a license-header file from inside the repo.
 
-    Guards against path traversal by reusing `safe_changelog_path`, which
-    vets for `..`, absolute paths, and the sensitive deny-list. Returns
-    the file contents (sanitized + 2KB-capped) or an empty string on any
-    failure. Failure is logged to stderr so operators can debug.
+    Fix I: symlink-safe read via `safe_open_in_repo`, which handles:
+     - path-traversal (resolved path must live inside repo tree)
+     - intermediate-component symlink refusal (attacker can't stage
+       `docs/` → `/etc` and sneak header content out of /etc/...)
+     - `O_NOFOLLOW` on the final component (TOCTOU mitigation)
+     - locale-independent UTF-8 decode
+
+    Also applies `safe_changelog_path` first as a fast-path deny-list
+    (rejects `..`, absolute paths, sensitive filenames like `.env`).
+    Returns the file contents (sanitized + 2KB-capped) or an empty
+    string on any safety violation or I/O error. Failures are logged
+    to stderr so operators can debug.
     """
     safe_rel = safe_changelog_path(rel_path)
     if safe_rel is None:
@@ -397,13 +426,16 @@ def _resolve_license_header_file(repo_dir: str, rel_path: str) -> str:
             file=_sys.stderr,
         )
         return ""
-    abs_path = os.path.join(repo_dir, safe_rel)
-    try:
-        with open(abs_path, "r", encoding="utf-8") as fh:
-            raw = fh.read()
-    except (OSError, UnicodeDecodeError) as exc:
+    raw = safe_open_in_repo(repo_dir, safe_rel)
+    if raw is None:
+        # `safe_open_in_repo` already logs the specific refusal reason
+        # (symlink, traversal, decode failure). Surface a seneschal-
+        # branded line so operators grepping for [seneschal] see the
+        # license-header failure path in addition to the post_merge
+        # refusal.
         print(
-            f"[seneschal] could not read license_header_file {rel_path!r}: {exc}",
+            f"[seneschal] could not read license_header_file {rel_path!r} "
+            f"(see prior [post_merge] line for reason)",
             file=_sys.stderr,
         )
         return ""

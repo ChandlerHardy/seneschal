@@ -224,3 +224,115 @@ def test_multi_line_header_matched():
     ])
     config = StandardsConfig(license_header=multi_line_header)
     assert scan_license_headers(diff, pr_files=None, config=config) == []
+
+
+# --------------------------------------------------------------------------
+# Fix E — trailing newline in header text
+# --------------------------------------------------------------------------
+
+
+def test_trailing_newline_in_header_does_not_add_phantom_line():
+    # YAML block-scalar `license_header: |\n    // Copyright\n` would carry
+    # a trailing `\n` that creates a phantom empty required line. The scan
+    # must tolerate trailing newlines gracefully.
+    header_with_trailing_nl = "// Copyright {YEAR} Acme Corp.\n"
+    diff = _mk_diff("src/foo.go", [
+        "// Copyright 2026 Acme Corp.",
+        "package foo",
+    ])
+    config = StandardsConfig(license_header=header_with_trailing_nl)
+    # The single-line header with trailing nl should match a file whose
+    # first line matches — no phantom empty required line.
+    assert scan_license_headers(diff, pr_files=None, config=config) == []
+
+
+# --------------------------------------------------------------------------
+# Fix F — BOM + lone-CR stripping in header match
+# --------------------------------------------------------------------------
+
+
+def test_file_with_utf8_bom_on_first_line_matches_plain_header():
+    # Files from Windows editors sometimes include a UTF-8 BOM (`﻿`)
+    # on the first line. The header match should strip it before comparing.
+    diff = _mk_diff("src/foo.go", [
+        "﻿// Copyright 2026 Acme Corp.",
+        "package foo",
+    ])
+    config = StandardsConfig(license_header="// Copyright {YEAR} Acme Corp.")
+    assert scan_license_headers(diff, pr_files=None, config=config) == []
+
+
+def test_bom_only_stripped_from_first_line_not_subsequent():
+    # A BOM mid-file is bizarre and should not pass — only the first line
+    # gets the BOM-strip treatment.
+    diff = _mk_diff("src/foo.go", [
+        "// Copyright 2026 Acme Corp.",
+        "﻿// Licensed under MIT.",  # BOM on line 2, should NOT match
+        "",
+    ])
+    config = StandardsConfig(license_header=(
+        "// Copyright {YEAR} Acme Corp.\n"
+        "// Licensed under MIT."
+    ))
+    violations = scan_license_headers(diff, pr_files=None, config=config)
+    assert len(violations) == 1
+
+
+def test_file_with_lone_cr_in_header_lines_still_matches():
+    # `git diff` normally strips trailing CR but belt-and-suspenders: a
+    # line ending with `\r` (`\r\n` preserved somehow) should still match
+    # a plain header line.
+    diff = (
+        "diff --git a/src/foo.go b/src/foo.go\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/src/foo.go\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+// Copyright 2026 Acme Corp.\r\n"
+        "+package foo\n"
+    )
+    config = StandardsConfig(license_header="// Copyright {YEAR} Acme Corp.")
+    assert scan_license_headers(diff, pr_files=None, config=config) == []
+
+
+# --------------------------------------------------------------------------
+# Fix P — _looks_binary scans all added lines for NUL, not just first 40
+# --------------------------------------------------------------------------
+
+
+def test_binary_detection_scans_beyond_first_40_lines():
+    # A file with 50 plain lines followed by a NUL-containing line is still
+    # binary and must be skipped. Previous behavior (first-40-only scan)
+    # would flag it as "missing header".
+    lines = [f"line{i}" for i in range(50)] + ["\x00 binary junk"]
+    diff = _mk_diff("src/image.png", lines)
+    config = StandardsConfig(license_header=REQUIRED)
+    assert scan_license_headers(diff, pr_files=None, config=config) == []
+
+
+# --------------------------------------------------------------------------
+# Fix I — license_header_file symlink traversal refusal
+# --------------------------------------------------------------------------
+
+
+def test_license_header_file_symlink_refused(tmp_path, capsys):
+    # A symlink inside the repo pointing at a host-sensitive path must be
+    # refused by _resolve_license_header_file (via safe_open_in_repo).
+    import repo_config
+
+    # Create a sensitive target outside the repo
+    sensitive = tmp_path / "outside_secret.txt"
+    sensitive.write_text("outside-host-secret\n")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    # Inside the repo, create a symlink named HEADER.txt -> sensitive
+    symlink_path = repo_dir / "HEADER.txt"
+    symlink_path.symlink_to(sensitive)
+
+    # Call the resolver directly
+    result = repo_config._resolve_license_header_file(str(repo_dir), "HEADER.txt")
+    assert result == ""
+    captured = capsys.readouterr()
+    # Should log refusal or safe-open failure.
+    assert "[seneschal]" in captured.err or "[post_merge]" in captured.err

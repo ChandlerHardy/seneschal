@@ -7,18 +7,24 @@ configured license-header text.
 Behavior:
  - Fires ONLY on newly-added files. Modified / renamed / deleted files
    are ignored. New-file detection prefers `pr_files` status (from
-   GitHub's PR files API) but falls back to a "no deletions + entirely
-   new content" heuristic.
+   GitHub's PR files API, typed as `Sequence[PRFile]`) but falls back
+   to the `new file mode` diff marker when `pr_files is None`.
  - Respects `license_applies_to` globs: if non-empty, only files matching
    at least one glob are checked. Empty = check every added file.
  - Respects `license_exemptions` globs: matching files are skipped even
    if they match `license_applies_to`.
- - Skips binary files (NUL byte detected in added content).
+ - Skips binary files (NUL byte detected anywhere in added content —
+   full-line scan, not just the header window).
  - Supports `{YEAR}` placeholder in the header text: translates to the
    regex `\\d{4}` (any 4-digit year) so the configured header doesn't
    need to be edited every January.
  - Multi-line headers: the configured header and the file's leading
    content are compared line-by-line (up to len(header_lines) lines).
+ - Normalizes added lines before matching: strips UTF-8 BOM from the
+   first line, strips trailing `\r` from every line. Operators' header
+   text is pre-normalized during `_sanitize_header_text` (CRLF→LF,
+   trailing newline stripped), so a YAML block-scalar header behaves
+   the same as an inline one.
 """
 
 from __future__ import annotations
@@ -40,13 +46,24 @@ class LicenseViolation:
 
 # How many leading lines of the added content we'll consider as "header
 # candidate" region. Anything past this is ignored — headers don't live
-# 500 lines into a file.
+# 500 lines into a file. Distinct from the binary-file NUL scan (which
+# covers ALL added lines, not just this window).
 _HEADER_WINDOW = 40
+
+# UTF-8 BOM sequence. Windows editors sometimes prepend this to the first
+# line of source files; `git diff` passes it through verbatim.
+_UTF8_BOM = "﻿"
 
 
 def _looks_binary(lines: Sequence[str]) -> bool:
-    """Return True if any of the sampled added lines contains a NUL byte."""
-    for ln in lines[:_HEADER_WINDOW]:
+    """Return True if ANY added line contains a NUL byte.
+
+    Scans the full sequence (not just the header window) because a binary
+    file's NUL bytes can appear anywhere — capping at 40 would misclassify
+    a 50-line text preamble + binary tail as text and falsely flag it as
+    "missing header". Lines are already in memory, so O(n) is free.
+    """
+    for ln in lines:
         if "\x00" in ln:
             return True
     return False
@@ -69,26 +86,44 @@ def _build_header_regex(header_text: str) -> re.Pattern:
     return re.compile(regex)
 
 
-def _header_matches(added_lines: Sequence[str], header_text: str) -> bool:
+def _normalize_added_line(line: str, is_first: bool) -> str:
+    """Strip UTF-8 BOM (first line only) and trailing CR from a diff line.
+
+    Fix F: normalize before regex match so BOM-prefixed or CRLF-preserved
+    diff lines still satisfy a plain configured header.
+    """
+    if is_first and line.startswith(_UTF8_BOM):
+        line = line[len(_UTF8_BOM):]
+    if line.endswith("\r"):
+        line = line[:-1]
+    return line
+
+
+def _header_matches(
+    added_lines: Sequence[str],
+    compiled_patterns: Sequence[re.Pattern],
+) -> bool:
     """Does the leading added content contain the configured header?
 
-    The scan compares the first `len(header_lines)` lines of added content
-    against a per-line regex derived from `header_text`. Lines are
-    compared as full-string regex matches to keep the contract strict —
-    operators want a sharp signal, not fuzzy contains-matching.
+    Takes a pre-compiled per-line pattern list (built once per scan call
+    by `scan_license_headers`) to avoid N*M re.compile() calls on large
+    diffs. Lines are full-string matched — operators want a sharp signal,
+    not fuzzy contains-matching.
+
+    Normalization (fix F) is applied to each added line before match:
+    first-line BOM strip + trailing-CR strip.
     """
-    if not header_text:
+    if not compiled_patterns:
         return True  # feature off — treat as satisfied
 
-    header_lines = header_text.split("\n")
-    # If the added content is shorter than the header, there's no way to
-    # satisfy it.
-    if len(added_lines) < len(header_lines):
+    if len(added_lines) < len(compiled_patterns):
         return False
 
-    for expected, actual in zip(header_lines, added_lines[: len(header_lines)]):
-        pattern = _build_header_regex(expected)
-        if not pattern.fullmatch(actual):
+    for i, (pattern, actual) in enumerate(
+        zip(compiled_patterns, added_lines[: len(compiled_patterns)])
+    ):
+        normalized = _normalize_added_line(actual, is_first=(i == 0))
+        if not pattern.fullmatch(normalized):
             return False
     return True
 
@@ -149,6 +184,18 @@ def scan_license_headers(
     if not config.license_header:
         return []
 
+    # Fix G: compile the per-line header pattern list ONCE per scan call.
+    # Previously _build_header_regex was called once per header line per
+    # file (N files × M header lines = N*M compiles on every PR).
+    # Fix E (belt + suspenders): strip trailing empty lines from the
+    # split. `_sanitize_header_text` already rstrips a single trailing
+    # newline from YAML-loaded configs, but constructors that bypass
+    # the sanitizer (direct StandardsConfig()) still benefit.
+    header_lines = config.license_header.split("\n")
+    while header_lines and header_lines[-1] == "":
+        header_lines.pop()
+    compiled_patterns = [_build_header_regex(ln) for ln in header_lines]
+
     added_by_file = parse_unified_diff(diff_text)
     violations: List[LicenseViolation] = []
 
@@ -166,11 +213,11 @@ def scan_license_headers(
         if any(glob_match(p, filename) for p in config.license_exemptions):
             continue
 
-        # Binary file guard
+        # Binary file guard (full-line scan).
         if _looks_binary(added_lines):
             continue
 
-        if not _header_matches(added_lines, config.license_header):
+        if not _header_matches(added_lines, compiled_patterns):
             violations.append(
                 LicenseViolation(
                     file=filename,
