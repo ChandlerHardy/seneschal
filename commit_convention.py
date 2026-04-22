@@ -7,6 +7,12 @@ any non-conforming PR title surfaces as a WARNING finding.
 
 Imports `CONVENTIONAL_TYPES` from `title_check` to keep the canonical
 type list in exactly one place.
+
+Accepted shapes (per Conventional Commits spec):
+    type: message
+    type(scope): message          # scope must be non-empty
+    type!: message                # `!` marks a breaking change
+    type(scope)!: message
 """
 
 from __future__ import annotations
@@ -19,47 +25,80 @@ from title_check import CONVENTIONAL_TYPES
 
 @dataclass
 class ConventionViolation:
+    """Violation context.
+
+    `title` is the offending PR title as submitted (post-strip). `reason`
+    is a human-readable explanation. Callers (e.g. `_convention_to_finding`
+    in analyzer.py) can choose to render one or both — having both on the
+    dataclass keeps the renderer side plain and symmetric with sibling
+    violation shapes (LicenseViolation, BranchNameViolation).
+    """
+
+    title: str
     reason: str
 
 
-def check_pr_title(title: Optional[str], strict: bool = True) -> Optional[ConventionViolation]:
+def check_pr_title_strict(
+    title: Optional[str],
+    strict: bool = False,
+) -> Optional[ConventionViolation]:
     """Check whether a PR title conforms to conventional-commit style.
 
     Args:
         title: The PR title to check.
-        strict: Only fire in strict mode. In non-strict mode the caller
-            should rely on `title_check.check_title` for the soft nudge
-            instead — this module returns None so it can be wired in
-            unconditionally without double-reporting.
+        strict: Only fire in strict mode. Defaults to False to match the
+            `StandardsConfig.commit_convention_strict` default — callers
+            that don't pass it opt OUT of the check entirely. In non-
+            strict mode the caller should rely on `title_check.check_title`
+            for the soft nudge instead — this module returns None so it
+            can be wired in unconditionally without double-reporting.
 
     Returns:
         `None` if the title is acceptable (or `strict=False`),
-        `ConventionViolation` with a human-readable reason otherwise.
+        `ConventionViolation` with the offending title and a reason
+        otherwise.
     """
     if not strict:
         return None
 
-    if not title or not title.strip():
-        return ConventionViolation(reason="PR title is empty")
+    if title is None or not title.strip():
+        return ConventionViolation(title=title or "", reason="PR title is empty")
 
-    bare = title.strip().lower()
+    original = title.strip()
+    bare = original.lower()
 
-    # Accept `type: ...` and `type(scope): ...`
+    # Accept:
+    #  - `type:`
+    #  - `type!:`  (breaking)
+    #  - `type(scope):`
+    #  - `type(scope)!:`
+    # Scope when parens are present must be non-empty.
     for t in CONVENTIONAL_TYPES:
-        if bare.startswith(f"{t}:") or bare.startswith(f"{t}("):
-            # For `type(`, require a matching `):` so we don't accept
-            # half-formed scopes like `feat(widget add thing`.
-            if bare.startswith(f"{t}("):
-                # Must close the paren AND be followed by `:`
-                closing = bare.find(")")
-                if closing == -1 or closing + 1 >= len(bare) or bare[closing + 1] != ":":
-                    continue
+        # Unsscoped forms first.
+        if bare.startswith(f"{t}:") or bare.startswith(f"{t}!:"):
             return None
+        # Scoped forms: `type(scope):` or `type(scope)!:`
+        if bare.startswith(f"{t}("):
+            # Must close the paren and be followed by `:` or `!:`.
+            closing = bare.find(")")
+            if closing == -1:
+                continue
+            # Reject empty scope: `type():` or `type()!:` are not valid —
+            # the spec says scope is a non-empty noun describing a section.
+            scope_slice = bare[len(t) + 1 : closing]
+            if not scope_slice.strip():
+                continue
+            tail = bare[closing + 1 :]
+            if tail.startswith(":") or tail.startswith("!:"):
+                return None
+            continue
 
     accepted = ", ".join(CONVENTIONAL_TYPES)
     return ConventionViolation(
+        title=original,
         reason=(
             f"PR title does not match conventional-commit style. "
-            f"Expected one of: {accepted} (e.g. `feat: ...` or `fix(scope): ...`)."
-        )
+            f"Expected one of: {accepted} (e.g. `feat: ...`, `feat!: ...`, "
+            f"or `fix(scope): ...`)."
+        ),
     )

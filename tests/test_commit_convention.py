@@ -5,8 +5,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from commit_convention import check_pr_title, ConventionViolation  # noqa: E402
+from commit_convention import check_pr_title_strict, ConventionViolation  # noqa: E402
 from title_check import CONVENTIONAL_TYPES  # noqa: E402
+
+
+# Backward-compat alias used by the existing tests below. Individual new
+# tests should call `check_pr_title_strict` directly.
+check_pr_title = check_pr_title_strict
 
 
 def test_strict_mode_accepts_conventional_feat():
@@ -65,3 +70,78 @@ def test_reuses_conventional_types_from_title_check():
         "commit_convention.py should import CONVENTIONAL_TYPES from "
         "title_check, not redeclare its own copy."
     )
+
+
+# --------------------------------------------------------------------------
+# Fix B — breaking-change `!` marker support
+# --------------------------------------------------------------------------
+
+
+def test_strict_mode_accepts_breaking_feat_bang():
+    assert check_pr_title_strict("feat!: add X", strict=True) is None
+
+
+def test_strict_mode_accepts_breaking_fix_with_scope_bang():
+    assert check_pr_title_strict("fix(api)!: remove Y", strict=True) is None
+
+
+def test_strict_mode_accepts_breaking_feat_with_scope_bang():
+    assert check_pr_title_strict("feat(core)!: breaking change", strict=True) is None
+
+
+def test_strict_mode_flags_bang_without_colon():
+    # `feat!` alone is not valid — still needs `:` terminator.
+    result = check_pr_title_strict("feat! add X", strict=True)
+    assert isinstance(result, ConventionViolation)
+
+
+# --------------------------------------------------------------------------
+# Fix C — empty-scope `feat():` rejection
+# --------------------------------------------------------------------------
+
+
+def test_strict_mode_flags_empty_scope_parens():
+    # Spec requires non-empty scope between parens when present.
+    result = check_pr_title_strict("feat(): add X", strict=True)
+    assert isinstance(result, ConventionViolation)
+
+
+def test_strict_mode_flags_empty_scope_parens_with_bang():
+    result = check_pr_title_strict("feat()!: add X", strict=True)
+    assert isinstance(result, ConventionViolation)
+
+
+# --------------------------------------------------------------------------
+# Fix K — default strict mode aligns with config default
+# --------------------------------------------------------------------------
+
+
+def test_check_pr_title_strict_default_matches_config_default():
+    # Config default `commit_convention_strict=False` means the function
+    # default should also be False — callers that don't pass strict get
+    # no-op behavior, matching opt-in semantics.
+    import inspect
+    sig = inspect.signature(check_pr_title_strict)
+    assert sig.parameters["strict"].default is False
+
+
+# --------------------------------------------------------------------------
+# Fix L — canonical function name is check_pr_title_strict
+# --------------------------------------------------------------------------
+
+
+def test_module_exports_check_pr_title_strict():
+    import commit_convention
+    assert hasattr(commit_convention, "check_pr_title_strict")
+
+
+# --------------------------------------------------------------------------
+# Fix H — ConventionViolation carries title context
+# --------------------------------------------------------------------------
+
+
+def test_convention_violation_carries_title_context():
+    result = check_pr_title_strict("random thing", strict=True)
+    assert isinstance(result, ConventionViolation)
+    assert result.title == "random thing"
+    assert result.reason

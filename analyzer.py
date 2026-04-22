@@ -15,7 +15,7 @@ from typing import List, Optional, Sequence
 from branch_naming import BranchNameViolation, check_branch_name
 from breaking_changes import BreakingChange, detect_breaking_changes, summarize_breaking
 from ci_context import CIResult, correlate_failing_checks, render_ci_addendum
-from commit_convention import ConventionViolation, check_pr_title as check_pr_title_strict
+from commit_convention import ConventionViolation, check_pr_title_strict
 from context_loader import BlastRadius, compute_blast_radius
 from findings import Finding, FindingSet, Severity
 from history_context import ADR, render_adrs_addendum
@@ -392,11 +392,16 @@ def _convention_to_finding(
 ) -> Optional[Finding]:
     if violation is None:
         return None
+    # Prefix the reason with the offending title so reviewers see exactly
+    # what failed, not just the generic explanation.
+    detail = violation.reason
+    if violation.title:
+        detail = f"Title `{violation.title}`: {violation.reason}"
     return Finding(
         severity=severity,
         category="commit-convention",
         title="PR title does not follow conventional-commit convention",
-        detail=violation.reason,
+        detail=detail,
     )
 
 
