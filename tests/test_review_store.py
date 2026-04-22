@@ -299,6 +299,36 @@ def test_get_repo_memory_refuses_legacy_symlink_outside_repo(tmp_path):
     assert "LEAK" not in result
 
 
+def test_get_repo_memory_rejects_oversized_file(tmp_path, capsys):
+    """Round-3 warning #1: `get_repo_memory` used to route straight through
+    `safe_open_in_repo`, which reads the entire file into memory. A 500 MB
+    attacker-planted `.seneschal-memory.md` (or a symlink that passes the
+    symlink check but targets a huge legitimate file) would OOM the MCP
+    process. Gate with a 1 MB stat-first cap matching the pattern in
+    `dependency_grep._read_manifest`."""
+    # Write a file just over the 1 MB cap (one byte is enough to trip).
+    oversized = tmp_path / ".seneschal-memory.md"
+    oversized.write_bytes(b"x" * (review_store._MAX_MEMORY_BYTES + 1))
+
+    result = get_repo_memory("a/b", str(tmp_path))
+    assert result == ""
+    # The rejection should be logged so operators can investigate a
+    # legitimate-but-huge memory file.
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "exceeds cap" in combined or ".seneschal-memory.md" in combined
+
+
+def test_get_repo_memory_reads_file_at_size_cap(tmp_path):
+    """A file exactly at the cap must still succeed — only STRICTLY above
+    trips the reject. This pins the boundary so future bumps to the cap
+    don't silently change the equality semantics."""
+    at_cap = tmp_path / ".seneschal-memory.md"
+    at_cap.write_bytes(b"x" * review_store._MAX_MEMORY_BYTES)
+    result = get_repo_memory("a/b", str(tmp_path))
+    assert len(result) == review_store._MAX_MEMORY_BYTES
+
+
 # --------------------------------------------------------------------------
 # Frontmatter v2: head_sha / merged_at / followups_filed (P1)
 # --------------------------------------------------------------------------

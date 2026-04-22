@@ -24,12 +24,20 @@ from pathlib import Path
 from typing import List, Optional
 
 from fs_safety import now_iso, safe_open_in_repo, validate_repo_slug
+from log import log as _neutral_log
 
 # Root of the per-review markdown files. Override via env for tests.
 STORE_ROOT = os.environ.get(
     "SENESCHAL_REVIEW_STORE",
     os.path.expanduser("~/.seneschal/reviews"),
 )
+
+# Size cap for `.seneschal-memory.md` reads. Matches
+# `dependency_grep._MAX_MANIFEST_BYTES` so every `safe_open_in_repo` caller
+# pre-gates the read against the same pathological-file threshold. A
+# repo-memory file larger than 1 MB is either a generated artifact or a
+# deliberate OOM vector — either way it's not legitimate curated content.
+_MAX_MEMORY_BYTES = 1_048_576  # 1 MB
 
 _FRONTMATTER_RE = re.compile(
     r"^---\s*\n(.*?)\n---\s*\n(.*)$",
@@ -186,7 +194,15 @@ def save_review(
     return out_path
 
 
-def _parse_review_file(path: Path, repo_slug: str) -> Optional[ReviewRecord]:
+def parse_review_file(path: Path, repo_slug: str) -> Optional[ReviewRecord]:
+    """Parse a persisted review markdown file into a ReviewRecord.
+
+    Public because `review_index.sync_from_markdown` needs to share the
+    same frontmatter-parsing logic — pulling this through a leading-
+    underscore private name was module-boundary drift. The public name
+    is the one source of truth; callers outside `review_store` import
+    it directly.
+    """
     try:
         # `utf-8-sig` transparently strips a UTF-8 BOM if an external
         # editor (Windows Notepad, a misconfigured VS Code on Windows)
@@ -247,6 +263,14 @@ def _parse_review_file(path: Path, repo_slug: str) -> Optional[ReviewRecord]:
         followups_filed=followups_filed,
         followups_filed_titles=followups_filed_titles,
     )
+
+
+# Backward-compat alias — the pre-round-3 name was leading-underscore
+# private, so external callers (review_index, tests) reached across
+# module boundaries to use it. `parse_review_file` is the public name
+# going forward; this alias stays so in-tree callers and existing test
+# monkeypatches continue to work without a churn-heavy rename.
+_parse_review_file = parse_review_file
 
 
 def list_reviews(repo_slug: str, limit: int = 10) -> List[ReviewRecord]:
@@ -382,11 +406,29 @@ def get_repo_memory(repo_slug: str, repo_root: str) -> str:
     if not repo_root:
         return ""
     for name in (".seneschal-memory.md", ".ch-code-reviewer-memory.md"):
+        abs_path = os.path.join(repo_root, name)
         # Fast-skip when the file isn't present — `safe_open_in_repo` does
         # its own existence check but we can avoid the full-walk overhead
         # when neither canonical file is there.
-        if not os.path.isfile(os.path.join(repo_root, name)):
+        if not os.path.isfile(abs_path):
             continue
+        # Size-cap BEFORE the full-file read. `safe_open_in_repo` walks
+        # the path + opens O_NOFOLLOW + reads the entire body into a
+        # Python string — a 500 MB attacker-planted `.seneschal-memory.md`
+        # would OOM the MCP process. Stat first, reject anything above
+        # 1 MB (matches `dependency_grep._read_manifest`'s pattern). The
+        # two `safe_open_in_repo` callers that read full file contents
+        # now share this pre-gate.
+        try:
+            st = os.stat(abs_path)
+        except OSError:
+            continue
+        if st.st_size > _MAX_MEMORY_BYTES:
+            _neutral_log(
+                f"[review_store] refusing to read {name!r} from {repo_root!r}: "
+                f"size {st.st_size} exceeds cap {_MAX_MEMORY_BYTES}"
+            )
+            return ""
         text = safe_open_in_repo(repo_root, name)
         if text is not None:
             return text
