@@ -1763,3 +1763,67 @@ def test_save_review_treats_none_as_skip(tmp_path, monkeypatch):
     assert "followups_filed" not in raw, (
         "None should mean 'omit the key' — got the key in the file."
     )
+
+
+# --------------------------------------------------------------------------
+# Round 4 chore: `_current_version` should be called once per `_release_step`,
+# not twice. It does subprocess + multiple file reads — caching the result
+# in a local halves the I/O per release-step invocation.
+# --------------------------------------------------------------------------
+
+
+def test_release_step_calls_current_version_at_most_once(tmp_path, monkeypatch):
+    """`_current_version` reads pyproject.toml, package.json, VERSION,
+    and may shell out to git. Calling it twice per `_release_step`
+    doubles the file I/O for no benefit — cache the result in a local.
+    """
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True, release_threshold="patch")
+
+    # Spy on the real function.
+    import post_merge.orchestrator as orch
+    call_count = {"n": 0}
+    real_current_version = orch._current_version
+
+    def _spy_current_version(repo_path):
+        call_count["n"] += 1
+        return real_current_version(repo_path)
+
+    monkeypatch.setattr(orch, "_current_version", _spy_current_version)
+
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh:
+        mock_gh.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        (clone_dir / "pyproject.toml").write_text(
+            '[project]\nversion = "0.2.3"\n'
+        )
+        (clone_dir / "CHANGELOG.md").write_text(
+            "# Changelog\n\n## [Unreleased]\n\n### Fixed\n- x ([#1](x))\n"
+        )
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        mock_gh.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_gh.get_file_sha = MagicMock(return_value="oldsha")
+        mock_gh.get_default_branch_sha = MagicMock(return_value="defaultsha")
+        mock_gh.find_open_prs_with_label = MagicMock(return_value=[])
+        mock_gh.get_pr_commits = MagicMock(return_value=[])
+        mock_gh.create_branch = MagicMock(return_value={"ref": "refs/heads/x"})
+        mock_gh.create_pull_request = MagicMock(return_value={"number": 99})
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "fix: tiny"),
+            config=cfg,
+        )
+
+    assert call_count["n"] == 1, (
+        f"`_current_version` called {call_count['n']} times per _release_step "
+        "— should be cached (once per invocation)."
+    )

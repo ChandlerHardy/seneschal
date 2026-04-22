@@ -80,12 +80,18 @@ def _read_local_changelog(repo_path: str, changelog_path: str) -> str:
 
     Wraps `_safe_open_in_repo` so a malicious symlink at `CHANGELOG.md`
     pointing outside the repo tree cannot exfiltrate host-sensitive
-    contents into a subsequent `put_file` commit.
+    contents into a subsequent `put_file` commit. The helper itself
+    returns None on any safety violation, missing file, or I/O error;
+    we normalize that to an empty string for callers that just want to
+    branch on truthiness.
+
+    Previously this function ran its own `os.path.exists + os.path.islink`
+    precondition before calling `_safe_open_in_repo`. That was redundant
+    — the helper's `os.lstat` walk + `O_NOFOLLOW` open already handles
+    missing files + symlinks + traversal. The extra check only added a
+    TOCTOU window between `os.path.exists` and the open.
     """
     if not repo_path:
-        return ""
-    full = os.path.join(repo_path, changelog_path)
-    if not os.path.exists(full) and not os.path.islink(full):
         return ""
     content = _safe_open_in_repo(repo_path, changelog_path)
     return content or ""
@@ -656,14 +662,21 @@ def _current_version(repo_path: str) -> Optional[str]:
     return None
 
 
-def _release_branch_name(repo_path: str, bump_kind: str) -> str:
+def _release_branch_name(
+    repo_path: str, bump_kind: str, current_version: Optional[str] = None,
+) -> str:
     """Compute the release-PR branch name.
 
     If a current version is discoverable, compute the next version and
     use it. Otherwise use `seneschal/release-pending-<bump_kind>` (NOT
     `-next` — that placeholder hid the bump intent in the branch name).
+
+    `current_version` is an optional caller-provided cache: `_release_step`
+    calls `_current_version(repo_path)` once and threads the result
+    through here so we don't re-read pyproject.toml + package.json +
+    VERSION + shell out to git twice per release step.
     """
-    current = _current_version(repo_path)
+    current = current_version if current_version is not None else _current_version(repo_path)
     if current:
         try:
             new_version = release_mod.next_version(current, bump_kind)
@@ -712,6 +725,12 @@ def _release_step(
     if order.get(bump, 0) < order.get(threshold, 0):
         return None
 
+    # Cache the current version once per _release_step invocation.
+    # Previously this was called twice (inside `_release_branch_name` and
+    # again for the release-notes body below) — each call reads
+    # pyproject.toml + package.json + VERSION and may shell out to git.
+    current_ver = _current_version(repo_path)
+
     # If a release PR is already open, amend it instead of opening another.
     try:
         existing_prs = github_api.find_open_prs_with_label(owner, repo, "seneschal:release", token)
@@ -726,7 +745,7 @@ def _release_step(
         )
 
     # Open a fresh release PR.
-    branch = _release_branch_name(repo_path, bump)
+    branch = _release_branch_name(repo_path, bump, current_version=current_ver)
     base = config.post_merge.release_base_branch or "main"
 
     # Build a structured release-notes body via `release.render_release_notes`
@@ -737,7 +756,6 @@ def _release_step(
     # tagged release. Falls back to a minimal body if the version is
     # unknown or `next_version` rejects the current string as non-semver.
     unreleased_section = m.group(0) if m else ""
-    current_ver = _current_version(repo_path)
     new_version_for_body: Optional[str] = None
     if current_ver:
         try:
