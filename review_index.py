@@ -18,7 +18,7 @@ Design rules:
 - ADRs are discovered per-known-repo via `history_context.find_adrs` by
   walking `SENESCHAL_REPOS_ROOT` (default `~/repos`) for directories
   that `cross_repo.known_repos` recognizes.
-- Review-body snippets pass through `secrets_scan._PATTERNS` before we
+- Review-body snippets pass through `secrets_scan.redact` before we
   ever return them — an otherwise-clean review can have a leaked token
   in a code block and the MCP tool is a new egress channel. Redact.
 
@@ -34,6 +34,7 @@ import re
 import sqlite3
 import sys
 import threading
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fs_safety import validate_repo_slug
@@ -63,6 +64,13 @@ DEFAULT_SEARCH_LIMIT = 20
 DEFAULT_LIST_LIMIT = 50
 MAX_LIMIT = 200
 
+# Log a WARN every N ensure_synced failures so a persistent-stale-index
+# condition is surfaced in stderr. Lower = noisier but faster operator
+# signal; higher = calmer logs but longer before a real problem trips the
+# threshold. 5 is a pragmatic middle ground — a single transient failure
+# stays quiet, five in a row demands attention.
+_SYNC_FAILURE_LOG_EVERY = 5
+
 # FTS tokens we must sanitize before handing to MATCH. FTS5 treats
 # `"`, `-`, `AND`/`OR`/`NOT`, `NEAR(` and parentheses as syntax; a raw
 # user query that happens to contain any of these crashes the query.
@@ -77,32 +85,48 @@ def _log(msg: str) -> None:
     _neutral_log(f"[review_index] {msg}")
 
 
-_ISO_DATETIME_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$"
-)
-
-
 def _parse_iso_or_raise(value: str) -> str:
-    """Validate that `value` is an ISO-8601 date or datetime string.
+    """Validate + normalize an ISO-8601 `since` to UTC-Z for SQL compare.
 
-    `list_merged_prs` uses `since` in a lexicographic SQL comparison.
-    Human input like `"yesterday"` or a date-only string mismatched
-    against `merged_at`'s "YYYY-MM-DDTHH:MM:SSZ" shape used to
-    silently return empty lists — a caller typo was indistinguishable
-    from an honestly-empty window.
+    `list_merged_prs` compares `since` lexicographically against stored
+    `merged_at` values, which are always `"%Y-%m-%dT%H:%M:%SZ"` (UTC,
+    Z-suffix). An offset-carrying input like `"2026-04-22T17:00:00+05:00"`
+    would sort BEFORE the equivalent `"2026-04-22T12:00:00Z"` (because
+    `+` = 0x2B < `Z` = 0x5A), silently including the same instant twice
+    in some windows and excluding it from others — a surprise-class bug.
 
-    Accepts `YYYY-MM-DD` and full ISO datetimes with optional
-    fractional seconds and a `Z` / `+HH:MM` offset. Returns the input
-    unchanged (SQL comparison stays string-based); raises ValueError
-    on anything that won't safely sort against the stored `merged_at`.
+    Round-3 fix: delegate shape validation to `datetime.fromisoformat`
+    (stdlib raises `ValueError` on any input it can't parse — same
+    contract the old regex tried to enforce, but correctly covers
+    fractional-second variants + subtle separator edge cases), then
+    normalize to UTC and re-format as `"%Y-%m-%dT%H:%M:%SZ"` so the
+    SQL compare is byte-aligned with stored values.
+
+    Accepts:
+      - `YYYY-MM-DD` (date-only — treated as UTC midnight)
+      - full datetimes with optional fractional seconds and any offset
+        (including `Z`, which `fromisoformat` handles natively on 3.11+).
     """
     if not isinstance(value, str) or not value:
         raise ValueError(f"since must be an ISO-8601 string, got {value!r}")
-    if not _ISO_DATETIME_RE.match(value):
+    # `datetime.fromisoformat` (3.11+) accepts `Z` suffix, fractional
+    # seconds, and `+HH:MM` offsets — everything the old regex tried to
+    # whitelist plus the bare-date case via the explicit fallback below.
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError as e:
         raise ValueError(
             f"since must be an ISO-8601 date or datetime, got {value!r}"
-        )
-    return value
+        ) from e
+    # A date-only input parses as a naive midnight — treat it as UTC so
+    # the normalized output is `"YYYY-MM-DDT00:00:00Z"` and sorts
+    # correctly against stored Z-suffix values. A tz-aware input gets
+    # converted to UTC first so `+05:00` → `Z` keeps the same instant.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _sanitize_fts_query(q: str) -> str:
@@ -152,63 +176,66 @@ def _make_snippet(body: str, query: str) -> str:
     return _redact_snippet(snippet)
 
 
-def _probe_fts5() -> bool:
-    """Check whether this sqlite build supports FTS5 by attempting to
-    create a throwaway virtual table on an in-memory connection.
+def _probe_fts5_features() -> tuple[bool, bool]:
+    """Probe FTS5 availability + `contentless_delete=1` support in one pass.
 
-    Runs against `:memory:` (not the real index DB) so a SIGKILL between
-    CREATE and DROP can never leave an orphan `_probe_fts` table in the
-    on-disk file. The orphan bug was reproducible: a crashed probe left
-    the table committed; the next startup's probe saw "table already
-    exists", caught the OperationalError, returned False, and silently
-    degraded every future search query to unindexed LIKE scans until an
-    operator noticed that searches were slow and ran a manual DROP.
+    Returns `(fts5_available, contentless_delete_supported)`. Both
+    probes share a single `:memory:` connection so the two-table
+    CREATE sequence runs in one sqlite process invocation.
 
-    The in-memory connection is thrown away at function return; the
-    probe's cost is ~1ms and runs once per Index open.
+    Why `:memory:` not the real index DB: the orphan-after-SIGKILL bug
+    is reproducible. A crashed probe on the real DB left `_probe_fts`
+    committed; the next startup's probe saw "table already exists",
+    caught the OperationalError, returned False, and silently degraded
+    every future search to unindexed LIKE scans. In-memory probe
+    isolates from any persistent state.
+
+    `contentless_delete=1` is a 3.43+ feature. When unavailable, the
+    Index falls back to the DELETE-less contentless table + the
+    'delete' special-insert protocol for purges — see `_fts_delete`.
+
+    Round-3 consolidation: the two probes used to live in separate
+    functions, each opening + closing its own connection. One
+    connection is ~0.5ms saved on every process start and ~18 fewer
+    LOC to audit.
     """
     try:
         probe_con = sqlite3.connect(":memory:")
     except sqlite3.Error:
-        return False
+        return (False, False)
     try:
-        probe_con.execute("CREATE VIRTUAL TABLE _probe_fts USING fts5(x);")
-        return True
-    except sqlite3.OperationalError:
-        return False
+        try:
+            probe_con.execute("CREATE VIRTUAL TABLE _probe_fts USING fts5(x);")
+            fts5_ok = True
+        except sqlite3.OperationalError:
+            return (False, False)
+
+        # Secondary probe: the `contentless_delete=1` option.
+        try:
+            probe_con.execute(
+                "CREATE VIRTUAL TABLE _probe_cd USING "
+                "fts5(x, content='', contentless_delete=1);"
+            )
+            contentless_delete_ok = True
+        except sqlite3.OperationalError:
+            contentless_delete_ok = False
+        return (fts5_ok, contentless_delete_ok)
     finally:
         try:
             probe_con.close()
         except sqlite3.Error:
             pass
+
+
+# Backward-compat shim: tests + external callers may still reference
+# `_probe_fts5()`. Route through the unified probe so the behavior stays
+# bit-identical.
+def _probe_fts5() -> bool:
+    return _probe_fts5_features()[0]
 
 
 def _probe_fts5_contentless_delete() -> bool:
-    """Secondary probe: does FTS5 accept the `contentless_delete=1` option?
-
-    Added in SQLite 3.43; older builds reject it at CREATE time. If
-    missing, we keep the DELETE-less contentless table and route purges
-    through the 'delete' special-insert protocol instead.
-
-    Same :memory: isolation as `_probe_fts5` — a crashed probe must not
-    orphan a `_probe_cd` table in the real index DB.
-    """
-    try:
-        probe_con = sqlite3.connect(":memory:")
-    except sqlite3.Error:
-        return False
-    try:
-        probe_con.execute(
-            "CREATE VIRTUAL TABLE _probe_cd USING fts5(x, content='', contentless_delete=1);"
-        )
-        return True
-    except sqlite3.OperationalError:
-        return False
-    finally:
-        try:
-            probe_con.close()
-        except sqlite3.Error:
-            pass
+    return _probe_fts5_features()[1]
 
 
 def open_index(path: Optional[str] = None) -> "Index":
@@ -287,6 +314,13 @@ class Index:
         # Moving the state here + using the shared lock closes that
         # race without needing a second primitive in server.py.
         self._synced = False
+        # Round-3 warning #4: if `sync_from_markdown` keeps raising,
+        # `_synced` stays False indefinitely and every tool call
+        # silently re-attempts the sync — with no operator signal.
+        # Count failures and log a WARN at every multiple of
+        # `_SYNC_FAILURE_LOG_EVERY` so a persistent-stale-index condition
+        # is surfaced in stderr instead of hiding as latency.
+        self._sync_failures: int = 0
         self._con.execute("PRAGMA journal_mode=WAL;")
         self._con.execute("PRAGMA synchronous=NORMAL;")
         self._con.execute("PRAGMA foreign_keys=ON;")
@@ -295,10 +329,11 @@ class Index:
         # table in the real DB (which would cause the NEXT startup's
         # probe to see "table already exists" and silently degrade
         # every search to unindexed LIKE scans).
-        self._fts5 = _probe_fts5()
-        self._fts5_contentless_delete = (
-            _probe_fts5_contentless_delete() if self._fts5 else False
-        )
+        #
+        # Round-3: the two probes are now one — `_probe_fts5_features()`
+        # returns both bits in a single `:memory:` session, halving the
+        # startup probe cost.
+        self._fts5, self._fts5_contentless_delete = _probe_fts5_features()
         self._ensure_schema()
 
     def ensure_synced(self, store_root: Optional[str] = None) -> None:
@@ -310,6 +345,15 @@ class Index:
         False so the next call retries (same semantics the old
         module-level sentinel had, minus the race).
 
+        Round-3 warning #4: persistent sync failure used to be silent —
+        `_synced` stayed False, every subsequent tool call re-attempted
+        the sync, and the operator only noticed via tool-call latency.
+        We now track failure count on `self._sync_failures` and log a
+        WARN every `_SYNC_FAILURE_LOG_EVERY` failures so the condition
+        is surfaced in stderr. Retry behavior is unchanged — the
+        latency cliff of re-running sync on every call is an acceptable
+        trade-off for not needing a separate retry scheduler.
+
         Replaces the `_INDEX_SYNCED` global in mcp_server.server —
         that sentinel was read-then-set without a lock, so two
         concurrent first-calls both saw False and both ran
@@ -319,7 +363,17 @@ class Index:
         with self._lock:
             if self._synced:
                 return
-            self.sync_from_markdown(store_root)
+            try:
+                self.sync_from_markdown(store_root)
+            except Exception:
+                self._sync_failures += 1
+                if self._sync_failures % _SYNC_FAILURE_LOG_EVERY == 0:
+                    _log(
+                        f"ensure_synced has failed {self._sync_failures} times; "
+                        f"the index may be serving stale data. Check disk "
+                        f"state and recent stderr for the underlying cause."
+                    )
+                raise
             self._synced = True
 
     # ------------------------------------------------------------------
@@ -457,7 +511,7 @@ class Index:
 
         Walks `<store_root>/<owner>/<repo>/<N>.md`. For each file: if its
         mtime is newer than the cached row (or there is no row), re-parse
-        via `review_store._parse_review_file` and upsert. Any DB row whose
+        via `review_store.parse_review_file` and upsert. Any DB row whose
         file no longer exists on disk is purged.
 
         Returns the number of rows inserted/updated (not counting purges).
@@ -557,7 +611,7 @@ class Index:
             # (Re)parse via the canonical review-store parser so schema
             # drift (new frontmatter keys) is handled in one place.
             from pathlib import Path
-            rec = review_store._parse_review_file(Path(fpath), slug)
+            rec = review_store.parse_review_file(Path(fpath), slug)
             if rec is None:
                 _log(f"skipped unparseable review file: {fpath}")
                 continue
@@ -714,7 +768,7 @@ class Index:
         self,
         query: str,
         repo: Optional[str] = None,
-        limit: int = 50,
+        limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> List[dict]:
         """Full-text search across indexed reviews.
 
@@ -788,7 +842,7 @@ class Index:
         self,
         query: str,
         repo: Optional[str] = None,
-        limit: int = 20,
+        limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> List[dict]:
         """Full-text search across indexed ADRs from every known repo."""
         if repo is not None:
@@ -865,7 +919,7 @@ class Index:
         self,
         repo: Optional[str] = None,
         since: Optional[str] = None,
-        limit: int = 20,
+        limit: int = DEFAULT_LIST_LIMIT,
     ) -> List[dict]:
         """Return reviews whose `merged_at` is set, newest-first.
 
