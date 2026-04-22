@@ -256,3 +256,113 @@ def test_release_base_branch_accepts_valid_name():
     raw = "post_merge:\n  release_base_branch: release/v2.x\n"
     cfg = parse_config(raw)
     assert cfg.post_merge.release_base_branch == "release/v2.x"
+
+
+# --------------------------------------------------------------------------
+# Blocker 1: deny-list for sensitive changelog_path values
+#
+# Even after traversal rejection, a `changelog_path: CODEOWNERS` (or
+# `.github/workflows/ci.yml`) is a valid repo-relative path that would
+# let a PR author redirect Seneschal's auto-commit at a file protected
+# by branch rules. The fix is a case-insensitive basename + top-segment
+# deny-list in `_safe_changelog_path`.
+# --------------------------------------------------------------------------
+
+
+def test_changelog_path_rejects_github_dir():
+    raw = "post_merge:\n  changelog_path: .github/workflows/ci.yml\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_github_root_codeowners():
+    # `.github/CODEOWNERS` is the standard location for reviewers.
+    raw = "post_merge:\n  changelog_path: .github/CODEOWNERS\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_root_codeowners_case_insensitive():
+    raw = "post_merge:\n  changelog_path: CODEOWNERS\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+    raw = "post_merge:\n  changelog_path: Codeowners\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+    raw = "post_merge:\n  changelog_path: codeowners\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_security_md():
+    raw = "post_merge:\n  changelog_path: SECURITY.md\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_gitattributes():
+    raw = "post_merge:\n  changelog_path: .gitattributes\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_gitignore():
+    raw = "post_merge:\n  changelog_path: .gitignore\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_license_variants():
+    for name in ("LICENSE", "LICENSE.md", "LICENSE.txt", "license", "License.MD"):
+        raw = f"post_merge:\n  changelog_path: {name}\n"
+        cfg = parse_config(raw)
+        assert cfg.post_merge.changelog_path == "CHANGELOG.md", f"should reject {name!r}"
+
+
+def test_changelog_path_rejects_env_file():
+    raw = "post_merge:\n  changelog_path: .env\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_dockerfile():
+    raw = "post_merge:\n  changelog_path: Dockerfile\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+    raw = "post_merge:\n  changelog_path: docker-compose.yml\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+    raw = "post_merge:\n  changelog_path: docker-compose.yaml\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_git_dir_segment():
+    # Nested `.git/HEAD` — crafted to avoid the `.github/` startswith check.
+    raw = "post_merge:\n  changelog_path: .git/HEAD\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_nested_git_segment():
+    # Any segment equal to `.git` anywhere in the path is suspicious.
+    raw = "post_merge:\n  changelog_path: docs/.git/HEAD\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_accepts_docs_subdir():
+    # Make sure the deny-list doesn't bleed over into ordinary paths.
+    raw = "post_merge:\n  changelog_path: docs/changes/HISTORY.md\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "docs/changes/HISTORY.md"
+
+
+def test_sensitive_path_sets_are_inspectable():
+    from repo_config import _SENSITIVE_FILENAMES, _SENSITIVE_PATH_SEGMENTS
+
+    # Sets must be frozensets so operators can inspect without mutation risk.
+    assert isinstance(_SENSITIVE_FILENAMES, frozenset)
+    assert isinstance(_SENSITIVE_PATH_SEGMENTS, frozenset)
+    assert "codeowners" in _SENSITIVE_FILENAMES
+    assert ".github" in _SENSITIVE_PATH_SEGMENTS

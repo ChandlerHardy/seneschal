@@ -52,6 +52,33 @@ def _sanitize(text: str, max_len: int) -> str:
 # would let anyone with push access redirect Seneschal's auto-commit at
 # a protected workflow file. Keep it confined to repo-relative, forward
 # slashes only, no traversal segments.
+#
+# Deny-list (Blocker 1): even after traversal rejection, explicit
+# `.github/CODEOWNERS` or `SECURITY.md` is a valid relative path that
+# would pass the naive safety check. A rogue config could redirect the
+# auto-commit at any of these and wipe branch-protection reviewers,
+# corrupt CI, or replace the license. Block them here.
+#
+# Frozenset so the list is inspectable from tests / operators.
+_SENSITIVE_PATH_SEGMENTS = frozenset({
+    ".github",
+    ".git",
+})
+_SENSITIVE_FILENAMES = frozenset({
+    "codeowners",
+    ".gitattributes",
+    ".gitignore",
+    "security.md",
+    "license",
+    "license.md",
+    "license.txt",
+    ".env",
+    "dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+})
+
+
 def _safe_changelog_path(path: str) -> Optional[str]:
     """Return `path` if it's a safe repo-relative file path, else None.
 
@@ -60,6 +87,9 @@ def _safe_changelog_path(path: str) -> Optional[str]:
       - backslashes (Windows-style, banned outright)
       - `..` segments (parent-dir traversal)
       - empty / whitespace-only strings
+      - any path starting with `.github/` or `.git/` (sensitive dirs)
+      - any file whose basename matches `_SENSITIVE_FILENAMES` case-insensitive
+        (CODEOWNERS, SECURITY.md, LICENSE, .env, Dockerfile, etc.)
     """
     if not path or not path.strip():
         return None
@@ -72,8 +102,27 @@ def _safe_changelog_path(path: str) -> Optional[str]:
         return None
     # Split on POSIX `/` so we catch `../foo` even after normpath
     # normalizes it to `../foo` rather than collapsing it.
-    for part in norm.split("/"):
+    parts = norm.split("/")
+    for part in parts:
         if part == "..":
+            return None
+    # Deny-list: reject any path whose first segment is a sensitive dir
+    # (.github/*, .git/*) OR whose basename is a sensitive filename
+    # (CODEOWNERS, SECURITY.md, etc.). Compare case-insensitively because
+    # some filesystems (macOS HFS+, Windows) are case-insensitive, and
+    # GitHub itself treats CODEOWNERS / Codeowners / codeowners as the
+    # same file at apply-time.
+    lowered_parts = [p.lower() for p in parts if p]
+    if lowered_parts:
+        head = lowered_parts[0]
+        if head in _SENSITIVE_PATH_SEGMENTS:
+            return None
+        # Any segment named `.git` anywhere in the path (eg `foo/.git/HEAD`).
+        if any(p == ".git" for p in lowered_parts):
+            return None
+        # Basename check.
+        basename = lowered_parts[-1]
+        if basename in _SENSITIVE_FILENAMES:
             return None
     return norm
 
