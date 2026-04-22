@@ -66,6 +66,14 @@ for f in agents/seneschal-architect.md \
   scp "$REPO_DIR/$f" "${HOST}:~/.claude/$(echo "$f" | sed 's#^#agents/#' 2>/dev/null || echo "$f")"
 done
 
+# Ship the `seneschal-post` CLI helper to ~/bin on the host. This is the
+# script the /seneschal-review Claude Code skill calls to post an
+# aggregated multi-persona review as seneschal-cr[bot] via a minted
+# installation token. Pure GitHub-API poster — no LLM dependency.
+ssh "$HOST" "mkdir -p ~/bin"
+scp "$REPO_DIR/bin/seneschal-post" "${HOST}:~/bin/seneschal-post"
+ssh "$HOST" "chmod +x ~/bin/seneschal-post"
+
 # Smoke-import so we catch missing deps before systemd starts
 ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token; from post_merge import orchestrator' && echo 'seneschal imports: OK'"
 
