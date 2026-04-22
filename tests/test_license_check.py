@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from license_check import scan_license_headers, LicenseViolation  # noqa: E402
 from repo_config import StandardsConfig  # noqa: E402
+from risk import PRFile  # noqa: E402
 
 
 def _mk_diff(path: str, lines: list) -> str:
@@ -134,17 +135,47 @@ def test_modified_file_not_flagged_via_pr_files():
         "+func Bar() {}\n"
     )
     config = StandardsConfig(license_header=REQUIRED)
-    pr_files = [{"filename": "src/existing.go", "status": "modified"}]
+    pr_files = [PRFile(filename="src/existing.go", status="modified")]
     assert scan_license_headers(diff, pr_files=pr_files, config=config) == []
 
 
 def test_added_file_flagged_via_pr_files_status():
     diff = _mk_diff("src/new.go", ["package new"])
     config = StandardsConfig(license_header=REQUIRED)
-    pr_files = [{"filename": "src/new.go", "status": "added"}]
+    pr_files = [PRFile(filename="src/new.go", status="added")]
     violations = scan_license_headers(diff, pr_files=pr_files, config=config)
     assert len(violations) == 1
     assert violations[0].file == "src/new.go"
+
+
+def test_renamed_file_not_flagged_via_pr_files():
+    # A renamed file is not "newly added" — it was already in the tree.
+    # Even if its added lines lack the header (e.g. rewrite during rename),
+    # the license scan must not flag it.
+    diff = _mk_diff("src/renamed.go", ["package renamed"])
+    config = StandardsConfig(license_header=REQUIRED)
+    pr_files = [PRFile(filename="src/renamed.go", status="renamed")]
+    assert scan_license_headers(diff, pr_files=pr_files, config=config) == []
+
+
+def test_pr_files_missing_entry_treated_as_not_new():
+    # If pr_files is supplied but the filename isn't in it, the scanner
+    # should not flag — the diff might include a file the caller has
+    # intentionally scoped out.
+    diff = _mk_diff("src/unknown.go", ["package unknown"])
+    config = StandardsConfig(license_header=REQUIRED)
+    pr_files = [PRFile(filename="src/other.go", status="added")]
+    assert scan_license_headers(diff, pr_files=pr_files, config=config) == []
+
+
+def test_pr_files_none_uses_new_file_mode_marker_fallback():
+    # When pr_files is None, the diff-text `new file mode` heuristic is
+    # the fallback. This is the current primary path from analyze_pr prior
+    # to fix A; keep covered so we don't regress it after signature change.
+    diff = _mk_diff("src/new.go", ["package new"])
+    config = StandardsConfig(license_header=REQUIRED)
+    violations = scan_license_headers(diff, pr_files=None, config=config)
+    assert len(violations) == 1
 
 
 def test_header_longer_than_2kb_truncated_but_still_works():

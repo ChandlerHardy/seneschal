@@ -512,11 +512,13 @@ def analyze_pr(
 
     # Standards enforcement (P3) — all three producers no-op when the
     # corresponding config knob is empty/False.
+    # NOTE: pass the raw `files` (pre-ignore_paths filter) so license
+    # enforcement applies repo-wide, not just to non-ignored paths.
+    # The `license_applies_to` / `license_exemptions` knobs are the
+    # right control surface for license scoping, not `ignore_paths`.
     license_violations = scan_license_headers(
         diff_text,
-        pr_files=None,  # analyze_pr doesn't receive the raw GitHub PR files API payload;
-                        # the file-status heuristic in license_check falls back to the
-                        # `new file mode` diff marker.
+        pr_files=files,
         config=config.standards,
     )
     convention_violation = check_pr_title_strict(

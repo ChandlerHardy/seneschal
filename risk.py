@@ -17,6 +17,10 @@ class PRFile:
     additions: int = 0
     deletions: int = 0
     status: str = "modified"  # added, removed, modified, renamed
+    # Populated by the GitHub files API only when `status == "renamed"`.
+    # Carries the pre-rename path so consumers (e.g. license_check) can
+    # distinguish a rename from a true add.
+    previous_filename: str = ""
 
 
 @dataclass

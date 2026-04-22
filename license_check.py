@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Sequence
+from typing import List, Optional, Sequence
 
 from diff_parser import parse_unified_diff
 from repo_config import StandardsConfig, glob_match
+from risk import PRFile
 
 
 @dataclass
@@ -94,30 +95,36 @@ def _header_matches(added_lines: Sequence[str], header_text: str) -> bool:
 
 def _file_is_new(
     filename: str,
-    added_lines: Sequence[str],
     diff_text: str,
-    pr_files: Optional[Iterable[Any]],
+    pr_files: Optional[Sequence[PRFile]],
 ) -> bool:
     """Determine whether this file is a new addition in the PR.
 
-    Prefers `pr_files` metadata (the GitHub PR files API has an explicit
-    `status` field). Falls back to the heuristic: the diff contains a
-    `new file mode` marker for this file.
+    Prefers `pr_files` metadata (typed `PRFile` — `.status == "added"`
+    is the authoritative signal). When `pr_files is None`, falls back
+    to the diff-text heuristic: `new file mode` marker. The fallback
+    is explicit (None is the sentinel) so a caller that passes an
+    empty sequence opts OUT of scanning — matching "nothing in this PR
+    is new" semantics rather than silently dropping to heuristic.
+
+    Renamed files are NOT treated as new: the file existed pre-PR,
+    only its path changed, so the license-scan contract (new-file-only)
+    means no violation.
     """
-    if pr_files:
+    if pr_files is not None:
         for entry in pr_files:
-            if not isinstance(entry, dict):
+            if entry.filename != filename:
                 continue
-            if entry.get("filename") == filename:
-                return entry.get("status") == "added"
-        # If pr_files was provided but this filename isn't in it, treat
-        # as not-new (the caller shouldn't be scanning something the PR
-        # doesn't touch).
+            if entry.status == "renamed":
+                # Rename, not add — content was already licensed pre-PR.
+                return False
+            return entry.status == "added"
+        # pr_files supplied but this filename isn't in it — treat as
+        # not-new (the caller intentionally scoped it out).
         return False
 
-    # Heuristic: look for the `new file mode` marker immediately after
-    # the file header in the raw diff. This is cheap and reliable for
-    # standard `git diff --no-color` output.
+    # Fallback: look for `new file mode` marker in the raw diff. This is
+    # cheap and reliable for standard `git diff --no-color` output.
     marker = f"diff --git a/{filename} b/{filename}"
     idx = diff_text.find(marker)
     if idx == -1:
@@ -129,7 +136,7 @@ def _file_is_new(
 
 def scan_license_headers(
     diff_text: str,
-    pr_files: Optional[Iterable[Any]],
+    pr_files: Optional[Sequence[PRFile]],
     config: StandardsConfig,
 ) -> List[LicenseViolation]:
     """Scan a PR's diff for files missing the configured license header.
@@ -147,7 +154,7 @@ def scan_license_headers(
 
     for filename, added_lines in added_by_file.items():
         # Skip non-new files (modified, renamed, etc.)
-        if not _file_is_new(filename, added_lines, diff_text, pr_files):
+        if not _file_is_new(filename, diff_text, pr_files):
             continue
 
         # applies_to filter. Empty = check every added file.
