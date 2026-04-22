@@ -1057,7 +1057,14 @@ def handle_pr_merged(
                 if err_detail:
                     result.setdefault("error", err_detail)
             except Exception as e:  # noqa: BLE001
-                app.log(f"[post_merge] changelog step failed for {owner}/{repo}#{pr_number}: {e!r}")
+                app.log(
+                    f"[post_merge] changelog step failed for "
+                    f"{owner}/{repo}#{pr_number}: {type(e).__name__}: {e}"
+                )
+                # Symmetric with the release-step handler below: a raised
+                # exception must populate `result["error"]` so callers /
+                # operators see the failure rather than just a log line.
+                result.setdefault("error", f"changelog: {type(e).__name__}")
 
         # 2. Followups.
         new_followups: List[int] = []
@@ -1094,7 +1101,18 @@ def handle_pr_merged(
                     owner, repo, pr_number, pr_meta, config, token, repo_path,
                 )
             except Exception as e:  # noqa: BLE001
-                app.log(f"[post_merge] release step failed for {owner}/{repo}#{pr_number}: {e!r}")
+                app.log(
+                    f"[post_merge] release step failed for "
+                    f"{owner}/{repo}#{pr_number}: {type(e).__name__}: {e}"
+                )
+                # Symmetric with _changelog_step: a raised exception
+                # during the release step must leave `result["error"]`
+                # populated so callers / operators see the failure.
+                # `_amend_release_pr` was tightened in round-4 to RAISE on
+                # put_file failure (instead of swallow-and-return) — if we
+                # only log here, that contract hole re-opens at the outer
+                # layer.
+                result.setdefault("error", f"release: {type(e).__name__}")
 
         return result
     except Exception as e:  # noqa: BLE001

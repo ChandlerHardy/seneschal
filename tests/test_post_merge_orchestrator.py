@@ -1414,6 +1414,63 @@ def test_release_step_skips_release_pr_when_amend_raises(tmp_path, monkeypatch):
         "Round-3 regression: _amend_release_pr swallowed put_file failure "
         f"and the orchestrator reported success: {result!r}"
     )
+    # Round-5 blocker: the outer except must populate `result["error"]`
+    # symmetric with the changelog-step handler. Previously it only
+    # logged, which left the outer caller with no programmatic signal
+    # that the release step failed — just a blank `release_pr` (which
+    # is indistinguishable from "threshold not met").
+    assert result.get("error"), (
+        "Round-5 blocker: release-step handler must set result['error'] "
+        "on exception, symmetric with _changelog_step. Without this, a "
+        "failed amend is indistinguishable from 'no release needed'."
+    )
+    assert "release" in result["error"].lower(), (
+        f"error string should identify the release step: {result['error']!r}"
+    )
+
+
+def test_changelog_step_exception_sets_result_error(tmp_path, monkeypatch):
+    """Symmetric with `test_release_step_skips_release_pr_when_amend_raises`:
+    when `_changelog_step` itself RAISES (not just returns a soft err_detail
+    tuple), the outer handler must populate `result["error"]` so callers
+    see the failure rather than just a log line.
+
+    The (ok, err_detail) return path already set error via setdefault;
+    this test covers the raise path, which round-5 previously left
+    asymmetric with the release step (which now also sets error on raise).
+    """
+    _PROTECTED_REPOS.clear()
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True)
+    with patch("post_merge.orchestrator.app") as mock_app, \
+            patch("post_merge.orchestrator.github_api") as mock_gh, \
+            patch("post_merge.orchestrator._changelog_step") as mock_step:
+        mock_gh.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        # Force the step to raise (not return an err_detail tuple).
+        mock_step.side_effect = RuntimeError("unexpected internal error")
+
+        result = handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "feat: x"),
+            config=cfg,
+        )
+
+    assert result["changelog_updated"] is False
+    assert result.get("error"), (
+        "changelog-step handler must set result['error'] on raise, "
+        f"symmetric with release step. Got: {result!r}"
+    )
+    assert "changelog" in result["error"].lower(), (
+        f"error string should identify the changelog step: {result['error']!r}"
+    )
 
 
 def test_amend_release_pr_rejects_missing_head_ref():
