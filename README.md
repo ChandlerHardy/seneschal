@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/cover-image.png" alt="Seneschal — reviews with diligence, guides with wisdom, serves the greater work" width="640">
+  <img src="docs/cover-image.png" alt="Seneschal — reviews with diligence, guides with wisdom, serves the greater work" width="960">
 </p>
 
 # Seneschal
