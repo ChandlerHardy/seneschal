@@ -25,7 +25,7 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "Deploying Seneschal to ${HOST}..."
 
 # Target install dir on the host
-ssh "$HOST" "mkdir -p ~/seneschal"
+ssh "$HOST" "mkdir -p ~/seneschal ~/seneschal/post_merge"
 
 # Create venv if missing
 ssh "$HOST" "
@@ -45,6 +45,12 @@ for f in app.py analyzer.py risk.py scope.py diff_parser.py test_gaps.py \
   scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
 done
 
+# Ship post_merge package (P1)
+for f in post_merge/__init__.py post_merge/changelog.py post_merge/release.py \
+         post_merge/followups.py post_merge/orchestrator.py; do
+  scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
+done
+
 # Install Python deps
 ssh "$HOST" "~/seneschal/venv/bin/pip install -q -r ~/seneschal/requirements.txt && echo 'pip install: OK'"
 
@@ -61,7 +67,7 @@ for f in agents/seneschal-architect.md \
 done
 
 # Smoke-import so we catch missing deps before systemd starts
-ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token' && echo 'seneschal imports: OK'"
+ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token; from post_merge import orchestrator' && echo 'seneschal imports: OK'"
 
 # Install / update the systemd unit
 scp "$REPO_DIR/systemd/seneschal.service" "${HOST}:/tmp/seneschal.service"
