@@ -399,3 +399,26 @@ def test_save_review_cleans_up_tempfile_on_error(tmp_path, monkeypatch):
             assert not p.name.endswith(".tmp"), (
                 f"Tempfile {p} not cleaned up after atomic-write failure"
             )
+
+
+def test_save_review_with_head_sha_via_post_review_path(tmp_path, monkeypatch):
+    """W6: app.post_review must thread head_sha through to save_review so
+    production records carry the actual PR head SHA. Previously the
+    call site never passed head_sha, leaving every record with head_sha=""
+    and breaking P2's SQLite index ability to correlate reviews to
+    commits."""
+    import review_store as rs
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    # The save_review kwarg accepts head_sha directly — confirm round-trip.
+    save_review(
+        "owner/repo",
+        123,
+        "APPROVE",
+        "https://x/123",
+        "review body",
+        head_sha="abc123def456",
+    )
+    rec = get_review("owner/repo", 123)
+    assert rec is not None
+    assert rec.head_sha == "abc123def456"

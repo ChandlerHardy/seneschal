@@ -77,9 +77,19 @@ _PREFIX_RE = re.compile(
     r"^(?P<type>[a-zA-Z]+)(?:\([^)]*\))?(?P<bang>!?):\s*(?P<rest>.*)$",
 )
 
-# Breaking-change markers recognized in commit bodies / titles. Both the
-# spaced and hyphenated forms are valid per Conventional Commits.
-_BREAKING_TEXT_RE = re.compile(r"BREAKING[\s-]CHANGE", re.IGNORECASE)
+# Breaking-change footer per Conventional Commits. Must be `BREAKING CHANGE:`
+# or `BREAKING-CHANGE:` (note: colon required) at the start of a line OR
+# directly after a preceding newline / footer separator. The previous
+# unanchored `BREAKING[\s-]CHANGE` matched any substring — so a title like
+# `fix: restore BREAKING CHANGE regression-test parser` was flagged
+# breaking, triggering a spurious major bump.
+#
+# (?m) = re.MULTILINE so `^` anchors to each line beginning.
+# Accept ws/hyphen, case-insensitive, require `:` after CHANGE.
+_BREAKING_TEXT_RE = re.compile(
+    r"(?m)^\s*BREAKING[\s-]CHANGE\s*:",
+    re.IGNORECASE,
+)
 
 
 def classify_prefix(title: str) -> Optional[str]:
@@ -201,7 +211,16 @@ def insert_unreleased_entry(
     of `kind`. The caller is responsible for rendering the `entry` string
     with a `**BREAKING**:` marker if downstream semver detection should
     see it in the changelog text.
+
+    CRLF normalization: input is normalized to LF before regex work, so a
+    changelog file on a Windows-origin repo (or one touched by a
+    non-LF-normalizing editor) doesn't confuse the line-anchored matchers.
+    Output is emitted with LF line endings, which the Contents API will
+    then echo back consistently.
     """
+    # Normalize CRLF -> LF so line-anchored regexes (`^## `, `^### `)
+    # match regardless of the input file's line endings.
+    existing_changelog = (existing_changelog or "").replace("\r\n", "\n").replace("\r", "\n")
     text = _ensure_header(existing_changelog)
     subsection = "Removed" if breaking else _sub_for_kind(kind)
 

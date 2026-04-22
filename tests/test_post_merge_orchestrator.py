@@ -865,6 +865,29 @@ def test_is_already_exists_error_requires_already_exists_substring():
     ) is False
 
 
+def test_strip_md_images_handles_nested_parens():
+    """Minor cleanup: `_IMAGE_MD_RE = r"!\\[.*\\]\\([^)]*\\)"` stops at
+    the first `)` so a URL with nested parens `![alt](http://x/a(b).png)`
+    would mis-strip only the first half, leaving `b).png)` visible in
+    the issue body where the tracking-pixel URL could still leak."""
+    from post_merge.orchestrator import _strip_md_images
+
+    # Simple case still works.
+    assert _strip_md_images("text ![alt](http://x) more") == "text [image removed] more"
+    # Nested parens: the balanced matcher must find the OUTER `)`.
+    out = _strip_md_images("hi ![alt](http://x/a(b).png) bye")
+    assert out == "hi [image removed] bye"
+    assert "a(b).png" not in out
+    # Multiple images on one line.
+    out = _strip_md_images("![a](x) and ![b](y(z))")
+    assert "[image removed]" in out
+    assert "y(z)" not in out
+    # No image at all: pass through.
+    assert _strip_md_images("just text") == "just text"
+    # Malformed (unbalanced): return verbatim rather than throwing.
+    assert "![alt](http" in _strip_md_images("![alt](http")
+
+
 def test_is_already_exists_error_via_response_attribute():
     """Mirror the text path through `err.response.status_code` + .text."""
     from post_merge.orchestrator import _is_already_exists_error

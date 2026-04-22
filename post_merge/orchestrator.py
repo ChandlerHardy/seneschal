@@ -174,9 +174,61 @@ def _read_local_changelog(repo_path: str, changelog_path: str) -> str:
 # by inserting a zero-width space so GitHub's autolinker doesn't match.
 # Drop markdown-image syntax + HTML tags outright.
 
-_IMAGE_MD_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _ZERO_WIDTH_SPACE = "​"
+
+
+def _strip_md_images(text: str) -> str:
+    """Remove markdown image syntax `![alt](url)`, balanced-paren aware.
+
+    The obvious regex `!\\[[^\\]]*\\]\\([^)]*\\)` stops at the FIRST `)`
+    and so mis-handles URLs with nested parens like
+    `![alt](http://x/a(b).png)`. Hand-roll a depth counter: when we see
+    `![`, scan to the matching `]`, then consume `(` and track paren
+    depth until we hit the matching `)`.
+
+    Silent fallthrough on malformed input (unclosed bracket / paren) —
+    we return the text unchanged for that span so we never throw on
+    attacker-controllable input.
+    """
+    if not text or "![" not in text:
+        return text
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        # Fast path for non-image chars.
+        if text[i] != "!" or i + 1 >= n or text[i + 1] != "[":
+            out.append(text[i])
+            i += 1
+            continue
+        # Potential image start: `![`. Find matching `]`.
+        j = i + 2
+        while j < n and text[j] != "]":
+            j += 1
+        if j >= n or j + 1 >= n or text[j + 1] != "(":
+            # Malformed — emit verbatim, advance 1.
+            out.append(text[i])
+            i += 1
+            continue
+        # Walk the balanced parens starting at j+1 (which is `(`).
+        depth = 1
+        k = j + 2
+        while k < n and depth > 0:
+            if text[k] == "(":
+                depth += 1
+            elif text[k] == ")":
+                depth -= 1
+            k += 1
+        if depth != 0:
+            # Unbalanced — emit verbatim.
+            out.append(text[i])
+            i += 1
+            continue
+        # Replace the full `![...](...)` span with a safe placeholder.
+        out.append("[image removed]")
+        i = k
+    return "".join(out)
 
 
 def _sanitize_issue_body(body_excerpt: str, pr_number: int, pr_url: str) -> str:
@@ -192,7 +244,7 @@ def _sanitize_issue_body(body_excerpt: str, pr_number: int, pr_url: str) -> str:
       traceable
     """
     excerpt = body_excerpt or ""
-    excerpt = _IMAGE_MD_RE.sub("[image removed]", excerpt)
+    excerpt = _strip_md_images(excerpt)
     excerpt = _HTML_TAG_RE.sub("", excerpt)
     # Neutralize @/# by inserting a zero-width space after each, which
     # breaks GitHub's autolinker but keeps the text readable.
@@ -786,6 +838,13 @@ def _commits_signal_breaking(commits: List[dict]) -> bool:
     GitHub's list-commits endpoint returns objects of the shape
     `{"commit": {"message": "..."}, ...}`. Scans both the title and body
     of each message for `BREAKING CHANGE:` / `BREAKING-CHANGE:`.
+
+    Uses a line-anchored match (`^\\s*BREAKING[\\s-]CHANGE\\s*:`) so a
+    commit whose body merely mentions the phrase (e.g. `fix: restore
+    parser for BREAKING CHANGE footers in tests`) doesn't falsely force
+    a major bump. The footer form proper — at the start of its own
+    line, with a trailing colon — is what Conventional Commits
+    requires for the breaking signal.
     """
     for c in commits:
         if not isinstance(c, dict):
@@ -794,7 +853,7 @@ def _commits_signal_breaking(commits: List[dict]) -> bool:
         msg = commit.get("message") or ""
         if changelog_mod.is_breaking_title(msg):
             return True
-        if re.search(r"BREAKING[\s-]CHANGE", msg, re.IGNORECASE):
+        if re.search(r"(?m)^\s*BREAKING[\s-]CHANGE\s*:", msg, re.IGNORECASE):
             return True
     return False
 

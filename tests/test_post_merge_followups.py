@@ -122,3 +122,37 @@ def test_parse_followups_indented_marker():
     body = "  - [FOLLOWUP] indented\n    - [FOLLOWUP] more indented\n"
     result = parse_followups(body)
     assert len(result) == 2
+
+
+def test_parse_followups_accepts_star_bullet():
+    """CommonMark allows `*` as a bullet; extend the marker to match.
+    Keep ordered-list markers (`1.`) deliberately excluded."""
+    body = "* [FOLLOWUP] star bullet\n"
+    result = parse_followups(body)
+    assert len(result) == 1
+    assert "star bullet" in result[0].title
+
+
+def test_parse_followups_accepts_plus_bullet():
+    body = "+ [FOLLOWUP] plus bullet\n"
+    result = parse_followups(body)
+    assert len(result) == 1
+    assert "plus bullet" in result[0].title
+
+
+def test_parse_followups_ignores_ordered_list_bullet():
+    """Ordered-list markers (`1.`, `2.`) are deliberately excluded so
+    numbered requirements lists don't false-positive."""
+    body = "1. [FOLLOWUP] numbered item\n"
+    result = parse_followups(body)
+    assert result == []
+
+
+def test_parse_followups_mixed_bullets():
+    body = (
+        "- [FOLLOWUP] dash\n"
+        "* [FOLLOWUP] star\n"
+        "+ [FOLLOWUP] plus\n"
+    )
+    result = parse_followups(body)
+    assert len(result) == 3

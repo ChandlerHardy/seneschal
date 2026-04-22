@@ -269,3 +269,117 @@ def test_merge_webhook_does_not_sync_synchronously(monkeypatch):
     body = resp[0] if isinstance(resp, tuple) else resp
     assert body.get("status") == "post_merge_queued"
     assert body.get("pr") == 77
+
+
+# --------------------------------------------------------------------------
+# W6: post_review must thread head_sha into save_review so the review-store
+# frontmatter gets populated (required by P2's SQLite indexing).
+# --------------------------------------------------------------------------
+
+
+def test_post_review_passes_head_sha_to_save_review(tmp_path, monkeypatch):
+    """Previously post_review dropped head_sha entirely — save_review got
+    only positional args so every persisted record had head_sha="".
+    After W6, head_sha is a keyword arg on post_review and flows into
+    the frontmatter."""
+    import review_store
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+
+    ok_resp = MagicMock()
+    ok_resp.status_code = 200
+    ok_resp.raise_for_status = MagicMock()
+    ok_resp.content = b'{"html_url": "https://x/review/99"}'
+    ok_resp.json.return_value = {"html_url": "https://x/review/99"}
+
+    mock_session = MagicMock()
+    mock_session.post.return_value = ok_resp
+
+    with patch.object(app, "_github_session", return_value=mock_session):
+        app.post_review(
+            "o", "r", 7,
+            body="APPROVE\n\nLGTM",
+            token="tok",
+            head_sha="feedc0ffee123",
+        )
+
+    rec = review_store.get_review("o/r", 7)
+    assert rec is not None
+    assert rec.head_sha == "feedc0ffee123"
+
+
+# --------------------------------------------------------------------------
+# W7: post_review's save_review call must happen under _per_pr_lock, so
+# it's mutually exclusive with the orchestrator's mark_merged writes on
+# the same PR.
+# --------------------------------------------------------------------------
+
+
+def test_post_review_holds_per_pr_lock_during_save(tmp_path, monkeypatch):
+    """Regression guard: a push-event review racing a merge event's
+    mark_merged could overwrite the frontmatter with a fresh record
+    (no merged_at, no followups_filed). Wrapping save_review in the
+    same per-PR lock the orchestrator uses makes the two writes
+    mutually exclusive."""
+    import review_store
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    monkeypatch.setattr(app, "_PER_PR_LOCK_DIR", str(tmp_path / "locks"))
+
+    ok_resp = MagicMock()
+    ok_resp.status_code = 200
+    ok_resp.raise_for_status = MagicMock()
+    ok_resp.content = b'{"html_url": "https://x/r/1"}'
+    ok_resp.json.return_value = {"html_url": "https://x/r/1"}
+
+    mock_session = MagicMock()
+    mock_session.post.return_value = ok_resp
+
+    # Track whether save_review is called while the lock is held.
+    lock_held_during_save = {"value": False}
+
+    # Acquire the same-key lock manually; the post_review call must
+    # BLOCK on it. Use a background thread to call post_review, and
+    # release the lock from the main thread after a short delay to
+    # confirm it was actually blocked.
+    acquired_by_test = threading.Event()
+    release_test_lock = threading.Event()
+
+    def _hold_outer_lock():
+        with app._per_pr_lock("o", "r", 55):
+            acquired_by_test.set()
+            release_test_lock.wait(timeout=2.0)
+
+    holder = threading.Thread(target=_hold_outer_lock, daemon=True)
+    holder.start()
+    acquired_by_test.wait(timeout=2.0)
+
+    # post_review should now block trying to acquire the same lock.
+    done = threading.Event()
+
+    def _call():
+        with patch.object(app, "_github_session", return_value=mock_session):
+            app.post_review(
+                "o", "r", 55,
+                body="APPROVE",
+                token="tok",
+            )
+        done.set()
+
+    caller = threading.Thread(target=_call, daemon=True)
+    caller.start()
+
+    # Give caller a chance to block on the lock.
+    time.sleep(0.05)
+    # If save_review ran without waiting, done would be set already.
+    assert not done.is_set(), (
+        "post_review's save_review call did NOT wait for _per_pr_lock — "
+        "W7 regression: save is not mutually exclusive with mark_merged."
+    )
+
+    # Release and let caller proceed.
+    release_test_lock.set()
+    done.wait(timeout=2.0)
+    assert done.is_set(), "post_review never completed after lock release"
+
+    # And the review did get saved.
+    rec = review_store.get_review("o/r", 55)
+    assert rec is not None

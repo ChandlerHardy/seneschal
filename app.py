@@ -593,7 +593,7 @@ def parse_verdict(review_text):
     return "APPROVE"
 
 
-def post_review(owner, repo, pr_number, body, token, inline_comments=None):
+def post_review(owner, repo, pr_number, body, token, inline_comments=None, *, head_sha=""):
     """Post a formal PR review (APPROVE or REQUEST_CHANGES).
 
     If inline_comments is provided, posts them as per-line review comments
@@ -603,6 +603,11 @@ def post_review(owner, repo, pr_number, body, token, inline_comments=None):
     On success, persists the posted review to the on-disk review store so
     the MCP server can expose it to local Claude Code sessions later.
     Persistence failures are non-fatal (the review is already on GitHub).
+
+    W6: `head_sha` is optional (keyword-only, default "") so existing
+    call sites stay compatible, but when supplied it's written into the
+    review-store frontmatter so P2's SQLite index carries the actual
+    PR head SHA instead of a blank column.
     """
     verdict = parse_verdict(body)
     session = _github_session()
@@ -636,16 +641,23 @@ def post_review(owner, repo, pr_number, body, token, inline_comments=None):
     log(f"Posted {verdict} review on {owner}/{repo}#{pr_number}{comment_suffix}")
 
     # Persist to the review store so the MCP server can surface this later.
+    # W7: wrap the save_review call in the same per-PR lock the post-merge
+    # orchestrator uses. Without it, a push-event review landing while a
+    # merge event's mark_merged is in flight overwrites the file with a
+    # fresh record (no merged_at, no followups_filed_titles) — losing the
+    # post-merge state that just got persisted.
     try:
         review_json = resp.json() if resp.content else {}
         review_url = str(review_json.get("html_url", "")) if isinstance(review_json, dict) else ""
-        save_review(
-            f"{owner}/{repo}",
-            int(pr_number),
-            verdict,
-            review_url,
-            body,
-        )
+        with _per_pr_lock(owner, repo, pr_number):
+            save_review(
+                f"{owner}/{repo}",
+                int(pr_number),
+                verdict,
+                review_url,
+                body,
+                head_sha=head_sha or "",
+            )
     except Exception as e:  # noqa: BLE001
         log(f"Review store persist failed (non-fatal): {e}")
 
@@ -997,6 +1009,7 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
                     owner, repo, pr_number,
                     result.body, token,
                     inline_comments=inline,
+                    head_sha=head_sha or "",
                 )
             except Exception as e:  # noqa: BLE001
                 log(f"Full review failed for {owner}/{repo}#{pr_number}: {e!r}")
@@ -1068,7 +1081,11 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
 
         body = f"## Automated Review\n\n{text}\n\n---\n*Reviewed by Seneschal*"
         inline = analysis.inline_comments()
-        verdict = post_review(owner, repo, pr_number, body, token, inline_comments=inline)
+        verdict = post_review(
+            owner, repo, pr_number, body, token,
+            inline_comments=inline,
+            head_sha=head_sha or "",
+        )
 
         # Auto-fix is not available in the public backend (the fix loop
         # needs a tool-using agent, which the API path does not wire). If

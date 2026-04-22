@@ -66,8 +66,23 @@ def test_bump_kind_double_starred_breaking_marker_is_major():
 
 
 def test_bump_kind_hyphenated_breaking_change_is_major():
-    lines = ["Note: BREAKING-CHANGE: old API gone"]
+    # W5: the footer must start at a line boundary. Line-anchored
+    # BREAKING-CHANGE: in its own line is the spec-compliant form.
+    lines = ["some feature", "", "BREAKING-CHANGE: old API gone"]
     assert bump_kind(lines) == "major"
+
+
+def test_bump_kind_rejects_breaking_phrase_in_description():
+    """W5: a description that just mentions BREAKING CHANGE (no
+    line-anchor, no trailing colon) must NOT force a major bump.
+    Previously the loose matcher fired on any substring — so a fix
+    describing a parser for the BREAKING CHANGE footer would force a
+    spurious major bump."""
+    lines = [
+        "- restore BREAKING CHANGE regression-test parser ([#1](x))",
+    ]
+    # Only a fix: body mentioning the phrase → patch, not major.
+    assert bump_kind(lines) == "patch"
 
 
 # --------------------------------------------------------------------------

@@ -12,7 +12,14 @@ from typing import List
 # preserve it in the bumped string.
 _SEMVER_RE = re.compile(r"^(?P<v>v?)(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$")
 
-_BREAKING_LINE_RE = re.compile(r"BREAKING[\s-]CHANGE", re.IGNORECASE)
+# Must be `BREAKING CHANGE:` / `BREAKING-CHANGE:` at the start of a line
+# (per Conventional Commits footer form). The unanchored previous matcher
+# fired on any title containing the phrase — so `fix: restore BREAKING
+# CHANGE regression-test parser` would force a major bump.
+_BREAKING_LINE_RE = re.compile(
+    r"(?m)^\s*BREAKING[\s-]CHANGE\s*:",
+    re.IGNORECASE,
+)
 # `**BREAKING**:` marker that `changelog.format_unreleased_entry` emits
 # when the source PR was marked breaking. Survives prefix stripping so
 # major-bump detection isn't lost when the `!` gets dropped.

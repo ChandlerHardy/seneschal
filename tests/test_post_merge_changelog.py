@@ -224,9 +224,28 @@ def test_classify_prefix_detects_breaking_bang():
 
 
 def test_classify_prefix_detects_breaking_text():
-    # Either spelling of the BREAKING CHANGE footer/text trips detection.
-    assert is_breaking_title("feat: rewrite; BREAKING CHANGE: old config dropped") is True
-    assert is_breaking_title("refactor: BREAKING-CHANGE: interface migrated") is True
+    # W5: BREAKING CHANGE / BREAKING-CHANGE must be at the start of a
+    # line with a trailing colon (Conventional Commits footer form).
+    # Use a multi-line title (title\n\nBREAKING CHANGE: ...) to match.
+    assert is_breaking_title("feat: rewrite\n\nBREAKING CHANGE: old config dropped") is True
+    assert is_breaking_title("refactor: migrate\n\nBREAKING-CHANGE: interface changed") is True
+
+
+def test_is_breaking_title_rejects_phrase_in_description():
+    """W5: a title whose description happens to mention the words
+    "BREAKING CHANGE" must NOT trigger a breaking signal. Previously
+    the unanchored regex fired on any substring match, so a restore /
+    regression-test title would force a spurious major bump."""
+    assert is_breaking_title(
+        "fix: restore BREAKING CHANGE regression-test parser"
+    ) is False
+    assert is_breaking_title(
+        "docs: explain BREAKING CHANGE footer convention"
+    ) is False
+    # Line-anchored form still trips.
+    assert is_breaking_title(
+        "fix: real break\n\nBREAKING CHANGE: dropped X"
+    ) is True
 
 
 def test_non_breaking_title_returns_false():
@@ -263,3 +282,25 @@ def test_format_unreleased_entry_marks_breaking_visibly():
     entry = format_unreleased_entry(9, "feat!: drop python 3.8", "https://x/9", breaking=True)
     assert entry.startswith("- **BREAKING**:")
     assert "drop python 3.8" in entry
+
+
+def test_insert_unreleased_entry_normalizes_crlf_input():
+    """A CHANGELOG.md committed from a Windows-origin repo may carry
+    CRLF line endings. The line-anchored regexes (`^## `, `^### `)
+    match on LF — `\\r\\n` would cause `^### Added` to not match and
+    the inserter would create duplicate subsections. Normalize CRLF
+    to LF before regex work."""
+    existing = (
+        "# Changelog\r\n\r\n"
+        "## [Unreleased]\r\n\r\n"
+        "### Added\r\n"
+        "- earlier ([#1](x))\r\n"
+    )
+    entry = "- new ([#2](y))"
+    out = insert_unreleased_entry(existing, entry, "feat")
+    # Output is LF-normalized.
+    assert "\r\n" not in out
+    # Only ONE `### Added` subsection (not two duplicates from a failed match).
+    assert out.count("### Added") == 1
+    assert "earlier" in out
+    assert "new" in out

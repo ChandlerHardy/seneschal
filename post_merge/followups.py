@@ -27,9 +27,13 @@ import re
 from dataclasses import dataclass
 from typing import List
 
-# Match a list bullet starting (with optional indent) with `- [FOLLOWUP] <title>`.
+# Match a CommonMark list bullet (`-`, `*`, or `+`) with an optional indent
+# followed by `[FOLLOWUP] <title>`. Ordered lists (`1.`, `2.`) are
+# deliberately NOT matched — enumerated items are rare in review bodies
+# and accepting them would expand the attack surface for false positives
+# on numbered requirements lists.
 _MARKER_RE = re.compile(
-    r"^(?P<indent>[ \t]*)-\s*\[FOLLOWUP\]\s+(?P<title>.+?)\s*$",
+    r"^(?P<indent>[ \t]*)[-*+]\s*\[FOLLOWUP\]\s+(?P<title>.+?)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
 
