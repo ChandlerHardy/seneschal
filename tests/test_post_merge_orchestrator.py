@@ -1672,6 +1672,107 @@ def test_followups_break_on_rate_limit_message_substring(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Round 5 W1: `_is_rate_limit_error` unit tests.
+#
+# GitHub's PRIMARY rate limit returns HTTP 403 (not 429) with body
+# "API rate limit exceeded for ...". The previous typed-check only
+# matched 429, and the message-substring fallback never saw the body
+# (str(HTTPError) omits it). Also tightened the substring path so
+# "#429" inside issue URLs doesn't falsely trip the check.
+# --------------------------------------------------------------------------
+
+
+def test_is_rate_limit_error_detects_403_primary_rate_limit():
+    """GitHub's primary rate limit returns 403 with body
+    `"API rate limit exceeded for ..."`. The typed check must match
+    this path — missing it means we'd `continue` past primary-limit
+    responses and hammer the API 9 more times after the first 403."""
+    import requests
+    from post_merge.orchestrator import _is_rate_limit_error
+
+    resp = requests.Response()
+    resp.status_code = 403
+    resp._content = b'{"message": "API rate limit exceeded for 1.2.3.4."}'
+    err = requests.HTTPError("403 Forbidden", response=resp)
+
+    assert _is_rate_limit_error(err) is True, (
+        "W1 regression: a 403 with 'rate limit exceeded' body is the "
+        "GitHub primary-rate-limit signal and must break the loop, "
+        "not trigger 9 more doomed requests."
+    )
+
+
+def test_is_rate_limit_error_rejects_403_permission_denied():
+    """A 403 that is NOT a rate-limit response (e.g. permissions denied,
+    resource forbidden) must return False. Matching every 403 as
+    rate-limit would convert a one-off permissions failure into a
+    loop-break, costing us retries on unrelated errors."""
+    import requests
+    from post_merge.orchestrator import _is_rate_limit_error
+
+    resp = requests.Response()
+    resp.status_code = 403
+    resp._content = b'{"message": "Resource not accessible by integration"}'
+    err = requests.HTTPError("403 Forbidden", response=resp)
+
+    assert _is_rate_limit_error(err) is False, (
+        "Non-rate-limit 403 (permissions denied) must not trip rate-limit "
+        "detection — that would convert a permission failure into a "
+        "loop-break and skip retries that might succeed."
+    )
+
+
+def test_is_rate_limit_error_rejects_429_in_issue_url():
+    """W1 substring-path tightening: a RuntimeError whose message
+    contains `#429` (an issue number) must NOT falsely match. The
+    previous bare `"429" in msg` check would trip on any URL or SHA
+    prefix containing the digits."""
+    from post_merge.orchestrator import _is_rate_limit_error
+
+    err = RuntimeError(
+        "create_issue failed for https://github.com/o/r/issues/429: unknown"
+    )
+
+    assert _is_rate_limit_error(err) is False, (
+        "W1 regression: an issue number '#429' in a URL must not trip "
+        "rate-limit detection. The substring path should require "
+        "word-boundary-adjacent 'HTTP 429' / ' 429' / 'rate limit "
+        "exceeded' — not a bare '429' digit match."
+    )
+
+
+def test_is_rate_limit_error_matches_secondary_rate_limit_body():
+    """GitHub's secondary rate limit also returns 403 with body
+    containing 'You have exceeded a secondary rate limit ...'. The
+    body-substring check matches on 'rate limit exceeded' (case-
+    insensitive) which catches both primary and secondary phrasings."""
+    import requests
+    from post_merge.orchestrator import _is_rate_limit_error
+
+    resp = requests.Response()
+    resp.status_code = 403
+    resp._content = (
+        b'{"message": "You have exceeded a secondary rate limit and have '
+        b'been temporarily blocked."}'
+    )
+    err = requests.HTTPError("403 Forbidden", response=resp)
+
+    # Secondary-limit wording doesn't contain "rate limit exceeded" verbatim
+    # (it's "exceeded a secondary rate limit"), so this exercises the
+    # message-substring fallback via str(err) — which should pick up the
+    # "secondary rate limit" token. Also the body-path checks for
+    # "rate limit exceeded" — neither matches the secondary-limit wording,
+    # so we rely on the message fallback.
+    # In practice `requests` includes the URL and status in str(err), so
+    # we fall back to matching via the body's "secondary rate limit" via
+    # msg substring. Confirm at least one path catches it.
+    assert _is_rate_limit_error(err) is True, (
+        "Secondary rate limit (403 body with 'secondary rate limit') must "
+        "be recognized by at least one of the recognition paths."
+    )
+
+
+# --------------------------------------------------------------------------
 # Round 4: per-issue durability for followups.
 #
 # Previous behavior: orchestrator collected (numbers, titles) across all

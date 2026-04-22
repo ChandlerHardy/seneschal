@@ -449,20 +449,25 @@ def _title_key(title: str) -> str:
 
 
 def _is_rate_limit_error(err: Exception) -> bool:
-    """Return True if `err` looks like a GitHub 429 rate-limit response.
+    """Return True if `err` looks like a GitHub rate-limit response.
 
     Two recognition paths:
-      - `requests.HTTPError` with `response.status_code == 429` (the
-        typed signal when the error came from `session.raise_for_status()`
-        in `github_api`)
-      - message substring match on "rate limit" / "429" — defends against
-        wrapped errors that lost the response object en route (e.g. an
-        adapter re-raising as RuntimeError with the status in the text)
+      - `requests.HTTPError` with a typed response:
+          * `status_code == 429` (secondary-limit path), OR
+          * `status_code == 403` AND the response BODY contains
+            "rate limit exceeded" (case-insensitive). GitHub's PRIMARY
+            rate limit returns 403 — not 429 — with body
+            `"API rate limit exceeded for ..."`. Missing this path meant
+            we'd `continue` past primary-limit responses and hammer
+            9 more requests that are guaranteed to fail.
+      - message substring fallback when the response object was stripped
+        in transit (wrapped errors): matches specific tokens
+        "http 429" / " 429" (space-anchored to avoid #429 issue-number
+        false positives) / "rate limit exceeded" / "secondary rate limit".
 
     W6 + Round 4 contract: other exception classes get `continue` so
-    one transient 500 doesn't abort the loop, but 429 is special —
-    continuing hammers 9 more requests that are GUARANTEED to fail
-    and amplifies the pressure that triggered the limit.
+    one transient 500 doesn't abort the loop, but rate-limit is special —
+    continuing amplifies the pressure that triggered the limit.
     """
     try:
         import requests  # deferred — keeps fs_safety-style import ordering
@@ -471,10 +476,34 @@ def _is_rate_limit_error(err: Exception) -> bool:
 
     if requests is not None and isinstance(err, requests.HTTPError):
         resp = getattr(err, "response", None)
-        if resp is not None and getattr(resp, "status_code", None) == 429:
-            return True
+        if resp is not None:
+            status = getattr(resp, "status_code", None)
+            if status == 429:
+                return True
+            if status == 403:
+                # Primary + secondary rate limits both return 403 with a
+                # body naming the limit. Inspect the body explicitly —
+                # the message-substring fallback below wouldn't see it
+                # because `str(HTTPError)` only includes the status + URL.
+                #   Primary:   "API rate limit exceeded for ..."
+                #   Secondary: "You have exceeded a secondary rate limit ..."
+                body = (getattr(resp, "text", "") or "").lower()
+                if (
+                    "rate limit exceeded" in body
+                    or "secondary rate limit" in body
+                ):
+                    return True
+    # Message-substring fallback for wrapped errors (adapters that
+    # re-raise as RuntimeError with the status in the text, etc.).
+    # Tightened to word-boundary-adjacent tokens so "#429" from issue
+    # numbers or SHA prefixes doesn't false-match.
     msg = str(err).lower()
-    if "429" in msg or "rate limit" in msg:
+    if (
+        "http 429" in msg
+        or " 429" in msg
+        or "rate limit exceeded" in msg
+        or "secondary rate limit" in msg
+    ):
         return True
     return False
 
