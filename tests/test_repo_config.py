@@ -109,3 +109,90 @@ def test_load_from_repo_yaml_fallback():
             fh.write("review_style: thorough\n")
         config = load_from_repo(d)
         assert config.review_style == "thorough"
+
+
+# --------------------------------------------------------------------------
+# PostMergeConfig (P1)
+# --------------------------------------------------------------------------
+
+
+def test_default_post_merge_off():
+    from repo_config import PostMergeConfig
+    cfg = parse_config("")
+    assert isinstance(cfg.post_merge, PostMergeConfig)
+    assert cfg.post_merge.changelog is False
+    assert cfg.post_merge.followups is False
+    assert cfg.post_merge.release_threshold == ""
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+    assert cfg.post_merge.release_base_branch == "main"
+    assert cfg.post_merge.release_pr_draft is True
+    assert cfg.post_merge.followup_label == "seneschal-followup"
+
+
+def test_post_merge_changelog_on():
+    raw = """
+post_merge:
+  changelog: true
+"""
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog is True
+    assert cfg.post_merge.followups is False
+
+
+def test_post_merge_followups_on_with_label():
+    raw = """
+post_merge:
+  followups: true
+  followup_label: needs-investigation
+"""
+    cfg = parse_config(raw)
+    assert cfg.post_merge.followups is True
+    assert cfg.post_merge.followup_label == "needs-investigation"
+
+
+def test_post_merge_release_threshold_valid():
+    for val in ("patch", "minor", "major"):
+        raw = f"post_merge:\n  release_threshold: {val}\n"
+        cfg = parse_config(raw)
+        assert cfg.post_merge.release_threshold == val
+
+
+def test_post_merge_release_threshold_invalid_falls_back():
+    raw = "post_merge:\n  release_threshold: bogus\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.release_threshold == ""
+
+
+def test_post_merge_unknown_keys_ignored():
+    raw = """
+post_merge:
+  changelog: true
+  bogus_key: whatever
+"""
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog is True
+
+
+def test_post_merge_release_base_branch_override():
+    raw = "post_merge:\n  release_base_branch: develop\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.release_base_branch == "develop"
+
+
+def test_post_merge_changelog_path_override():
+    raw = "post_merge:\n  changelog_path: docs/CHANGELOG.md\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "docs/CHANGELOG.md"
+
+
+def test_post_merge_release_pr_draft_off():
+    raw = "post_merge:\n  release_pr_draft: false\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.release_pr_draft is False
+
+
+def test_post_merge_block_invalid_type_ignored():
+    raw = "post_merge: not-a-dict\n"
+    cfg = parse_config(raw)
+    # Falls back to defaults silently.
+    assert cfg.post_merge.changelog is False
