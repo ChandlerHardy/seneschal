@@ -12,11 +12,9 @@ caller can log a single line and move on.
 
 from __future__ import annotations
 
-import errno
 import json
 import os
 import re
-import stat
 import subprocess
 import sys
 import time
@@ -28,12 +26,18 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app  # noqa: E402 — late binding so tests can patch `log`/`ensure_repo_synced` wholesale
+import fs_safety  # noqa: E402 — path-safety primitives (safe_open_in_repo, etc.)
 import github_api  # noqa: E402 — GitHub REST helpers live here post-refactor
 import review_store  # noqa: E402
+from fs_safety import safe_open_in_repo  # noqa: E402
 from github_api import PushProtectedError  # noqa: E402 — direct import, no re-export
 from post_merge import changelog as changelog_mod  # noqa: E402
 from post_merge import followups as followups_mod  # noqa: E402
 from post_merge import release as release_mod  # noqa: E402
+
+# Backward-compat alias for tests that imported the private name.
+# `fs_safety.safe_open_in_repo` is the canonical home.
+_safe_open_in_repo = safe_open_in_repo
 
 # Process-local cache of which `owner/repo` combinations had `put_file` to
 # main return 403. Entries are (monotonic_seconds, protected_bool). After
@@ -73,109 +77,6 @@ def _mark_protected(repo_slug: str, protected: bool) -> None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _safe_open_in_repo(repo_path: str, rel_path: str) -> Optional[str]:
-    """Read `rel_path` from `repo_path`, refusing symlink traversal.
-
-    Attacker vector: a malicious PR commits `CHANGELOG.md` (or any file
-    this module reads) as a symlink pointing at host-sensitive paths
-    like `~/seneschal/ch-code-reviewer.pem` or `/etc/passwd`. Without
-    guarding, `_read_local_changelog` would return that file's contents
-    and `put_file` would write them into the repo where the attacker
-    has view access — a pem-key exfil.
-
-    Defense (belt + suspenders):
-      1. `os.path.realpath` both paths and confirm the resolved file is
-         WITHIN the resolved repo tree via `os.path.commonpath`.
-      2. `os.lstat` each INTERMEDIATE path component (W5 round 3): the
-         old code only guarded the final path component against being a
-         symlink via `O_NOFOLLOW`, but an attacker could replace an
-         intermediate directory (e.g. `docs/`) with a symlink between
-         realpath and open. We pre-check every component and reject if
-         any is a symlink.
-      3. `os.open(..., O_RDONLY | O_NOFOLLOW)` on the target so the
-         kernel refuses to follow a symlink at read time — closes the
-         TOCTOU window on the final component.
-
-    Returns the file contents as a string, or None on any safety
-    violation or I/O error. Logs a warning when traversal is blocked.
-    """
-    if not repo_path or not rel_path:
-        return None
-    try:
-        repo_root = os.path.realpath(repo_path)
-    except OSError:
-        return None
-    candidate = os.path.join(repo_path, rel_path)
-    try:
-        resolved = os.path.realpath(candidate)
-    except OSError:
-        return None
-    # commonpath() raises ValueError on mixed drives (Windows) or empty
-    # paths; treat that defensively as "not in the repo tree".
-    try:
-        if os.path.commonpath([resolved, repo_root]) != repo_root:
-            app.log(
-                f"[post_merge] refused to read {rel_path!r} from {repo_path!r}: "
-                f"resolves outside repo tree ({resolved!r})"
-            )
-            return None
-    except ValueError:
-        app.log(
-            f"[post_merge] refused to read {rel_path!r}: "
-            f"path comparison failed (mixed roots)"
-        )
-        return None
-    # W5: intermediate-component symlink check. `O_NOFOLLOW` only guards
-    # the final component. If the attacker symlinks `docs/` → `/etc`,
-    # then `docs/CHANGELOG.md` would still open `/etc/CHANGELOG.md`
-    # (realpath resolves the intermediate symlink), and our commonpath
-    # check can be bypassed if the symlink target happens to match the
-    # repo-root realpath. Walk each intermediate component with lstat
-    # and refuse if any is a symlink.
-    #
-    # Pragmatic threat model: the attacker has push access but not
-    # host FS write — they stage symlinks via the git tree. A perfect
-    # openat-style traversal would be better but CPython doesn't
-    # expose openat directly; lstat-per-component is good enough.
-    rel_norm = os.path.normpath(rel_path)
-    parts = [p for p in rel_norm.split(os.sep) if p and p != "."]
-    current = repo_path
-    # Walk intermediate dirs (everything except the final component).
-    for intermediate in parts[:-1]:
-        current = os.path.join(current, intermediate)
-        try:
-            st = os.lstat(current)
-        except OSError:
-            # Missing intermediate dir — will fail at open anyway.
-            return None
-        if stat.S_ISLNK(st.st_mode):
-            app.log(
-                f"[post_merge] refused to read {rel_path!r}: "
-                f"intermediate component {intermediate!r} is a symlink"
-            )
-            return None
-    # O_NOFOLLOW on the FINAL path component: if the target itself is a
-    # symlink (even if its realpath lands inside the repo), refuse. This
-    # closes a TOCTOU window where the file is swapped for a symlink
-    # between the realpath check and the open().
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(candidate, flags)
-    except OSError as e:
-        # ELOOP = symlink loop, or (on O_NOFOLLOW systems) "is a symlink".
-        if e.errno == errno.ELOOP:
-            app.log(
-                f"[post_merge] refused to read {rel_path!r}: "
-                f"final path component is a symlink"
-            )
-        return None
-    try:
-        with os.fdopen(fd, "r") as fh:
-            return fh.read()
-    except OSError:
-        return None
 
 
 def _read_local_changelog(repo_path: str, changelog_path: str) -> str:

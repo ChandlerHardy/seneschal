@@ -28,6 +28,20 @@ from typing import List, Optional
 
 import yaml
 
+from fs_safety import (
+    SENSITIVE_FILENAMES,
+    SENSITIVE_PATH_SEGMENTS,
+    safe_branch_name,
+    safe_changelog_path,
+)
+
+# Backward-compat aliases: tests import these private names. The canonical
+# home for the path-safety primitives is `fs_safety`.
+_SENSITIVE_FILENAMES = SENSITIVE_FILENAMES
+_SENSITIVE_PATH_SEGMENTS = SENSITIVE_PATH_SEGMENTS
+_safe_changelog_path = safe_changelog_path
+_safe_branch_name = safe_branch_name
+
 
 # Repo-supplied content lands in the Claude system prompt, so we sanitize it
 # defensively. The repo file is editable by anyone with push access, so a
@@ -45,118 +59,6 @@ def _sanitize(text: str, max_len: int) -> str:
     text = text.replace("\r", " ").replace("\n", " ")
     text = " ".join(text.split())
     return text[:max_len]
-
-
-# `changelog_path` flows to `app.put_file(path=...)`. A rogue
-# `.seneschal.yml` committing `changelog_path: ../.github/workflows/x.yml`
-# would let anyone with push access redirect Seneschal's auto-commit at
-# a protected workflow file. Keep it confined to repo-relative, forward
-# slashes only, no traversal segments.
-#
-# Deny-list (Blocker 1): even after traversal rejection, explicit
-# `.github/CODEOWNERS` or `SECURITY.md` is a valid relative path that
-# would pass the naive safety check. A rogue config could redirect the
-# auto-commit at any of these and wipe branch-protection reviewers,
-# corrupt CI, or replace the license. Block them here.
-#
-# Frozenset so the list is inspectable from tests / operators.
-_SENSITIVE_PATH_SEGMENTS = frozenset({
-    ".github",
-    ".git",
-})
-_SENSITIVE_FILENAMES = frozenset({
-    "codeowners",
-    ".gitattributes",
-    ".gitignore",
-    "security.md",
-    "license",
-    "license.md",
-    "license.txt",
-    ".env",
-    "dockerfile",
-    "docker-compose.yml",
-    "docker-compose.yaml",
-})
-
-
-def _safe_changelog_path(path: str) -> Optional[str]:
-    """Return `path` if it's a safe repo-relative file path, else None.
-
-    Rejects:
-      - absolute paths (`/foo`, `C:\\foo`)
-      - backslashes (Windows-style, banned outright)
-      - `..` segments (parent-dir traversal)
-      - empty / whitespace-only strings
-      - any path starting with `.github/` or `.git/` (sensitive dirs)
-      - any file whose basename matches `_SENSITIVE_FILENAMES` case-insensitive
-        (CODEOWNERS, SECURITY.md, LICENSE, .env, Dockerfile, etc.)
-    """
-    if not path or not path.strip():
-        return None
-    if "\\" in path:
-        return None
-    if path.startswith("/"):
-        return None
-    norm = os.path.normpath(path)
-    if norm.startswith("/") or norm == "..":
-        return None
-    # Split on POSIX `/` so we catch `../foo` even after normpath
-    # normalizes it to `../foo` rather than collapsing it.
-    parts = norm.split("/")
-    for part in parts:
-        if part == "..":
-            return None
-    # Deny-list: reject any path whose first segment is a sensitive dir
-    # (.github/*, .git/*) OR whose basename is a sensitive filename
-    # (CODEOWNERS, SECURITY.md, etc.). Compare case-insensitively because
-    # some filesystems (macOS HFS+, Windows) are case-insensitive, and
-    # GitHub itself treats CODEOWNERS / Codeowners / codeowners as the
-    # same file at apply-time.
-    lowered_parts = [p.lower() for p in parts if p]
-    if lowered_parts:
-        head = lowered_parts[0]
-        if head in _SENSITIVE_PATH_SEGMENTS:
-            return None
-        # Any segment named `.git` anywhere in the path (eg `foo/.git/HEAD`).
-        if any(p == ".git" for p in lowered_parts):
-            return None
-        # Basename check.
-        basename = lowered_parts[-1]
-        if basename in _SENSITIVE_FILENAMES:
-            return None
-    return norm
-
-
-# `release_base_branch` lands in the `base` field of a create-pull-request
-# call. A value like `main?admin=1` could be used to tack query params onto
-# the downstream GitHub API URL in the rare future where we interpolate it
-# into a path (e.g. `git/ref/heads/<branch>`). Validate against git's own
-# ref-name rules (the strict subset we need).
-_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9_\-./]+$")
-
-
-def _safe_branch_name(name: str) -> Optional[str]:
-    """Return `name` if it looks like a valid git branch name, else None.
-
-    Applies git's ref-name rules (the strict subset we need):
-      - `[A-Za-z0-9_\\-./]+` only
-      - max 100 chars
-      - no leading/trailing slash or dot
-      - no consecutive dots (`..`)
-    """
-    if not name or not name.strip():
-        return None
-    if len(name) > 100:
-        return None
-    if not _BRANCH_NAME_RE.match(name):
-        return None
-    if name.startswith("/") or name.endswith("/"):
-        return None
-    if name.startswith(".") or name.endswith("."):
-        return None
-    if ".." in name:
-        return None
-    return name
 
 
 @dataclass

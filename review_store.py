@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
+from fs_safety import REPO_SLUG_RE, validate_repo_slug
+
 # Root of the per-review markdown files. Override via env for tests.
 STORE_ROOT = os.environ.get(
     "SENESCHAL_REVIEW_STORE",
@@ -35,7 +37,10 @@ _FRONTMATTER_RE = re.compile(
     re.DOTALL,
 )
 
-_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+$")
+# Backward-compat aliases: callers and tests import these private names.
+# `fs_safety` is the canonical home for the regex + validator.
+_REPO_SLUG_RE = REPO_SLUG_RE
+_validate_repo_slug = validate_repo_slug
 
 
 @dataclass(frozen=True)
@@ -74,16 +79,6 @@ class ReviewRecord:
             "timestamp": self.timestamp,
             "url": self.url,
         }
-
-
-def _validate_repo_slug(repo_slug: str) -> None:
-    """Raise ValueError if repo_slug isn't a simple owner/repo form.
-
-    Guards against path traversal via the repo_slug parameter (MCP
-    clients are local but we still defend).
-    """
-    if not _REPO_SLUG_RE.match(repo_slug):
-        raise ValueError(f"invalid repo slug: {repo_slug!r}")
 
 
 def _atomic_write(path: Path, content: str) -> None:
