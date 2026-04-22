@@ -128,34 +128,63 @@ def _make_snippet(body: str, query: str) -> str:
     return _redact_snippet(snippet)
 
 
-def _probe_fts5(con: sqlite3.Connection) -> bool:
+def _probe_fts5() -> bool:
     """Check whether this sqlite build supports FTS5 by attempting to
-    create a throwaway virtual table. Returns True on success.
+    create a throwaway virtual table on an in-memory connection.
 
-    Cheaper than parsing `PRAGMA compile_options` (not all builds expose
-    it consistently) and catches the real failure mode."""
+    Runs against `:memory:` (not the real index DB) so a SIGKILL between
+    CREATE and DROP can never leave an orphan `_probe_fts` table in the
+    on-disk file. The orphan bug was reproducible: a crashed probe left
+    the table committed; the next startup's probe saw "table already
+    exists", caught the OperationalError, returned False, and silently
+    degraded every future search query to unindexed LIKE scans until an
+    operator noticed that searches were slow and ran a manual DROP.
+
+    The in-memory connection is thrown away at function return; the
+    probe's cost is ~1ms and runs once per Index open.
+    """
     try:
-        con.execute("CREATE VIRTUAL TABLE _probe_fts USING fts5(x);")
-        con.execute("DROP TABLE _probe_fts;")
+        probe_con = sqlite3.connect(":memory:")
+    except sqlite3.Error:
+        return False
+    try:
+        probe_con.execute("CREATE VIRTUAL TABLE _probe_fts USING fts5(x);")
         return True
     except sqlite3.OperationalError:
         return False
+    finally:
+        try:
+            probe_con.close()
+        except sqlite3.Error:
+            pass
 
 
-def _probe_fts5_contentless_delete(con: sqlite3.Connection) -> bool:
+def _probe_fts5_contentless_delete() -> bool:
     """Secondary probe: does FTS5 accept the `contentless_delete=1` option?
 
     Added in SQLite 3.43; older builds reject it at CREATE time. If
     missing, we keep the DELETE-less contentless table and route purges
-    through the 'delete' special-insert protocol instead."""
+    through the 'delete' special-insert protocol instead.
+
+    Same :memory: isolation as `_probe_fts5` — a crashed probe must not
+    orphan a `_probe_cd` table in the real index DB.
+    """
     try:
-        con.execute(
+        probe_con = sqlite3.connect(":memory:")
+    except sqlite3.Error:
+        return False
+    try:
+        probe_con.execute(
             "CREATE VIRTUAL TABLE _probe_cd USING fts5(x, content='', contentless_delete=1);"
         )
-        con.execute("DROP TABLE _probe_cd;")
         return True
     except sqlite3.OperationalError:
         return False
+    finally:
+        try:
+            probe_con.close()
+        except sqlite3.Error:
+            pass
 
 
 def open_index(path: Optional[str] = None) -> "Index":
@@ -209,9 +238,14 @@ class Index:
         self._con.execute("PRAGMA journal_mode=WAL;")
         self._con.execute("PRAGMA synchronous=NORMAL;")
         self._con.execute("PRAGMA foreign_keys=ON;")
-        self._fts5 = _probe_fts5(self._con)
+        # Probes run against throwaway :memory: connections so a
+        # SIGKILL between CREATE and DROP can't leave an orphan probe
+        # table in the real DB (which would cause the NEXT startup's
+        # probe to see "table already exists" and silently degrade
+        # every search to unindexed LIKE scans).
+        self._fts5 = _probe_fts5()
         self._fts5_contentless_delete = (
-            _probe_fts5_contentless_delete(self._con) if self._fts5 else False
+            _probe_fts5_contentless_delete() if self._fts5 else False
         )
         self._ensure_schema()
 

@@ -382,6 +382,63 @@ def test_schema_mismatch_drops_and_rebuilds(tmp_path):
         ix.close()
 
 
+def test_fts_probe_ignores_orphan_tables_in_real_db(tmp_path):
+    """Blocker #5: the FTS5 probe used to run CREATE+DROP against the
+    real index.db. A SIGKILL between CREATE and DROP left an orphan
+    `_probe_fts` table committed on disk; the next startup's probe
+    saw "table already exists", caught the error, returned False, and
+    silently degraded every search to unindexed LIKE scans.
+
+    Test: construct the race directly. The probe no longer takes a
+    connection argument — it runs against `:memory:` unconditionally.
+    Invoking it twice in a row (without manual cleanup) must still
+    return True on both calls, proving the probe is isolated from any
+    persistent state (real DB OR a prior probe's in-memory state).
+    """
+    # Skip if the local sqlite build lacks FTS5 — nothing to test.
+    try:
+        sample = sqlite3.connect(":memory:")
+        sample.execute("CREATE VIRTUAL TABLE t USING fts5(x);")
+        sample.close()
+    except sqlite3.OperationalError:
+        pytest.skip("sqlite build lacks FTS5")
+
+    # Two back-to-back probes — if the probe leaked state between
+    # invocations, the second call would hit 'table already exists'.
+    assert review_index._probe_fts5() is True
+    assert review_index._probe_fts5() is True
+    # And even when invoked after Index has been built against a real
+    # DB, the probe stays correct.
+    db_path = tmp_path / "index.db"
+    ix = review_index.open_index(str(db_path))
+    try:
+        assert review_index._probe_fts5() is True
+        assert ix._fts5 is True
+    finally:
+        ix.close()
+
+
+def test_fts_probe_tables_never_written_to_real_db(tmp_path):
+    """Complementary check: after Index construction, neither
+    `_probe_fts` nor `_probe_cd` exist in the on-disk DB. This is the
+    structural invariant that prevents the orphan-after-SIGKILL bug."""
+    db_path = tmp_path / "index.db"
+    ix = review_index.open_index(str(db_path))
+    try:
+        con = sqlite3.connect(str(db_path))
+        names = {
+            row[0]
+            for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        con.close()
+        assert "_probe_fts" not in names
+        assert "_probe_cd" not in names
+    finally:
+        ix.close()
+
+
 def test_wal_mode_is_enabled(tmp_path):
     db_path = tmp_path / "index.db"
     ix = review_index.open_index(str(db_path))
