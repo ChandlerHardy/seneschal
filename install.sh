@@ -51,8 +51,10 @@ for f in app.py analyzer.py risk.py scope.py diff_parser.py test_gaps.py \
   scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
 done
 
-# Install Python deps
-ssh "$HOST" "~/seneschal/venv/bin/pip install -q -r ~/seneschal/requirements.txt && echo 'pip install: OK'"
+# Install Python deps. Use `python -m pip` rather than the pip binary
+# directly so we survive a stale shebang in venv/bin/pip (side-by-side
+# deployment leftovers).
+ssh "$HOST" "~/seneschal/venv/bin/python -m pip install -q -r ~/seneschal/requirements.txt && echo 'pip install: OK'"
 
 # Ship persona subagent definitions. full_review.py reads these at runtime
 # from ~/.claude/agents/seneschal-*.md when the full-review code path fires.
@@ -63,7 +65,7 @@ for f in agents/seneschal-architect.md \
          agents/seneschal-edge-case.md \
          agents/seneschal-design.md \
          agents/seneschal-simplifier.md; do
-  scp "$REPO_DIR/$f" "${HOST}:~/.claude/$(echo "$f" | sed 's#^#agents/#' 2>/dev/null || echo "$f")"
+  scp "$REPO_DIR/$f" "${HOST}:~/.claude/$f"
 done
 
 # Smoke-import so we catch missing deps before systemd starts. Set

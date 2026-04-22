@@ -935,11 +935,15 @@ def webhook():
 @app.route("/webhook/code-reviewer", methods=["GET"])
 def health():
     pem_exists = Path(PEM_PATH).exists()
+    # PRIVATE-FORK PATCH: report the actual backend in use. Public repo
+    # hardcodes "api" because ApiBackend is the only impl it ships; the
+    # private fork also has CliBackend and needs to distinguish.
+    backend_choice = (os.environ.get("SENESCHAL_BACKEND") or "api").strip().lower()
     return jsonify({
         "status": "running",
         "app_id": APP_ID,
         "pem_configured": pem_exists,
-        "backend": "api",
+        "backend": backend_choice if backend_choice in ("api", "cli") else "api",
     })
 
 
@@ -953,7 +957,14 @@ if __name__ == "__main__":
     # WARNING (not a hard fail) so Flask still binds and GitHub does not
     # back off webhook deliveries, but the operator sees the problem
     # immediately in `journalctl` right next to the "Starting" line.
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    #
+    # PRIVATE-FORK PATCH: respect SENESCHAL_BACKEND. When the CLI backend
+    # is selected, ANTHROPIC_API_KEY is not required — the CLI uses the
+    # host's Claude session directly.
+    _backend_choice = (os.environ.get("SENESCHAL_BACKEND") or "").strip().lower()
+    if _backend_choice == "cli":
+        log("LLM backend: CliBackend (SENESCHAL_BACKEND=cli)")
+    elif not os.environ.get("ANTHROPIC_API_KEY"):
         log("WARNING: ANTHROPIC_API_KEY is not set in the environment.")
         log("WARNING: Reviews will fail until the key is configured in the systemd unit.")
     else:
