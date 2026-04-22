@@ -302,7 +302,7 @@ def test_release_base_branch_accepts_valid_name():
 # `.github/workflows/ci.yml`) is a valid repo-relative path that would
 # let a PR author redirect Seneschal's auto-commit at a file protected
 # by branch rules. The fix is a case-insensitive basename + top-segment
-# deny-list in `_safe_changelog_path`.
+# deny-list in `safe_changelog_path`.
 # --------------------------------------------------------------------------
 
 

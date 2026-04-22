@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from fs_safety import REPO_SLUG_RE, now_iso, validate_repo_slug
+from fs_safety import now_iso, validate_repo_slug
 
 # Root of the per-review markdown files. Override via env for tests.
 STORE_ROOT = os.environ.get(
@@ -35,12 +35,6 @@ _FRONTMATTER_RE = re.compile(
     r"^---\s*\n(.*?)\n---\s*\n(.*)$",
     re.DOTALL,
 )
-
-# Backward-compat aliases: callers and tests import these private names.
-# `fs_safety` is the canonical home for the regex + validator + now_iso.
-_REPO_SLUG_RE = REPO_SLUG_RE
-_validate_repo_slug = validate_repo_slug
-_now_iso = now_iso
 
 
 @dataclass(frozen=True)
@@ -119,7 +113,7 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _repo_dir(repo_slug: str) -> Path:
-    _validate_repo_slug(repo_slug)
+    validate_repo_slug(repo_slug)
     return Path(STORE_ROOT) / repo_slug
 
 
@@ -144,14 +138,14 @@ def save_review(
     v2 fields (head_sha/merged_at/followups_filed) are written into the
     frontmatter only when non-empty so v1 callers produce v1-shaped files.
     """
-    _validate_repo_slug(repo_slug)
+    validate_repo_slug(repo_slug)
     if not isinstance(pr_number, int) or pr_number <= 0:
         raise ValueError(f"invalid pr_number: {pr_number!r}")
     out_dir = _repo_dir(repo_slug)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{pr_number}.md"
 
-    ts = timestamp or _now_iso()
+    ts = timestamp or now_iso()
     meta = {
         "pr_number": int(pr_number),
         "verdict": str(verdict or "UNKNOWN"),
@@ -262,7 +256,7 @@ def list_reviews(repo_slug: str, limit: int = 10) -> List[ReviewRecord]:
     strictly monotonic with time but is good enough for "show me recent
     reviews". Empty list if the repo has no reviews on disk.
     """
-    _validate_repo_slug(repo_slug)
+    validate_repo_slug(repo_slug)
     out_dir = _repo_dir(repo_slug)
     if not out_dir.is_dir():
         return []
@@ -281,7 +275,7 @@ def list_reviews(repo_slug: str, limit: int = 10) -> List[ReviewRecord]:
 
 def get_review(repo_slug: str, pr_number: int) -> Optional[ReviewRecord]:
     """Return the review for (repo_slug, pr_number), or None if missing."""
-    _validate_repo_slug(repo_slug)
+    validate_repo_slug(repo_slug)
     path = _repo_dir(repo_slug) / f"{int(pr_number)}.md"
     if not path.is_file():
         return None
@@ -315,7 +309,7 @@ def mark_merged(
       pattern from `review_memory.save` so a crash mid-write can't leave a
       half-written frontmatter the next read would barf on.
     """
-    _validate_repo_slug(repo_slug)
+    validate_repo_slug(repo_slug)
     if not isinstance(pr_number, int) or pr_number <= 0:
         return None
     target = _repo_dir(repo_slug) / f"{int(pr_number)}.md"
@@ -377,7 +371,7 @@ def get_repo_memory(repo_slug: str, repo_root: str) -> str:
     Checks the two canonical filenames: `.seneschal-memory.md` and the
     legacy `.ch-code-reviewer-memory.md`.
     """
-    _validate_repo_slug(repo_slug)
+    validate_repo_slug(repo_slug)
     for name in (".seneschal-memory.md", ".ch-code-reviewer-memory.md"):
         p = os.path.join(repo_root, name)
         if os.path.isfile(p):

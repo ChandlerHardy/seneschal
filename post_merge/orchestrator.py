@@ -35,10 +35,6 @@ from post_merge import changelog as changelog_mod  # noqa: E402
 from post_merge import followups as followups_mod  # noqa: E402
 from post_merge import release as release_mod  # noqa: E402
 
-# Backward-compat alias for tests that imported the private name.
-# `fs_safety.safe_open_in_repo` is the canonical home.
-_safe_open_in_repo = safe_open_in_repo
-
 # Process-local cache of which `owner/repo` combinations had `put_file` to
 # main return 403. Entries are (monotonic_seconds, protected_bool). After
 # `_PROTECTED_TTL_SEC` we re-probe — branch protection may have been
@@ -78,7 +74,7 @@ def _mark_protected(repo_slug: str, protected: bool) -> None:
 def _read_local_changelog(repo_path: str, changelog_path: str) -> str:
     """Read CHANGELOG.md from the locally-synced clone. Empty string if missing.
 
-    Wraps `_safe_open_in_repo` so a malicious symlink at `CHANGELOG.md`
+    Wraps `safe_open_in_repo` so a malicious symlink at `CHANGELOG.md`
     pointing outside the repo tree cannot exfiltrate host-sensitive
     contents into a subsequent `put_file` commit. The helper itself
     returns None on any safety violation, missing file, or I/O error;
@@ -86,14 +82,14 @@ def _read_local_changelog(repo_path: str, changelog_path: str) -> str:
     branch on truthiness.
 
     Previously this function ran its own `os.path.exists + os.path.islink`
-    precondition before calling `_safe_open_in_repo`. That was redundant
+    precondition before calling `safe_open_in_repo`. That was redundant
     — the helper's `os.lstat` walk + `O_NOFOLLOW` open already handles
     missing files + symlinks + traversal. The extra check only added a
     TOCTOU window between `os.path.exists` and the open.
     """
     if not repo_path:
         return ""
-    content = _safe_open_in_repo(repo_path, changelog_path)
+    content = safe_open_in_repo(repo_path, changelog_path)
     return content or ""
 
 
@@ -646,20 +642,20 @@ def _current_version(repo_path: str) -> Optional[str]:
 
     Returns None if none of those yield a value that parses as semver.
 
-    All file reads go through `_safe_open_in_repo` so a malicious
+    All file reads go through `safe_open_in_repo` so a malicious
     symlink at any of these paths pointing outside the repo tree is
-    refused (see `_safe_open_in_repo` docstring).
+    refused (see `safe_open_in_repo` docstring).
     """
     if not repo_path:
         return None
     # 1. pyproject.toml
-    py_content = _safe_open_in_repo(repo_path, "pyproject.toml")
+    py_content = safe_open_in_repo(repo_path, "pyproject.toml")
     if py_content:
         m = _PYPROJECT_VERSION_RE.search(py_content)
         if m:
             return m.group(1).strip()
     # 2. package.json
-    pkg_content = _safe_open_in_repo(repo_path, "package.json")
+    pkg_content = safe_open_in_repo(repo_path, "package.json")
     if pkg_content:
         try:
             data = json.loads(pkg_content)
@@ -670,7 +666,7 @@ def _current_version(repo_path: str) -> Optional[str]:
             if isinstance(ver, str) and ver.strip():
                 return ver.strip()
     # 3. VERSION
-    ver_content = _safe_open_in_repo(repo_path, "VERSION")
+    ver_content = safe_open_in_repo(repo_path, "VERSION")
     if ver_content:
         ver = ver_content.strip()
         if ver:

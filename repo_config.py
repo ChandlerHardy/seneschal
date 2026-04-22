@@ -35,12 +35,12 @@ from fs_safety import (
     safe_changelog_path,
 )
 
-# Backward-compat aliases: tests import these private names. The canonical
-# home for the path-safety primitives is `fs_safety`.
+# Backward-compat aliases for the *_SENSITIVE_*_ constants: only
+# `tests/test_repo_config.py` imports these. Kept because multiple test
+# callsites reference the private names; a future cleanup can migrate
+# tests to the canonical `SENSITIVE_FILENAMES` / `SENSITIVE_PATH_SEGMENTS`.
 _SENSITIVE_FILENAMES = SENSITIVE_FILENAMES
 _SENSITIVE_PATH_SEGMENTS = SENSITIVE_PATH_SEGMENTS
-_safe_changelog_path = safe_changelog_path
-_safe_branch_name = safe_branch_name
 
 
 # Repo-supplied content lands in the Claude system prompt, so we sanitize it
@@ -181,7 +181,7 @@ def parse_config(raw: str) -> RepoConfig:
             pm.changelog = pm_raw["changelog"]
         if isinstance(pm_raw.get("changelog_path"), str) and pm_raw["changelog_path"].strip():
             candidate = _sanitize(pm_raw["changelog_path"], 200)
-            safe = _safe_changelog_path(candidate)
+            safe = safe_changelog_path(candidate)
             if safe is not None:
                 pm.changelog_path = safe
             else:
@@ -195,7 +195,7 @@ def parse_config(raw: str) -> RepoConfig:
                 )
         if isinstance(pm_raw.get("release_base_branch"), str) and pm_raw["release_base_branch"].strip():
             candidate = _sanitize(pm_raw["release_base_branch"], 100)
-            safe = _safe_branch_name(candidate)
+            safe = safe_branch_name(candidate)
             if safe is not None:
                 pm.release_base_branch = safe
             else:

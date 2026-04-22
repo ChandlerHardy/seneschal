@@ -244,7 +244,6 @@ def test_handle_pr_merged_falls_back_to_pr_when_protected(tmp_path, monkeypatch)
         clone_dir.mkdir()
         (clone_dir / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_gh.PushProtectedError = PushProtectedError
 
         # First put_file (direct to main) raises PushProtectedError;
         # subsequent ones (on the auto-PR branch) succeed.
@@ -451,7 +450,6 @@ def test_handle_pr_merged_dead_letters_changelog_on_conflict_exhaustion(tmp_path
         clone_dir.mkdir()
         (clone_dir / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
         mock_app.ensure_repo_synced.return_value = str(clone_dir)
-        mock_gh.PushProtectedError = PushProtectedError
         mock_gh.get_file_sha = MagicMock(return_value="oldsha")
         # put_file exhausts sha-conflict retries.
         mock_gh.put_file = MagicMock(
@@ -767,14 +765,14 @@ def test_current_version_refuses_symlink_outside_repo(tmp_path):
 def test_safe_open_in_repo_blocks_absolute_outside_path(tmp_path):
     """Even without a symlink: if the `rel_path` itself resolves
     outside the repo (e.g. `../../etc/passwd`), the helper must refuse."""
-    from post_merge.orchestrator import _safe_open_in_repo
+    from fs_safety import safe_open_in_repo
 
     repo_dir = tmp_path / "clone"
     repo_dir.mkdir()
     outside = tmp_path / "outside.txt"
     outside.write_text("HOST CONTENT")
 
-    result = _safe_open_in_repo(str(repo_dir), "../outside.txt")
+    result = safe_open_in_repo(str(repo_dir), "../outside.txt")
     assert result is None
 
 
@@ -1234,7 +1232,7 @@ def test_followups_continue_past_transient_create_issue_failure(tmp_path, monkey
 
 
 def test_safe_open_in_repo_refuses_intermediate_symlink(tmp_path, monkeypatch):
-    """W5: `_safe_open_in_repo` must refuse when any INTERMEDIATE
+    """W5: `safe_open_in_repo` must refuse when any INTERMEDIATE
     directory in the path is a symlink. The old code only used
     O_NOFOLLOW on the final component, so `docs/` → `/etc` combined
     with reading `docs/CHANGELOG.md` would resolve through the
@@ -1244,7 +1242,7 @@ def test_safe_open_in_repo_refuses_intermediate_symlink(tmp_path, monkeypatch):
     Fix walks each intermediate component with os.lstat and refuses
     if any is a symlink.
     """
-    from post_merge.orchestrator import _safe_open_in_repo
+    from fs_safety import safe_open_in_repo
 
     # Set up a fake repo with a symlinked intermediate dir.
     repo = tmp_path / "repo"
@@ -1260,7 +1258,7 @@ def test_safe_open_in_repo_refuses_intermediate_symlink(tmp_path, monkeypatch):
     # Attempt to read `docs/CHANGELOG.md` — even though the realpath
     # resolves inside `tmp_path`, the intermediate `docs/` is a
     # symlink and must be rejected.
-    result = _safe_open_in_repo(str(repo), "docs/CHANGELOG.md")
+    result = safe_open_in_repo(str(repo), "docs/CHANGELOG.md")
     assert result is None, (
         "W5 regression: intermediate-symlink was allowed through. "
         "Returned content: %r" % (result,)
@@ -1271,7 +1269,7 @@ def test_safe_open_in_repo_allows_nested_real_dirs(tmp_path):
     """Sanity: the intermediate-symlink check must NOT false-positive on
     ordinary nested directories. `docs/notes/CHANGELOG.md` where every
     component is a real dir must still read successfully."""
-    from post_merge.orchestrator import _safe_open_in_repo
+    from fs_safety import safe_open_in_repo
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1279,7 +1277,7 @@ def test_safe_open_in_repo_allows_nested_real_dirs(tmp_path):
     (repo / "docs" / "notes").mkdir()
     (repo / "docs" / "notes" / "CHANGELOG.md").write_text("legit content")
 
-    result = _safe_open_in_repo(str(repo), "docs/notes/CHANGELOG.md")
+    result = safe_open_in_repo(str(repo), "docs/notes/CHANGELOG.md")
     assert result == "legit content"
 
 
