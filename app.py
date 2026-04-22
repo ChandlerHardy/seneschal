@@ -17,20 +17,15 @@ import errno
 import fcntl
 import hashlib
 import hmac
-import json
 import os
 import re
 import subprocess
 import sys
 import threading
-import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Dict, Tuple
 
-import jwt
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from flask import Flask, request, jsonify
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,18 +36,45 @@ from ci_context import fetch_ci_results  # noqa: E402
 from full_review import run_full_review  # noqa: E402
 from history_context import find_adrs  # noqa: E402
 from persona_loader import load_personas  # noqa: E402
-from review_store import save_review  # noqa: E402
-from related_prs import OtherPR  # noqa: E402
 from repo_config import load_from_repo  # noqa: E402
 from review_memory import load as load_memory  # noqa: E402
-from risk import PRFile  # noqa: E402
+
+# GitHub REST + App-auth helpers live in github_api.py. The webhook handler
+# and post-merge orchestrator both import the same module so GitHub I/O
+# stays in one place.
+from github_api import (  # noqa: E402
+    APP_ID,
+    INSTALL_DIR,
+    PEM_PATH,
+    PushProtectedError,
+    apply_labels,
+    create_branch,
+    create_issue,
+    create_pull_request,
+    find_open_prs_with_label,
+    generate_jwt,
+    get_default_branch_sha,
+    get_file_content,
+    get_file_sha,
+    get_installation_token,
+    get_other_open_prs,
+    get_pr_commits,
+    get_pr_diff,
+    get_pr_files,
+    get_pr_meta,
+    post_comment,
+    post_review,
+    put_file,
+    react_to_comment,
+    _github_session,
+)
 
 app = Flask(__name__)
 
-# Config
-APP_ID = 3127694
-INSTALL_DIR = os.path.expanduser("~/seneschal")
-PEM_PATH = os.path.join(INSTALL_DIR, "ch-code-reviewer.pem")
+# App-instance-level config that's specific to the webhook handler (not
+# the github_api helpers). APP_ID / INSTALL_DIR / PEM_PATH are re-exported
+# from github_api above for backward-compat with callers that read them
+# off `app`.
 WEBHOOK_SECRET_PATH = os.path.join(INSTALL_DIR, "webhook-secret.txt")
 REPOS_DIR = "/mnt/block_volume/repos"
 
@@ -114,19 +136,6 @@ REPO_NAME_MAP = {
 LOG_PREFIX = "[seneschal]"
 
 
-def _github_session():
-    """Create a requests Session with retry/backoff for transient GitHub errors."""
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[502, 503, 504],
-        allowed_methods=["GET", "POST"],
-    )
-    session.mount("https://", HTTPAdapter(max_retries=retry))
-    return session
-
-
 def log(msg):
     print(f"{LOG_PREFIX} {msg}", flush=True)
 
@@ -165,285 +174,107 @@ def verify_signature(payload, signature):
     return hmac.compare_digest(expected, signature)
 
 
-def generate_jwt():
-    now = int(time.time())
-    payload = {
-        "iat": now - 60,
-        "exp": now + (10 * 60),
-        "iss": str(APP_ID),
-    }
-    pem = Path(PEM_PATH).read_text()
-    return jwt.encode(payload, pem, algorithm="RS256")
-
-
-def get_installation_token(installation_id):
-    token = generate_jwt()
-    session = _github_session()
-    resp = session.post(
-        f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()["token"]
-
-
-def get_pr_diff(owner, repo, pr_number, token):
-    session = _github_session()
-    resp = session.get(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers={
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3.diff",
-        },
-    )
-    resp.raise_for_status()
-    return resp.text
-
-
-def get_pr_meta(owner, repo, pr_number, token):
-    """Fetch PR metadata (title, body, head, etc.)."""
-    session = _github_session()
-    resp = session.get(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-        headers={
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github+json",
-        },
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_pr_files(owner, repo, pr_number, token):
-    """Fetch the list of files in a PR. Returns List[PRFile]."""
-    session = _github_session()
-    files = []
-    page = 1
-    while True:
-        resp = session.get(
-            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files",
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-            },
-            params={"per_page": 100, "page": page},
-        )
-        resp.raise_for_status()
-        batch = resp.json()
-        if not batch:
-            break
-        for f in batch:
-            files.append(PRFile(
-                filename=f["filename"],
-                additions=f.get("additions", 0),
-                deletions=f.get("deletions", 0),
-                status=f.get("status", "modified"),
-            ))
-        if len(batch) < 100:
-            break
-        page += 1
-    return files
-
-
-def get_other_open_prs(owner, repo, exclude_pr, token, max_prs=200):
-    """Fetch other open PRs and their files. Returns List[OtherPR].
-
-    Paginates the pulls endpoint instead of the previous one-shot
-    `per_page=50` call — on a repo with >50 open PRs the tail was
-    silently dropped, causing overlap detection to miss related work.
-    """
-    session = _github_session()
-    others = []
-    page = 1
-    fetched = 0
-    while fetched < max_prs:
-        resp = session.get(
-            f"https://api.github.com/repos/{owner}/{repo}/pulls",
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-            },
-            params={"state": "open", "per_page": 100, "page": page},
-        )
-        resp.raise_for_status()
-        batch = resp.json()
-        if not batch:
-            break
-        for pr in batch:
-            if pr["number"] == exclude_pr:
-                continue
-            try:
-                files = get_pr_files(owner, repo, pr["number"], token)
-                others.append(OtherPR(
-                    number=pr["number"],
-                    title=pr["title"],
-                    files=frozenset(f.filename for f in files),
-                ))
-            except Exception as e:  # noqa: BLE001
-                log(f"Failed to fetch files for #{pr['number']}: {e}")
-            fetched += 1
-            if fetched >= max_prs:
-                break
-        if len(batch) < 100:
-            break
-        page += 1
-    return others
-
-
-def apply_labels(owner, repo, pr_number, labels, token):
-    """Add labels to a PR (additive, not replace)."""
-    if not labels:
-        return
-    session = _github_session()
-    try:
-        session.post(
-            f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/labels",
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-            },
-            json={"labels": list(labels)},
-        )
-    except Exception as e:  # noqa: BLE001
-        log(f"Failed to apply labels {labels}: {e}")
-
-
-def parse_verdict(review_text):
-    """Determine the GitHub review event from the review body text.
-
-    Recognizes both formats Seneschal produces:
-
-    1. Single-pass review (analyzer.py + one Claude call) — looks for the
-       "NEEDS CHANGES" / "NEEDS_CHANGES" sentinel from that prompt's
-       verdict rule, defaulting to APPROVE when absent.
-    2. Full multi-persona review (full_review.py + slash command) —
-       looks for the explicit ``**Verdict:** REQUEST_CHANGES|COMMENT|APPROVE``
-       line that the /seneschal-review command writes near the top.
-
-    The full-review path's COMMENT verdict is preserved so the bot can
-    leave non-blocking feedback (warnings + minor) without auto-approving
-    or hard-blocking the PR.
-    """
-    first_lines = review_text[:1000].upper()
-
-    # Seneschal full-review explicit verdict line (most specific, check first).
-    if "**VERDICT:** REQUEST_CHANGES" in first_lines or "**VERDICT:** REQUEST CHANGES" in first_lines:
-        return "REQUEST_CHANGES"
-    if "**VERDICT:** APPROVE" in first_lines:
-        return "APPROVE"
-    if "**VERDICT:** COMMENT" in first_lines:
-        return "COMMENT"
-
-    # Single-pass legacy format.
-    if "NEEDS CHANGES" in first_lines or "NEEDS_CHANGES" in first_lines:
-        return "REQUEST_CHANGES"
-    return "APPROVE"
-
-
-def post_review(owner, repo, pr_number, body, token, inline_comments=None):
-    """Post a formal PR review (APPROVE or REQUEST_CHANGES).
-
-    If inline_comments is provided, posts them as per-line review comments
-    alongside the review body. Each comment should be a dict with keys:
-    path, line, side, body.
-
-    On success, persists the posted review to the on-disk review store so
-    the MCP server can expose it to local Claude Code sessions later.
-    Persistence failures are non-fatal (the review is already on GitHub).
-    """
-    verdict = parse_verdict(body)
-    session = _github_session()
-    payload = {"body": body, "event": verdict}
-    if inline_comments:
-        payload["comments"] = inline_comments
-    resp = session.post(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-        headers={
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github+json",
-        },
-        json=payload,
-    )
-    if resp.status_code >= 400 and inline_comments:
-        # Inline comments can fail if line numbers don't map to the diff
-        # (e.g. the file was later modified). Retry without them rather
-        # than failing the whole review.
-        log(f"Review with inline comments failed ({resp.status_code}): {resp.text[:200]}")
-        log("Retrying without inline comments...")
-        resp = session.post(
-            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-            },
-            json={"body": body, "event": verdict},
-        )
-    resp.raise_for_status()
-    comment_suffix = f" with {len(inline_comments)} inline comment(s)" if inline_comments else ""
-    log(f"Posted {verdict} review on {owner}/{repo}#{pr_number}{comment_suffix}")
-
-    # Persist to the review store so the MCP server can surface this later.
-    try:
-        review_json = resp.json() if resp.content else {}
-        review_url = str(review_json.get("html_url", "")) if isinstance(review_json, dict) else ""
-        save_review(
-            f"{owner}/{repo}",
-            int(pr_number),
-            verdict,
-            review_url,
-            body,
-        )
-    except Exception as e:  # noqa: BLE001
-        log(f"Review store persist failed (non-fatal): {e}")
-
-    return verdict
-
-
-def post_comment(owner, repo, pr_number, body, token):
-    """Post a regular issue comment (for fix attempt tracking)."""
-    session = _github_session()
-    session.post(
-        f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
-        headers={
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github+json",
-        },
-        json={"body": body},
-    )
-
-
-def react_to_comment(owner, repo, comment_id, token, content="eyes"):
-    """React to an issue/PR comment so the user sees the trigger was
-    received before the full review runs (~30 seconds). Failure is
-    non-fatal — the review continues regardless.
-
-    Args:
-        comment_id: GitHub's numeric id for the triggering comment.
-        content: one of GitHub's reaction contents. Default "eyes" (👀)
-            is the standard "I saw this, working on it" signal.
-    """
-    try:
-        session = _github_session()
-        resp = session.post(
-            f"https://api.github.com/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions",
-            headers={
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github+json",
-            },
-            json={"content": content},
-            timeout=5,
-        )
-        if resp.status_code >= 400:
-            log(f"React to comment {comment_id} failed ({resp.status_code}): {resp.text[:200]}")
-    except Exception as e:  # noqa: BLE001
-        log(f"React to comment {comment_id} raised (non-fatal): {e}")
-
-
 def _local_repo_path(repo: str) -> str:
     return os.path.join(REPOS_DIR, REPO_NAME_MAP.get(repo, repo))
+
+
+_PER_PR_LOCK_DIR = os.path.expanduser("~/.seneschal/locks")
+
+# In-process per-PR locks, keyed by (owner, repo, pr_number). Needed
+# ABOVE the fcntl lock because Linux `flock(2)` is per-open-file-
+# description: two threads in this same Python process each `os.open`
+# the lockfile and each `LOCK_EX` succeeds independently, breaking the
+# concurrency promise. Threading.Lock serializes same-process threads;
+# fcntl serializes cross-process handlers.
+# Key type is `(owner, repo, int_pr_or_sentinel)` — W4 fix allows the
+# PR slot to be the `"__invalid__"` sentinel string when coercion fails.
+_PER_PR_THREAD_LOCKS: Dict[Tuple[str, str, object], threading.Lock] = {}
+_PER_PR_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _get_thread_lock(owner: str, repo: str, pr_number: int) -> threading.Lock:
+    """Return the shared threading.Lock for (owner, repo, pr_number).
+
+    W4: previously `int(pr_number) if isinstance(pr_number, int) else 0`
+    — the else branch collapsed any non-int (including the string
+    `"42"`) to 0, cross-serializing unrelated PRs passed as strings.
+    Match the defensive pattern used by `_per_pr_lock`: `int(pr_number)`
+    unconditionally, letting a genuine TypeError/ValueError bubble up
+    cleanly on truly-invalid input.
+    """
+    try:
+        pr_key = int(pr_number)
+    except (TypeError, ValueError):
+        # Preserve the previous behavior of not raising from inside the
+        # lock-lookup path — but key on a sentinel dict that still
+        # distinguishes "invalid" PRs from "pr #0". Use a string tag so
+        # it can't collide with any real int key.
+        pr_key = "__invalid__"
+    key = (str(owner), str(repo), pr_key)
+    with _PER_PR_THREAD_LOCKS_GUARD:
+        lock = _PER_PR_THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PER_PR_THREAD_LOCKS[key] = lock
+    return lock
+
+
+@contextmanager
+def _per_pr_lock(owner: str, repo: str, pr_number: int):
+    """Serialize post-merge work for a single PR across webhook retries.
+
+    GitHub retries webhook delivery on 5xx. Without this lock, two
+    background threads for the same merge event could both read
+    `followups_filed_titles=[]` and both file the same followup issue
+    before either writes the updated review record back to disk.
+
+    Two-layer lock:
+      1. `threading.Lock` — serializes threads in the same process.
+         Needed because Linux `flock(2)` is per-open-file-description;
+         two threads each `os.open` the file and each `LOCK_EX` succeeds.
+      2. `fcntl.flock` — serializes across processes (webhook handler
+         restarts, side-by-side deployments). The kernel drops the lock
+         on fd close, so crash-safety is free.
+
+    File naming is safe because `owner`/`repo` come from the GitHub
+    webhook payload (controlled) and `pr_number` is an integer — we
+    still pass the components through a conservative regex to catch
+    any hypothetical injection before it reaches the filesystem.
+    """
+    safe_owner = re.sub(r"[^A-Za-z0-9_.\-]", "_", str(owner))[:100]
+    safe_repo = re.sub(r"[^A-Za-z0-9_.\-]", "_", str(repo))[:100]
+    try:
+        safe_pr = int(pr_number)
+    except (TypeError, ValueError):
+        safe_pr = 0
+    os.makedirs(_PER_PR_LOCK_DIR, exist_ok=True)
+    # W3: previously joined components with `_` — owner `a_b` + repo `c`
+    # collides with owner `a` + repo `b_c` on the same PR number. Use
+    # `+` as a separator: GitHub disallows it in both owner and repo
+    # names (letters, digits, `-`, `_`, `.` only), so it can't appear in
+    # the sanitized components and is collision-free by construction.
+    lock_path = os.path.join(
+        _PER_PR_LOCK_DIR, f"{safe_owner}+{safe_repo}+{safe_pr}.lock",
+    )
+    thread_lock = _get_thread_lock(owner, repo, safe_pr)
+    thread_lock.acquire()
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError as e:
+                if e.errno != errno.EBADF:
+                    raise
+    finally:
+        thread_lock.release()
 
 
 @contextmanager
@@ -671,6 +502,7 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
                     owner, repo, pr_number,
                     result.body, token,
                     inline_comments=inline,
+                    head_sha=head_sha or "",
                 )
             except Exception as e:  # noqa: BLE001
                 log(f"Full review failed for {owner}/{repo}#{pr_number}: {e!r}")
@@ -742,7 +574,11 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
 
         body = f"## Automated Review\n\n{text}\n\n---\n*Reviewed by Seneschal*"
         inline = analysis.inline_comments()
-        verdict = post_review(owner, repo, pr_number, body, token, inline_comments=inline)
+        verdict = post_review(
+            owner, repo, pr_number, body, token,
+            inline_comments=inline,
+            head_sha=head_sha or "",
+        )
 
         # Auto-fix is not available in the public backend (the fix loop
         # needs a tool-using agent, which the API path does not wire). If
@@ -781,16 +617,88 @@ def _queue_review(owner, repo, pr_number, installation_id, head_ref, head_sha, t
     thread.start()
 
 
+def _queue_post_merge(owner, repo, pr_number, installation_id, pr_meta):
+    """Spawn the post-merge orchestrator on a background thread.
+
+    Same pattern as `_queue_review`: webhook handler returns 200 fast,
+    the orchestrator chugs on its own. Exceptions in the orchestrator
+    are swallowed (it returns a status dict).
+
+    W4: the slow work (installation-token mint, `ensure_repo_synced`,
+    `load_from_repo`) happens INSIDE the thread — not in the webhook
+    handler — so a cold clone doesn't exceed GitHub's delivery timeout
+    and pile up retried Flask workers on the same PR.
+    """
+    from post_merge.orchestrator import handle_pr_merged
+
+    log(f"Queueing post-merge for {owner}/{repo}#{pr_number}")
+
+    def _runner():
+        # Per-PR advisory lock: GitHub retries webhook delivery on 5xx,
+        # so two threads might enter the orchestrator for the same merge
+        # event. Without this, both read followups_filed_titles=[] and
+        # both file the followup issue. Lock-holder wins, the retry
+        # sees the persisted state and no-ops.
+        with _per_pr_lock(owner, repo, pr_number):
+            try:
+                token = get_installation_token(installation_id)
+                base_ref = (pr_meta.get("base") or {}).get("ref") or "main"
+                head_sha = pr_meta.get("merge_commit_sha") or (pr_meta.get("head") or {}).get("sha", "")
+                repo_path = ensure_repo_synced(owner, repo, base_ref, head_sha, token)
+                config = load_from_repo(repo_path)
+            except Exception as e:  # noqa: BLE001
+                log(f"[post_merge] config load failed for {owner}/{repo}#{pr_number}: {e!r}")
+                return
+            result = handle_pr_merged(
+                owner=owner,
+                repo=repo,
+                pr_number=pr_number,
+                installation_id=installation_id,
+                pr_meta=pr_meta,
+                config=config,
+            )
+        log(f"[post_merge] {owner}/{repo}#{pr_number} done: {result}")
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+
+
 def _handle_pull_request_event(data):
     """Auto-trigger path. Gated by AUTOREVIEW_ENABLED."""
     action = data.get("action")
+
+    pr = data.get("pull_request") or {}
+
+    # Merge events: route to post-merge orchestrator regardless of
+    # AUTOREVIEW_ENABLED. The orchestrator no-ops on a default config so
+    # repos that haven't opted in see no behavior change.
+    #
+    # W4: repo sync + config load happen INSIDE the background thread
+    # (see `_queue_post_merge`), not synchronously in the webhook
+    # handler. A cold clone of a large repo can take >10s — long enough
+    # that GitHub's delivery timeout fires and the webhook is retried
+    # while the first handler is still running, stacking Flask workers
+    # on the same PR. The handler here only does payload validation
+    # (which is cheap + already done above) and queues the thread.
+    if action == "closed" and pr.get("merged"):
+        owner = data["repository"]["owner"]["login"]
+        repo = data["repository"]["name"]
+        pr_number = pr["number"]
+        installation_id = data["installation"]["id"]
+        _queue_post_merge(owner, repo, pr_number, installation_id, pr)
+        return jsonify({"status": "post_merge_queued", "pr": pr_number}), 200
+
+    # Closed-but-not-merged falls through to the ignore branch below; a
+    # status_ignore is the right answer for those.
+    if action == "closed":
+        log(f"Ignored pull_request/closed for unmerged PR #{pr.get('number')}")
+        return jsonify({"status": "ignored", "action": action, "reason": "closed_not_merged"}), 200
 
     # Only review on PR open or synchronize (new push).
     if action not in ("opened", "synchronize"):
         log(f"Ignored pull_request action: {action}")
         return jsonify({"status": "ignored", "action": action}), 200
 
-    pr = data["pull_request"]
     head_ref = pr["head"]["ref"]
     head_sha = pr["head"]["sha"]
 

@@ -22,10 +22,25 @@ from __future__ import annotations
 
 import os
 import re
+import sys as _sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import yaml
+
+from fs_safety import (
+    SENSITIVE_FILENAMES,
+    SENSITIVE_PATH_SEGMENTS,
+    safe_branch_name,
+    safe_changelog_path,
+)
+
+# Backward-compat aliases for the *_SENSITIVE_*_ constants: only
+# `tests/test_repo_config.py` imports these. Kept because multiple test
+# callsites reference the private names; a future cleanup can migrate
+# tests to the canonical `SENSITIVE_FILENAMES` / `SENSITIVE_PATH_SEGMENTS`.
+_SENSITIVE_FILENAMES = SENSITIVE_FILENAMES
+_SENSITIVE_PATH_SEGMENTS = SENSITIVE_PATH_SEGMENTS
 
 
 # Repo-supplied content lands in the Claude system prompt, so we sanitize it
@@ -47,6 +62,28 @@ def _sanitize(text: str, max_len: int) -> str:
 
 
 @dataclass
+class PostMergeConfig:
+    """Per-repo knobs for post-merge stewardship (P1).
+
+    Defaults are conservative: changelog and followups stay OFF unless the
+    repo opts in via `.seneschal.yml`. The orchestrator no-ops on a default
+    config so installing P1 doesn't change behavior for repos that haven't
+    asked for it.
+    """
+
+    changelog: bool = False
+    changelog_path: str = "CHANGELOG.md"
+    release_base_branch: str = "main"
+    # "" (off), "patch", "minor", "major" — the lowest bump kind that
+    # should trigger a release-PR. "minor" = open a release PR once the
+    # accumulated unreleased bump is minor or higher.
+    release_threshold: str = ""
+    release_pr_draft: bool = True
+    followups: bool = False
+    followup_label: str = "seneschal-followup"
+
+
+@dataclass
 class RepoConfig:
     rules: List[str] = field(default_factory=list)
     ignore_paths: List[str] = field(default_factory=list)
@@ -63,6 +100,8 @@ class RepoConfig:
     # Resolved into Persona objects by persona_loader.load_personas().
     # Empty list → run all six builtin personas (pre-v2 default).
     personas: List[dict] = field(default_factory=list)
+    # Post-merge stewardship config (P1). All sub-knobs default OFF.
+    post_merge: "PostMergeConfig" = field(default_factory=lambda: PostMergeConfig())
 
     def system_prompt_addendum(self) -> str:
         if not self.rules and self.review_style == "concise":
@@ -131,14 +170,66 @@ def parse_config(raw: str) -> RepoConfig:
             if isinstance(entry, dict) and ("builtin" in entry or "file" in entry):
                 filtered.append(entry)
         config.personas = filtered
+
+    # post_merge: nested dict of stewardship knobs. Same defensive parsing
+    # as the top-level fields — unknown keys are dropped, invalid values
+    # fall back to the dataclass default.
+    pm_raw = data.get("post_merge")
+    if isinstance(pm_raw, dict):
+        pm = PostMergeConfig()
+        if isinstance(pm_raw.get("changelog"), bool):
+            pm.changelog = pm_raw["changelog"]
+        if isinstance(pm_raw.get("changelog_path"), str) and pm_raw["changelog_path"].strip():
+            candidate = _sanitize(pm_raw["changelog_path"], 200)
+            safe = safe_changelog_path(candidate)
+            if safe is not None:
+                pm.changelog_path = safe
+            else:
+                # Reject + fall back to default. `print` rather than `log`
+                # because repo_config is imported from contexts (the MCP
+                # server) that don't wire `app.log`.
+                print(
+                    f"[seneschal] rejecting unsafe changelog_path {pm_raw['changelog_path']!r}; "
+                    f"falling back to default {pm.changelog_path!r}",
+                    file=_sys.stderr,
+                )
+        if isinstance(pm_raw.get("release_base_branch"), str) and pm_raw["release_base_branch"].strip():
+            candidate = _sanitize(pm_raw["release_base_branch"], 100)
+            safe = safe_branch_name(candidate)
+            if safe is not None:
+                pm.release_base_branch = safe
+            else:
+                print(
+                    f"[seneschal] rejecting unsafe release_base_branch "
+                    f"{pm_raw['release_base_branch']!r}; falling back to "
+                    f"default {pm.release_base_branch!r}",
+                    file=_sys.stderr,
+                )
+        if pm_raw.get("release_threshold") in {"patch", "minor", "major"}:
+            pm.release_threshold = pm_raw["release_threshold"]
+        if isinstance(pm_raw.get("release_pr_draft"), bool):
+            pm.release_pr_draft = pm_raw["release_pr_draft"]
+        if isinstance(pm_raw.get("followups"), bool):
+            pm.followups = pm_raw["followups"]
+        if isinstance(pm_raw.get("followup_label"), str) and pm_raw["followup_label"].strip():
+            pm.followup_label = _sanitize(pm_raw["followup_label"], 100)
+        config.post_merge = pm
     return config
 
 
 def load_from_path(path: str) -> RepoConfig:
     if not os.path.exists(path):
         return RepoConfig()
-    with open(path, "r") as fh:
-        raw = fh.read()
+    # Pin utf-8 explicitly: a `.seneschal.yml` with Unicode rule strings
+    # (café ☕, résumé, é, etc.) would otherwise raise UnicodeDecodeError
+    # under `LANG=C` → swallowed below → config silently falls back to
+    # all-defaults (no rules applied). Locale-independent decoding is
+    # the correct posture here.
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return RepoConfig()
     try:
         return parse_config(raw)
     except Exception:

@@ -25,7 +25,7 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "Deploying Seneschal to ${HOST}..."
 
 # Target install dir on the host
-ssh "$HOST" "mkdir -p ~/seneschal"
+ssh "$HOST" "mkdir -p ~/seneschal ~/seneschal/post_merge"
 
 # Create venv if missing
 ssh "$HOST" "
@@ -40,8 +40,14 @@ for f in app.py analyzer.py risk.py scope.py diff_parser.py test_gaps.py \
          related_prs.py repo_config.py review_memory.py context_loader.py \
          findings.py summary.py title_check.py breaking_changes.py \
          quality_scan.py secrets_scan.py full_review.py seneschal_token.py \
-         backend.py \
+         backend.py github_api.py fs_safety.py \
          __init__.py requirements.txt; do
+  scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
+done
+
+# Ship post_merge package (P1)
+for f in post_merge/__init__.py post_merge/changelog.py post_merge/release.py \
+         post_merge/followups.py post_merge/orchestrator.py; do
   scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
 done
 
@@ -60,8 +66,16 @@ for f in agents/seneschal-architect.md \
   scp "$REPO_DIR/$f" "${HOST}:~/.claude/$(echo "$f" | sed 's#^#agents/#' 2>/dev/null || echo "$f")"
 done
 
+# Ship the `seneschal-post` CLI helper to ~/bin on the host. This is the
+# script the /seneschal-review Claude Code skill calls to post an
+# aggregated multi-persona review as seneschal-cr[bot] via a minted
+# installation token. Pure GitHub-API poster — no LLM dependency.
+ssh "$HOST" "mkdir -p ~/bin"
+scp "$REPO_DIR/bin/seneschal-post" "${HOST}:~/bin/seneschal-post"
+ssh "$HOST" "chmod +x ~/bin/seneschal-post"
+
 # Smoke-import so we catch missing deps before systemd starts
-ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token' && echo 'seneschal imports: OK'"
+ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token; from post_merge import orchestrator' && echo 'seneschal imports: OK'"
 
 # Install / update the systemd unit
 scp "$REPO_DIR/systemd/seneschal.service" "${HOST}:/tmp/seneschal.service"

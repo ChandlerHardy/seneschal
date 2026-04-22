@@ -124,9 +124,9 @@ def _build_user_prompt(persona_name: str, pr_meta: dict, diff_text: str) -> str:
 def _parse_persona_verdict(text: str) -> str:
     """Lightweight per-persona verdict parse.
 
-    Mirrors the shape used by app.parse_verdict / analyzer layers but
-    without importing `app` (avoid circular). Falls back to COMMENT when
-    the persona does not emit an explicit verdict line.
+    Mirrors the shape used by `github_api.parse_verdict` / analyzer
+    layers but without importing it (avoid circular). Falls back to
+    COMMENT when the persona does not emit an explicit verdict line.
     """
     first_lines = (text or "")[:1000].upper()
     if "**VERDICT:** REQUEST_CHANGES" in first_lines or "**VERDICT:** REQUEST CHANGES" in first_lines:

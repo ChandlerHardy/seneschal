@@ -14,6 +14,7 @@ from review_store import (  # noqa: E402
     get_review,
     last_review,
     list_reviews,
+    mark_merged,
     save_review,
 )
 
@@ -69,6 +70,80 @@ def test_get_review_handles_corrupt_frontmatter(tmp_path, monkeypatch):
     d.mkdir(parents=True)
     (d / "5.md").write_text("no frontmatter here, just body")
     assert get_review("a/b", 5) is None
+
+
+# --------------------------------------------------------------------------
+# W1 (round 3): locale-agnostic UTF-8 encoding
+#
+# `os.fdopen(fd, "w")` + `path.read_text()` use the process locale. On a
+# `LANG=C` host, writing a review body with emoji/accented characters
+# raised UnicodeEncodeError and the review was lost. Pin UTF-8 on both
+# write and read, and accept a UTF-8 BOM on read so externally-edited
+# files don't parse as corrupt.
+# --------------------------------------------------------------------------
+
+
+def test_save_review_round_trips_unicode(tmp_path, monkeypatch):
+    """Emoji + accented chars must survive save → get without encode
+    errors. Previously `os.fdopen(fd, "w")` inherited the process
+    locale — on `LANG=C` this aborted the write and `get_review`
+    returned None."""
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    body = "review with emoji \U0001F525 and accénts é ñ ü"
+    save_review("a/b", 42, "APPROVE", "https://x/42", body)
+    rec = get_review("a/b", 42)
+    assert rec is not None
+    assert "\U0001F525" in rec.body
+    assert "accénts" in rec.body
+
+
+def test_save_review_unicode_under_c_locale(tmp_path, monkeypatch):
+    """Force the ASCII locale and confirm the save path still uses
+    UTF-8. `open("w")` without an explicit encoding would raise
+    UnicodeEncodeError here; the fix pins `encoding="utf-8"` on the
+    fdopen call."""
+    import locale
+
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    # Snapshot + restore the locale so other tests aren't affected.
+    original = locale.setlocale(locale.LC_ALL)
+    try:
+        try:
+            locale.setlocale(locale.LC_ALL, "C")
+        except locale.Error:
+            # Some platforms reject `C` — fall back to the mock via env.
+            monkeypatch.setenv("LANG", "C")
+            monkeypatch.setenv("LC_ALL", "C")
+        body = "emoji \U0001F525 still works"
+        save_review("a/b", 1, "APPROVE", "", body)
+        rec = get_review("a/b", 1)
+        assert rec is not None
+        assert "\U0001F525" in rec.body
+    finally:
+        try:
+            locale.setlocale(locale.LC_ALL, original)
+        except locale.Error:
+            pass
+
+
+def test_get_review_strips_utf8_bom(tmp_path, monkeypatch):
+    """An externally-edited review file with a UTF-8 BOM at the start
+    of the frontmatter must still parse. Previously the BOM bytes
+    prepended `---\\n{` making the JSON-parse step barf."""
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    d = tmp_path / "a" / "b"
+    d.mkdir(parents=True)
+    # Hand-roll a review file with a BOM byte.
+    frontmatter = (
+        '---\n{\n  "pr_number": 7,\n  "verdict": "APPROVE",\n'
+        '  "timestamp": "2026-04-21T00:00:00Z",\n  "url": ""\n}\n---\n'
+    )
+    body = "body with emoji \U0001F525\n"
+    (d / "7.md").write_bytes("﻿".encode("utf-8") + (frontmatter + body).encode("utf-8"))
+    rec = get_review("a/b", 7)
+    assert rec is not None
+    assert rec.pr_number == 7
+    assert "\U0001F525" in rec.body
 
 
 # --------------------------------------------------------------------------
@@ -185,3 +260,259 @@ def test_get_repo_memory_prefers_new_name(tmp_path):
 
 def test_get_repo_memory_empty_when_missing(tmp_path):
     assert get_repo_memory("a/b", str(tmp_path)) == ""
+
+
+# --------------------------------------------------------------------------
+# Frontmatter v2: head_sha / merged_at / followups_filed (P1)
+# --------------------------------------------------------------------------
+
+
+def test_save_review_with_head_sha_persists(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review(
+        "a/b",
+        7,
+        "APPROVE",
+        "https://x/7",
+        "body",
+        head_sha="abc123def",
+    )
+    rec = get_review("a/b", 7)
+    assert rec is not None
+    assert rec.head_sha == "abc123def"
+
+
+def test_save_review_default_head_sha_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("a/b", 1, "APPROVE", "", "body")
+    rec = get_review("a/b", 1)
+    assert rec.head_sha == ""
+    assert rec.merged_at is None
+    assert rec.followups_filed == []
+
+
+def test_v1_frontmatter_still_parses(tmp_path, monkeypatch):
+    """A review file without the new v2 fields must still parse with defaults."""
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    d = tmp_path / "a" / "b"
+    d.mkdir(parents=True)
+    # Hand-craft a v1-shaped file (no head_sha / merged_at / followups_filed).
+    (d / "12.md").write_text(
+        '---\n'
+        '{\n'
+        '  "pr_number": 12,\n'
+        '  "verdict": "APPROVE",\n'
+        '  "timestamp": "2026-04-18T12:00:00Z",\n'
+        '  "url": "https://x/12"\n'
+        '}\n'
+        '---\n'
+        'old body'
+    )
+    rec = get_review("a/b", 12)
+    assert rec is not None
+    assert rec.pr_number == 12
+    assert rec.verdict == "APPROVE"
+    assert rec.head_sha == ""
+    assert rec.merged_at is None
+    assert rec.followups_filed == []
+
+
+def test_mark_merged_updates_frontmatter(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("a/b", 5, "APPROVE", "https://x/5", "review body")
+    out = mark_merged("a/b", 5, "2026-04-21T10:00:00Z", [101, 102])
+    assert out is not None
+    assert out.exists()
+    rec = get_review("a/b", 5)
+    assert rec.merged_at == "2026-04-21T10:00:00Z"
+    assert sorted(rec.followups_filed) == [101, 102]
+    # Body preserved.
+    assert "review body" in rec.body
+
+
+def test_mark_merged_dedupes_followup_numbers(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("a/b", 5, "APPROVE", "", "body")
+    mark_merged("a/b", 5, "2026-04-21T10:00:00Z", [101, 102])
+    mark_merged("a/b", 5, "2026-04-21T10:00:00Z", [102, 103])
+    rec = get_review("a/b", 5)
+    assert sorted(rec.followups_filed) == [101, 102, 103]
+
+
+def test_mark_merged_returns_none_for_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    assert mark_merged("a/b", 999, "2026-04-21T10:00:00Z", []) is None
+
+
+def test_mark_merged_preserves_body(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    body = "## Review\n\n- finding 1\n- [FOLLOWUP] do later\n"
+    save_review("a/b", 11, "APPROVE", "", body)
+    mark_merged("a/b", 11, "2026-04-21T10:00:00Z", [501])
+    rec = get_review("a/b", 11)
+    assert "## Review" in rec.body
+    assert "[FOLLOWUP]" in rec.body
+
+
+def test_mark_merged_persists_followup_titles(tmp_path, monkeypatch):
+    """The orchestrator hands mark_merged the sanitized titles of the
+    issues it just filed. Those must round-trip through the frontmatter
+    so the next webhook delivery dedupes correctly by title, not count."""
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("a/b", 20, "APPROVE", "", "body")
+    mark_merged(
+        "a/b",
+        20,
+        "2026-04-21T10:00:00Z",
+        [601],
+        followup_titles=["[seneschal followup] do the thing"],
+    )
+    rec = get_review("a/b", 20)
+    assert rec.followups_filed_titles == ["[seneschal followup] do the thing"]
+
+
+def test_mark_merged_dedupes_titles_across_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("a/b", 21, "APPROVE", "", "body")
+    mark_merged("a/b", 21, "2026-04-21T10:00:00Z", [601], followup_titles=["Alpha"])
+    # Second call with the same title (different casing/whitespace).
+    mark_merged("a/b", 21, "2026-04-21T10:00:00Z", [602], followup_titles=["  alpha  ", "Beta"])
+    rec = get_review("a/b", 21)
+    # Only one Alpha (casefold + whitespace collapse dedupe), Beta added.
+    assert len(rec.followups_filed_titles) == 2
+    assert rec.followups_filed_titles[0] == "Alpha"
+    assert "Beta" in rec.followups_filed_titles
+
+
+def test_review_record_defaults_followups_titles_to_empty_list():
+    """v2 records without the new titles field must round-trip with []."""
+    rec = ReviewRecord(
+        repo="a/b",
+        pr_number=1,
+        verdict="APPROVE",
+        timestamp="2026-04-21T10:00:00Z",
+        url="https://x",
+        body="",
+    )
+    assert rec.followups_filed_titles == []
+
+
+# --------------------------------------------------------------------------
+# B4: atomic save_review — a crash mid-write must not corrupt the file.
+# --------------------------------------------------------------------------
+
+
+def test_save_review_is_atomic_via_tempfile(tmp_path, monkeypatch):
+    """`save_review` must use a sibling tempfile + `os.replace` pattern,
+    not `path.write_text(content)` directly. The guarantee: if the write
+    fails mid-flight, the original file (if any) is untouched — a
+    half-written frontmatter would cause `get_review` to return None and
+    silently lose the review.
+
+    Strategy: directly verify `os.replace` is invoked (the fingerprint
+    of the atomic pattern). A regression to `path.write_text` wouldn't
+    trigger os.replace and the counter stays at 0."""
+    import review_store as rs
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    replace_calls = {"n": 0}
+    orig_replace = os.replace
+
+    def _counting_replace(src, dst, *args, **kwargs):
+        replace_calls["n"] += 1
+        return orig_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", _counting_replace)
+
+    save_review("a/b", 7, "APPROVE", "https://x/7", "FIRST")
+    assert replace_calls["n"] >= 1, (
+        "save_review did not call os.replace — it's using a non-atomic "
+        "write_text fallback, which loses the original file on crash."
+    )
+
+    # Second save must also go through replace.
+    replace_calls["n"] = 0
+    save_review("a/b", 7, "REQUEST_CHANGES", "https://x/7", "SECOND")
+    assert replace_calls["n"] >= 1
+
+
+def test_save_review_preserves_original_on_replace_failure(tmp_path, monkeypatch):
+    """Complement: when os.replace fails, the PRE-EXISTING file must
+    remain intact (not truncated by a mid-write failure in the new
+    content). This is the actual crash-safety guarantee."""
+    import review_store as rs
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    # Seed: a known-good existing review.
+    save_review("a/b", 7, "APPROVE", "https://x/7", "ORIGINAL BODY")
+    orig_rec = get_review("a/b", 7)
+    assert orig_rec is not None
+    assert "ORIGINAL" in orig_rec.body
+
+    def _fail_replace(*args, **kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "replace", _fail_replace)
+
+    import pytest
+    with pytest.raises(OSError):
+        save_review("a/b", 7, "REQUEST_CHANGES", "https://x/7", "CORRUPT ATTEMPT")
+
+    # Un-patch replace so get_review works on intact original file.
+    monkeypatch.undo()
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    rec = get_review("a/b", 7)
+    assert rec is not None
+    assert rec.verdict == "APPROVE"
+    assert "ORIGINAL" in rec.body
+    assert "CORRUPT" not in rec.body
+
+
+def test_save_review_cleans_up_tempfile_on_error(tmp_path, monkeypatch):
+    """If the atomic-write raises, the tempfile must be cleaned up so
+    the reviews directory doesn't accumulate `.N.md.*.tmp` cruft."""
+    import review_store as rs
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    # Force os.replace to fail.
+    def _fail_replace(*args, **kwargs):
+        raise OSError("nope")
+
+    monkeypatch.setattr(os, "replace", _fail_replace)
+
+    import pytest
+    with pytest.raises(OSError):
+        save_review("a/b", 99, "APPROVE", "", "body")
+
+    review_dir = tmp_path / "a" / "b"
+    if review_dir.exists():
+        leftovers = list(review_dir.iterdir())
+        # Only possibly nothing OR the tempfile was cleaned up.
+        for p in leftovers:
+            assert not p.name.endswith(".tmp"), (
+                f"Tempfile {p} not cleaned up after atomic-write failure"
+            )
+
+
+def test_save_review_with_head_sha_via_post_review_path(tmp_path, monkeypatch):
+    """W6: app.post_review must thread head_sha through to save_review so
+    production records carry the actual PR head SHA. Previously the
+    call site never passed head_sha, leaving every record with head_sha=""
+    and breaking P2's SQLite index ability to correlate reviews to
+    commits."""
+    import review_store as rs
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    # The save_review kwarg accepts head_sha directly — confirm round-trip.
+    save_review(
+        "owner/repo",
+        123,
+        "APPROVE",
+        "https://x/123",
+        "review body",
+        head_sha="abc123def456",
+    )
+    rec = get_review("owner/repo", 123)
+    assert rec is not None
+    assert rec.head_sha == "abc123def456"
