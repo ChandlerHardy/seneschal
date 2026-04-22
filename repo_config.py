@@ -20,6 +20,7 @@ Example:
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import sys as _sys
@@ -61,6 +62,66 @@ def _sanitize(text: str, max_len: int) -> str:
     return text[:max_len]
 
 
+# Header text is allowed to carry newlines (unlike rule strings that land in
+# the system prompt), but we still strip control chars and cap the size.
+_HEADER_MAX_BYTES = 2048
+
+
+def _sanitize_header_text(text: str) -> str:
+    """Sanitize license-header text: strip control chars (keep \n), cap 2KB."""
+    # Keep newlines, tabs, carriage returns — strip the rest.
+    cleaned = _CONTROL_CHARS.sub("", text)
+    # Normalize CRLF to LF so the scan compares consistently.
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    return cleaned[:_HEADER_MAX_BYTES]
+
+
+_GLOB_META_CHARS = re.compile(r"([.+^$(){}\[\]|\\])")
+
+
+def glob_match(pattern: str, path: str) -> bool:
+    """Match `path` against a glob `pattern`, supporting `**` (recursive).
+
+    `fnmatch.fnmatch` does NOT recognize `**` — `src/**/*.go` wouldn't
+    match `src/a/b/c.go`. This helper promotes patterns containing `**`
+    to a regex (escaping other metacharacters) and falls back to
+    `fnmatch` for simple patterns.
+
+    Semantics follow the common gitignore / minimatch convention:
+     - `**` matches zero or more path segments.
+     - `**/*.go` matches `foo.go`, `a/foo.go`, `a/b/foo.go`, etc.
+       (the leading `**/` is optional — it matches zero segments too).
+     - `src/**` matches `src/a.go`, `src/a/b.go`, etc.
+     - `*` matches within a single segment (no `/`).
+     - `?` matches a single character (no `/`).
+    """
+    if not pattern:
+        return False
+    if "**" not in pattern:
+        return fnmatch.fnmatch(path, pattern)
+
+    # Translate ** glob to regex. Use two sentinels:
+    #  - STAR_SLASH for the `**/` prefix idiom (zero-or-more segments
+    #    followed by a slash): that's a special case where we want the
+    #    slash itself to be optional when `**` collapses to zero.
+    #  - STAR_STAR for any other `**`.
+    STAR_SLASH = "\x00STARSLASH\x00"
+    STAR_STAR = "\x00STARSTAR\x00"
+    work = pattern.replace("**/", STAR_SLASH)
+    work = work.replace("**", STAR_STAR)
+    work = _GLOB_META_CHARS.sub(r"\\\1", work)
+    work = work.replace("*", "[^/]*").replace("?", "[^/]")
+    # `**/` → `(?:.*/)?` (zero or more segments plus slash, OR nothing).
+    work = work.replace(STAR_SLASH, "(?:.*/)?")
+    # Bare `**` → `.*` (any characters including slashes).
+    work = work.replace(STAR_STAR, ".*")
+    try:
+        return re.match(f"^{work}$", path) is not None
+    except re.error:
+        # Degrade to fnmatch if our translation produced invalid regex.
+        return fnmatch.fnmatch(path, pattern)
+
+
 @dataclass
 class PostMergeConfig:
     """Per-repo knobs for post-merge stewardship (P1).
@@ -84,6 +145,42 @@ class PostMergeConfig:
 
 
 @dataclass
+class StandardsConfig:
+    """Per-repo knobs for standards enforcement (P3).
+
+    All defaults are OFF: installing P3 doesn't change behavior for any
+    repo that hasn't opted in via `.seneschal.yml`. Severity overrides
+    let operators downgrade (e.g. NIT → INFO) or upgrade (WARNING → BLOCKER)
+    specific findings to match their house style.
+    """
+
+    # License-header scan ---------------------------------------------------
+    # Inline wins over file when both are set. Both sanitized / truncated at
+    # 2KB during parse.
+    license_header: str = ""
+    license_header_file: str = ""
+    # Empty applies_to = check every added file. Non-empty = only check
+    # files matching at least one glob.
+    license_applies_to: List[str] = field(default_factory=list)
+    # Files matching any exemption glob are skipped even if they match
+    # applies_to.
+    license_exemptions: List[str] = field(default_factory=list)
+
+    # Commit-convention strict mode -----------------------------------------
+    commit_convention_strict: bool = False
+
+    # Branch-name regex patterns --------------------------------------------
+    # Empty list = feature disabled. ANY pattern match counts as valid.
+    branch_name_patterns: List[str] = field(default_factory=list)
+
+    # Severity overrides — None = use plan defaults.
+    # Accepted values: "blocker" | "warning" | "nit" | "info"
+    license_severity: Optional[str] = None
+    commit_convention_severity: Optional[str] = None
+    branch_name_severity: Optional[str] = None
+
+
+@dataclass
 class RepoConfig:
     rules: List[str] = field(default_factory=list)
     ignore_paths: List[str] = field(default_factory=list)
@@ -102,6 +199,8 @@ class RepoConfig:
     personas: List[dict] = field(default_factory=list)
     # Post-merge stewardship config (P1). All sub-knobs default OFF.
     post_merge: "PostMergeConfig" = field(default_factory=lambda: PostMergeConfig())
+    # Standards-enforcement config (P3). All sub-knobs default OFF.
+    standards: "StandardsConfig" = field(default_factory=lambda: StandardsConfig())
 
     def system_prompt_addendum(self) -> str:
         if not self.rules and self.review_style == "concise":
@@ -214,6 +313,48 @@ def parse_config(raw: str) -> RepoConfig:
         if isinstance(pm_raw.get("followup_label"), str) and pm_raw["followup_label"].strip():
             pm.followup_label = _sanitize(pm_raw["followup_label"], 100)
         config.post_merge = pm
+
+    # standards: nested dict of enforcement knobs (P3). Same defensive
+    # parsing as post_merge — unknown keys dropped, invalid values fall
+    # back to dataclass defaults. license_header_file is resolved relative
+    # to the repo root in load_from_repo; we only carry the raw name here.
+    st_raw = data.get("standards")
+    if isinstance(st_raw, dict):
+        st = StandardsConfig()
+        if isinstance(st_raw.get("license_header"), str) and st_raw["license_header"]:
+            st.license_header = _sanitize_header_text(st_raw["license_header"])
+        if isinstance(st_raw.get("license_header_file"), str) and st_raw["license_header_file"].strip():
+            st.license_header_file = _sanitize(st_raw["license_header_file"], 200)
+        if isinstance(st_raw.get("license_applies_to"), list):
+            st.license_applies_to = [
+                _sanitize(str(p), MAX_RULE_LEN)
+                for p in st_raw["license_applies_to"][:MAX_IGNORE_PATHS]
+                if str(p).strip()
+            ]
+        if isinstance(st_raw.get("license_exemptions"), list):
+            st.license_exemptions = [
+                _sanitize(str(p), MAX_RULE_LEN)
+                for p in st_raw["license_exemptions"][:MAX_IGNORE_PATHS]
+                if str(p).strip()
+            ]
+        if isinstance(st_raw.get("commit_convention_strict"), bool):
+            st.commit_convention_strict = st_raw["commit_convention_strict"]
+        if isinstance(st_raw.get("branch_name_patterns"), list):
+            st.branch_name_patterns = [
+                _sanitize(str(p), MAX_RULE_LEN)
+                for p in st_raw["branch_name_patterns"][:MAX_IGNORE_PATHS]
+                if str(p).strip()
+            ]
+        # Severity overrides — accept only the four canonical labels.
+        for key in (
+            "license_severity",
+            "commit_convention_severity",
+            "branch_name_severity",
+        ):
+            val = st_raw.get(key)
+            if val in {"blocker", "warning", "nit", "info"}:
+                setattr(st, key, val)
+        config.standards = st
     return config
 
 
@@ -236,9 +377,38 @@ def load_from_path(path: str) -> RepoConfig:
         return RepoConfig()
 
 
+def _resolve_license_header_file(repo_dir: str, rel_path: str) -> str:
+    """Safely read a license-header file from inside the repo.
+
+    Guards against path traversal by reusing `safe_changelog_path`, which
+    vets for `..`, absolute paths, and the sensitive deny-list. Returns
+    the file contents (sanitized + 2KB-capped) or an empty string on any
+    failure. Failure is logged to stderr so operators can debug.
+    """
+    safe_rel = safe_changelog_path(rel_path)
+    if safe_rel is None:
+        print(
+            f"[seneschal] rejecting unsafe license_header_file {rel_path!r}",
+            file=_sys.stderr,
+        )
+        return ""
+    abs_path = os.path.join(repo_dir, safe_rel)
+    try:
+        with open(abs_path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        print(
+            f"[seneschal] could not read license_header_file {rel_path!r}: {exc}",
+            file=_sys.stderr,
+        )
+        return ""
+    return _sanitize_header_text(raw)
+
+
 def load_from_repo(repo_dir: str) -> RepoConfig:
     # Prefer the canonical .seneschal.yml, fall back to the legacy name for
     # repos that haven't migrated yet. Both filenames carry the same schema.
+    config = RepoConfig()
     for name in (
         ".seneschal.yml",
         ".seneschal.yaml",
@@ -247,5 +417,17 @@ def load_from_repo(repo_dir: str) -> RepoConfig:
     ):
         p = os.path.join(repo_dir, name)
         if os.path.exists(p):
-            return load_from_path(p)
-    return RepoConfig()
+            config = load_from_path(p)
+            break
+
+    # Resolve license_header_file relative to repo_dir. Inline license_header
+    # wins if both are set. Doing this post-parse keeps `parse_config` pure
+    # (no filesystem access) — tests that call `parse_config` directly still
+    # see `license_header_file` as a raw string.
+    st = config.standards
+    if not st.license_header and st.license_header_file:
+        resolved = _resolve_license_header_file(repo_dir, st.license_header_file)
+        if resolved:
+            st.license_header = resolved
+
+    return config

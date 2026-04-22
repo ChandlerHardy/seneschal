@@ -403,3 +403,189 @@ def test_sensitive_path_sets_are_inspectable():
     assert isinstance(_SENSITIVE_PATH_SEGMENTS, frozenset)
     assert "codeowners" in _SENSITIVE_FILENAMES
     assert ".github" in _SENSITIVE_PATH_SEGMENTS
+
+
+# --------------------------------------------------------------------------
+# StandardsConfig (P3)
+# --------------------------------------------------------------------------
+
+
+def test_default_standards_all_off():
+    from repo_config import StandardsConfig
+    cfg = parse_config("")
+    assert isinstance(cfg.standards, StandardsConfig)
+    assert cfg.standards.license_header == ""
+    assert cfg.standards.license_header_file == ""
+    assert cfg.standards.license_applies_to == []
+    assert cfg.standards.license_exemptions == []
+    assert cfg.standards.commit_convention_strict is False
+    assert cfg.standards.branch_name_patterns == []
+    assert cfg.standards.license_severity is None
+
+
+def test_standards_license_header_inline():
+    raw = """
+standards:
+  license_header: "// Copyright {YEAR} Acme Corp."
+"""
+    cfg = parse_config(raw)
+    assert "Copyright" in cfg.standards.license_header
+    assert "{YEAR}" in cfg.standards.license_header
+
+
+def test_standards_license_header_multiline_preserved():
+    raw = """
+standards:
+  license_header: |
+    // Copyright {YEAR} Acme Corp.
+    // Licensed under MIT.
+"""
+    cfg = parse_config(raw)
+    assert "\n" in cfg.standards.license_header
+    assert "Licensed under MIT" in cfg.standards.license_header
+
+
+def test_standards_license_header_truncated_at_2kb():
+    # Headers longer than 2KB get truncated.
+    big = "x" * 3000
+    raw = f"standards:\n  license_header: \"{big}\"\n"
+    cfg = parse_config(raw)
+    assert len(cfg.standards.license_header) <= 2048
+
+
+def test_standards_applies_to_and_exemptions():
+    raw = """
+standards:
+  license_header: "// header"
+  license_applies_to:
+    - "**/*.go"
+    - "**/*.py"
+  license_exemptions:
+    - "vendor/**"
+    - "**/generated/**"
+"""
+    cfg = parse_config(raw)
+    assert "**/*.go" in cfg.standards.license_applies_to
+    assert "vendor/**" in cfg.standards.license_exemptions
+
+
+def test_standards_commit_convention_strict_on():
+    raw = "standards:\n  commit_convention_strict: true\n"
+    cfg = parse_config(raw)
+    assert cfg.standards.commit_convention_strict is True
+
+
+def test_standards_branch_name_patterns_parsed():
+    raw = """
+standards:
+  branch_name_patterns:
+    - "^feat/"
+    - "^fix/"
+    - "^chore/"
+"""
+    cfg = parse_config(raw)
+    assert cfg.standards.branch_name_patterns == ["^feat/", "^fix/", "^chore/"]
+
+
+def test_standards_severity_override_accepted():
+    raw = """
+standards:
+  license_severity: blocker
+  commit_convention_severity: nit
+  branch_name_severity: info
+"""
+    cfg = parse_config(raw)
+    assert cfg.standards.license_severity == "blocker"
+    assert cfg.standards.commit_convention_severity == "nit"
+    assert cfg.standards.branch_name_severity == "info"
+
+
+def test_standards_severity_override_invalid_ignored():
+    raw = "standards:\n  license_severity: bogus\n"
+    cfg = parse_config(raw)
+    # Bogus value falls back to None (default).
+    assert cfg.standards.license_severity is None
+
+
+def test_standards_block_invalid_type_falls_back():
+    raw = "standards: not-a-dict\n"
+    cfg = parse_config(raw)
+    assert cfg.standards.license_header == ""
+
+
+def test_standards_unknown_keys_ignored():
+    raw = """
+standards:
+  license_header: "// hdr"
+  bogus_new_key: whatever
+"""
+    cfg = parse_config(raw)
+    assert cfg.standards.license_header == "// hdr"
+
+
+def test_load_from_repo_resolves_license_header_file(tmp_path):
+    # Place a header file in the repo and have the config point at it.
+    (tmp_path / "LICENSE_HEADER.txt").write_text(
+        "// Copyright {YEAR} Acme Corp.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".seneschal.yml").write_text(
+        "standards:\n  license_header_file: LICENSE_HEADER.txt\n",
+        encoding="utf-8",
+    )
+    cfg = load_from_repo(str(tmp_path))
+    assert "Acme" in cfg.standards.license_header
+
+
+def test_load_from_repo_rejects_license_header_file_traversal(tmp_path):
+    # Attempt `..` escape from the repo.
+    (tmp_path / ".seneschal.yml").write_text(
+        "standards:\n  license_header_file: ../secret.txt\n",
+        encoding="utf-8",
+    )
+    cfg = load_from_repo(str(tmp_path))
+    # Rejected → license_header stays empty (the feature won't fire).
+    assert cfg.standards.license_header == ""
+
+
+def test_load_from_repo_inline_header_wins_over_file(tmp_path):
+    (tmp_path / "LICENSE_HEADER.txt").write_text("FROM FILE\n", encoding="utf-8")
+    (tmp_path / ".seneschal.yml").write_text(
+        """
+standards:
+  license_header: "INLINE"
+  license_header_file: LICENSE_HEADER.txt
+""",
+        encoding="utf-8",
+    )
+    cfg = load_from_repo(str(tmp_path))
+    assert cfg.standards.license_header == "INLINE"
+
+
+# --------------------------------------------------------------------------
+# glob_match helper
+# --------------------------------------------------------------------------
+
+
+def test_glob_match_simple_star():
+    from repo_config import glob_match
+    assert glob_match("*.go", "foo.go") is True
+    assert glob_match("*.go", "foo.py") is False
+
+
+def test_glob_match_double_star_recursive():
+    from repo_config import glob_match
+    assert glob_match("**/*.go", "a/b/c/foo.go") is True
+    assert glob_match("**/*.go", "foo.go") is True
+    assert glob_match("src/**", "src/a/b/c.go") is True
+
+
+def test_glob_match_exact_path():
+    from repo_config import glob_match
+    assert glob_match("docs/readme.md", "docs/readme.md") is True
+    assert glob_match("docs/readme.md", "docs/other.md") is False
+
+
+def test_glob_match_empty_pattern_is_false():
+    from repo_config import glob_match
+    assert glob_match("", "foo.go") is False
