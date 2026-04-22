@@ -26,6 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Dict, Tuple
 
 import jwt
 import requests
@@ -436,13 +437,25 @@ def put_file(owner, repo, path, content, message, branch, sha, token):
             raise PushProtectedError(
                 f"PUT {path} on {owner}/{repo}@{branch} returned 403 — likely branch protection"
             )
-        if resp.status_code == 409 and attempt < 2:
-            # Concurrent write — re-fetch sha and retry.
-            sha = get_file_sha(owner, repo, path, branch, token)
-            continue
+        if resp.status_code == 409:
+            # Concurrent write. Re-fetch the sha and retry unless we've
+            # exhausted the retry budget — if we have, raise RuntimeError
+            # with the "sha conflict after 3 retries" sentinel so the
+            # orchestrator's `_attempt_changelog_commit` classifies this
+            # as `"conflict"` and dead-letters the entry. Previously this
+            # fell through to `resp.raise_for_status()` and surfaced an
+            # HTTPError, which the orchestrator misclassified as `"error"`
+            # and silently dropped the changelog entry on the floor.
+            if attempt < 2:
+                sha = get_file_sha(owner, repo, path, branch, token)
+                continue
+            raise RuntimeError(
+                f"put_file: sha conflict after 3 retries on {owner}/{repo}/{path}"
+            )
         resp.raise_for_status()
         return resp.json()
-    # If we exhausted retries on 409:
+    # Defensive: loop only exits via return/raise above. If we somehow fall
+    # through, surface a clear error rather than a silent None.
     raise RuntimeError(f"put_file: gave up after 3 retries on {owner}/{repo}/{path}")
 
 
@@ -646,6 +659,26 @@ def _local_repo_path(repo: str) -> str:
 
 _PER_PR_LOCK_DIR = os.path.expanduser("~/.seneschal/locks")
 
+# In-process per-PR locks, keyed by (owner, repo, pr_number). Needed
+# ABOVE the fcntl lock because Linux `flock(2)` is per-open-file-
+# description: two threads in this same Python process each `os.open`
+# the lockfile and each `LOCK_EX` succeeds independently, breaking the
+# concurrency promise. Threading.Lock serializes same-process threads;
+# fcntl serializes cross-process handlers.
+_PER_PR_THREAD_LOCKS: Dict[Tuple[str, str, int], threading.Lock] = {}
+_PER_PR_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _get_thread_lock(owner: str, repo: str, pr_number: int) -> threading.Lock:
+    """Return the shared threading.Lock for (owner, repo, pr_number)."""
+    key = (str(owner), str(repo), int(pr_number) if isinstance(pr_number, int) else 0)
+    with _PER_PR_THREAD_LOCKS_GUARD:
+        lock = _PER_PR_THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _PER_PR_THREAD_LOCKS[key] = lock
+    return lock
+
 
 @contextmanager
 def _per_pr_lock(owner: str, repo: str, pr_number: int):
@@ -656,7 +689,14 @@ def _per_pr_lock(owner: str, repo: str, pr_number: int):
     `followups_filed_titles=[]` and both file the same followup issue
     before either writes the updated review record back to disk.
 
-    Advisory fcntl lock on a sidecar file under `~/.seneschal/locks/`.
+    Two-layer lock:
+      1. `threading.Lock` — serializes threads in the same process.
+         Needed because Linux `flock(2)` is per-open-file-description;
+         two threads each `os.open` the file and each `LOCK_EX` succeeds.
+      2. `fcntl.flock` — serializes across processes (webhook handler
+         restarts, side-by-side deployments). The kernel drops the lock
+         on fd close, so crash-safety is free.
+
     File naming is safe because `owner`/`repo` come from the GitHub
     webhook payload (controlled) and `pr_number` is an integer — we
     still pass the components through a conservative regex to catch
@@ -672,20 +712,25 @@ def _per_pr_lock(owner: str, repo: str, pr_number: int):
     lock_path = os.path.join(
         _PER_PR_LOCK_DIR, f"{safe_owner}_{safe_repo}_{safe_pr}.lock",
     )
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    thread_lock = _get_thread_lock(owner, repo, safe_pr)
+    thread_lock.acquire()
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError as e:
+                if e.errno != errno.EBADF:
+                    raise
     finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            os.close(fd)
-        except OSError as e:
-            if e.errno != errno.EBADF:
-                raise
+        thread_lock.release()
 
 
 @contextmanager

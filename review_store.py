@@ -86,6 +86,38 @@ def _validate_repo_slug(repo_slug: str) -> None:
         raise ValueError(f"invalid repo slug: {repo_slug!r}")
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    """Write `content` to `path` via a sibling tempfile + `os.replace`.
+
+    A naked `path.write_text(content)` is not atomic: a crash mid-write
+    (or a full disk) leaves a zero-byte or partially-written file that
+    parses as corrupt frontmatter and causes `get_review` to return
+    None — the review is effectively lost.
+
+    This borrows the pattern `mark_merged` already uses so the two
+    write paths have identical crash semantics. The tempfile is created
+    in the same directory as `path` so `os.replace` is guaranteed to be
+    a same-filesystem rename.
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(parent),
+    )
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def _repo_dir(repo_slug: str) -> Path:
     _validate_repo_slug(repo_slug)
     return Path(STORE_ROOT) / repo_slug
@@ -151,7 +183,11 @@ def save_review(
 
     frontmatter = json.dumps(meta, indent=2)
     content = f"---\n{frontmatter}\n---\n{body or ''}"
-    out_path.write_text(content)
+    # Atomic write via sibling tempfile + `os.replace`. A naked
+    # `write_text` is not atomic — a crash mid-write yields a
+    # zero-byte or partial file that `get_review` treats as missing,
+    # losing the review. Use the same pattern `mark_merged` uses.
+    _atomic_write(out_path, content)
     return out_path
 
 
@@ -317,23 +353,9 @@ def mark_merged(
     frontmatter = json.dumps(meta, indent=2)
     new_content = f"---\n{frontmatter}\n---\n{existing.body}"
 
-    # Atomic write via mkstemp sibling — same pattern as review_memory.save.
-    target_dir = str(target.parent)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-        dir=target_dir,
-    )
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(new_content)
-        os.replace(tmp_path, target)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    # Atomic write via the shared `_atomic_write` helper — same pattern
+    # as `save_review`, mirroring `review_memory.save`'s crash semantics.
+    _atomic_write(target, new_content)
 
     return target
 

@@ -682,3 +682,80 @@ def test_release_pr_branch_falls_back_to_pending_when_version_unknown(tmp_path, 
     branch = created.get("branch") or ""
     assert branch.startswith("seneschal/release-pending-")
     assert "next" not in branch
+
+
+# --------------------------------------------------------------------------
+# B3: Symlink traversal guard — `_read_local_changelog` and `_current_version`
+# must refuse to read through symlinks pointing outside the repo tree.
+# --------------------------------------------------------------------------
+
+
+def test_read_local_changelog_refuses_symlink_outside_repo(tmp_path):
+    """Attacker commits `CHANGELOG.md` as a symlink to a host file
+    (e.g. ~/seneschal/ch-code-reviewer.pem). Without a guard, the
+    orchestrator would read the pem's contents and `put_file` them
+    back into the repo, exfiltrating the App's private key.
+
+    The safe helper must return empty string on such a symlink AND log
+    the refusal so operators can notice the attempt."""
+    from post_merge.orchestrator import _read_local_changelog
+
+    # Set up: a repo directory containing CHANGELOG.md → /etc/passwd.
+    repo_dir = tmp_path / "clone"
+    repo_dir.mkdir()
+    # Target is outside the repo. Use tmp_path (which is outside repo_dir)
+    # so the test doesn't depend on /etc/passwd existing & readable.
+    outside = tmp_path / "secret.txt"
+    outside.write_text("SUPER SECRET HOST CONTENT")
+    (repo_dir / "CHANGELOG.md").symlink_to(outside)
+
+    content = _read_local_changelog(str(repo_dir), "CHANGELOG.md")
+    assert "SUPER SECRET" not in content
+    assert content == ""
+
+
+def test_read_local_changelog_accepts_regular_file(tmp_path):
+    """Sanity: the guard must NOT break the happy path where
+    CHANGELOG.md is a regular file inside the repo."""
+    from post_merge.orchestrator import _read_local_changelog
+
+    repo_dir = tmp_path / "clone"
+    repo_dir.mkdir()
+    (repo_dir / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
+
+    content = _read_local_changelog(str(repo_dir), "CHANGELOG.md")
+    assert "# Changelog" in content
+    assert "Unreleased" in content
+
+
+def test_current_version_refuses_symlink_outside_repo(tmp_path):
+    """Analogous to the changelog case: `_current_version` reads
+    pyproject.toml / package.json / VERSION. A symlink on any of those
+    pointing outside the repo must be refused. Narrower exfil (the
+    regex only matches a version string), but still a traversal."""
+    from post_merge.orchestrator import _current_version
+
+    repo_dir = tmp_path / "clone"
+    repo_dir.mkdir()
+    outside = tmp_path / "host-pyproject.toml"
+    outside.write_text('[project]\nversion = "99.99.99"\n')
+    (repo_dir / "pyproject.toml").symlink_to(outside)
+
+    # Fallback: no other version source present, so if the symlink had
+    # been followed we'd get "99.99.99". With the guard, we get None.
+    result = _current_version(str(repo_dir))
+    assert result != "99.99.99"
+
+
+def test_safe_open_in_repo_blocks_absolute_outside_path(tmp_path):
+    """Even without a symlink: if the `rel_path` itself resolves
+    outside the repo (e.g. `../../etc/passwd`), the helper must refuse."""
+    from post_merge.orchestrator import _safe_open_in_repo
+
+    repo_dir = tmp_path / "clone"
+    repo_dir.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("HOST CONTENT")
+
+    result = _safe_open_in_repo(str(repo_dir), "../outside.txt")
+    assert result is None

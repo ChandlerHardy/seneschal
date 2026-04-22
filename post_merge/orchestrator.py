@@ -12,6 +12,7 @@ caller can log a single line and move on.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -69,16 +70,88 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _read_local_changelog(repo_path: str, changelog_path: str) -> str:
-    """Read CHANGELOG.md from the locally-synced clone. Empty string if missing."""
-    full = os.path.join(repo_path, changelog_path)
-    if not os.path.isfile(full):
-        return ""
+def _safe_open_in_repo(repo_path: str, rel_path: str) -> Optional[str]:
+    """Read `rel_path` from `repo_path`, refusing symlink traversal.
+
+    Attacker vector: a malicious PR commits `CHANGELOG.md` (or any file
+    this module reads) as a symlink pointing at host-sensitive paths
+    like `~/seneschal/ch-code-reviewer.pem` or `/etc/passwd`. Without
+    guarding, `_read_local_changelog` would return that file's contents
+    and `put_file` would write them into the repo where the attacker
+    has view access — a pem-key exfil.
+
+    Defense (belt + suspenders):
+      1. `os.path.realpath` both paths and confirm the resolved file is
+         WITHIN the resolved repo tree via `os.path.commonpath`.
+      2. `os.open(..., O_RDONLY | O_NOFOLLOW)` so the kernel refuses to
+         follow a symlink at read time — closes the TOCTOU window
+         between realpath and open.
+
+    Returns the file contents as a string, or None on any safety
+    violation or I/O error. Logs a warning when traversal is blocked.
+    """
+    if not repo_path or not rel_path:
+        return None
     try:
-        with open(full, "r") as fh:
+        repo_root = os.path.realpath(repo_path)
+    except OSError:
+        return None
+    candidate = os.path.join(repo_path, rel_path)
+    try:
+        resolved = os.path.realpath(candidate)
+    except OSError:
+        return None
+    # commonpath() raises ValueError on mixed drives (Windows) or empty
+    # paths; treat that defensively as "not in the repo tree".
+    try:
+        if os.path.commonpath([resolved, repo_root]) != repo_root:
+            app.log(
+                f"[post_merge] refused to read {rel_path!r} from {repo_path!r}: "
+                f"resolves outside repo tree ({resolved!r})"
+            )
+            return None
+    except ValueError:
+        app.log(
+            f"[post_merge] refused to read {rel_path!r}: "
+            f"path comparison failed (mixed roots)"
+        )
+        return None
+    # O_NOFOLLOW on the FINAL path component: if the target itself is a
+    # symlink (even if its realpath lands inside the repo), refuse. This
+    # closes a TOCTOU window where the file is swapped for a symlink
+    # between the realpath check and the open().
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(candidate, flags)
+    except OSError as e:
+        # ELOOP = symlink loop, or (on O_NOFOLLOW systems) "is a symlink".
+        if e.errno == errno.ELOOP:
+            app.log(
+                f"[post_merge] refused to read {rel_path!r}: "
+                f"final path component is a symlink"
+            )
+        return None
+    try:
+        with os.fdopen(fd, "r") as fh:
             return fh.read()
     except OSError:
+        return None
+
+
+def _read_local_changelog(repo_path: str, changelog_path: str) -> str:
+    """Read CHANGELOG.md from the locally-synced clone. Empty string if missing.
+
+    Wraps `_safe_open_in_repo` so a malicious symlink at `CHANGELOG.md`
+    pointing outside the repo tree cannot exfiltrate host-sensitive
+    contents into a subsequent `put_file` commit.
+    """
+    if not repo_path:
         return ""
+    full = os.path.join(repo_path, changelog_path)
+    if not os.path.exists(full) and not os.path.islink(full):
+        return ""
+    content = _safe_open_in_repo(repo_path, changelog_path)
+    return content or ""
 
 
 # --------------------------------------------------------------------------
@@ -450,38 +523,36 @@ def _current_version(repo_path: str) -> Optional[str]:
       4. `git describe --tags --abbrev=0`
 
     Returns None if none of those yield a value that parses as semver.
+
+    All file reads go through `_safe_open_in_repo` so a malicious
+    symlink at any of these paths pointing outside the repo tree is
+    refused (see `_safe_open_in_repo` docstring).
     """
+    if not repo_path:
+        return None
     # 1. pyproject.toml
-    py = os.path.join(repo_path, "pyproject.toml")
-    if os.path.isfile(py):
-        try:
-            with open(py, "r") as fh:
-                m = _PYPROJECT_VERSION_RE.search(fh.read())
-                if m:
-                    return m.group(1).strip()
-        except OSError:
-            pass
+    py_content = _safe_open_in_repo(repo_path, "pyproject.toml")
+    if py_content:
+        m = _PYPROJECT_VERSION_RE.search(py_content)
+        if m:
+            return m.group(1).strip()
     # 2. package.json
-    pkg = os.path.join(repo_path, "package.json")
-    if os.path.isfile(pkg):
+    pkg_content = _safe_open_in_repo(repo_path, "package.json")
+    if pkg_content:
         try:
-            with open(pkg, "r") as fh:
-                data = json.load(fh)
+            data = json.loads(pkg_content)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
             ver = data.get("version")
             if isinstance(ver, str) and ver.strip():
                 return ver.strip()
-        except (OSError, json.JSONDecodeError):
-            pass
     # 3. VERSION
-    ver_file = os.path.join(repo_path, "VERSION")
-    if os.path.isfile(ver_file):
-        try:
-            with open(ver_file, "r") as fh:
-                ver = fh.read().strip()
-            if ver:
-                return ver
-        except OSError:
-            pass
+    ver_content = _safe_open_in_repo(repo_path, "VERSION")
+    if ver_content:
+        ver = ver_content.strip()
+        if ver:
+            return ver
     # 4. git describe
     try:
         proc = subprocess.run(

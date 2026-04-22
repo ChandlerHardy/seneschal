@@ -321,3 +321,81 @@ def test_review_record_defaults_followups_titles_to_empty_list():
         body="",
     )
     assert rec.followups_filed_titles == []
+
+
+# --------------------------------------------------------------------------
+# B4: atomic save_review — a crash mid-write must not corrupt the file.
+# --------------------------------------------------------------------------
+
+
+def test_save_review_is_atomic_via_tempfile(tmp_path, monkeypatch):
+    """`save_review` must use a sibling tempfile + `os.replace` pattern,
+    not `path.write_text(content)` directly. The guarantee: if the write
+    fails mid-flight, the original file (if any) is untouched — a
+    half-written frontmatter would cause `get_review` to return None and
+    silently lose the review.
+
+    Simulates a crash by patching the internal atomic-write helper to
+    raise after creating the tempfile but before os.replace. The
+    existing review file on disk must be unchanged."""
+    import review_store as rs
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    # Seed: a known-good existing review.
+    save_review("a/b", 7, "APPROVE", "https://x/7", "ORIGINAL BODY")
+    orig_rec = get_review("a/b", 7)
+    assert orig_rec is not None
+    assert "ORIGINAL" in orig_rec.body
+
+    # Force _atomic_write to raise by patching os.replace to fail.
+    orig_replace = os.replace
+
+    def _fail_replace(*args, **kwargs):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "replace", _fail_replace)
+
+    import pytest
+    with pytest.raises(OSError):
+        save_review("a/b", 7, "REQUEST_CHANGES", "https://x/7", "CORRUPT ATTEMPT")
+
+    # Restore replace so get_review / teardown works.
+    monkeypatch.setattr(os, "replace", orig_replace)
+
+    # Original file must still be intact.
+    rec = get_review("a/b", 7)
+    assert rec is not None
+    assert rec.verdict == "APPROVE"
+    assert "ORIGINAL" in rec.body
+    assert "CORRUPT" not in rec.body
+
+    # No tempfile leakage in the review dir.
+    review_dir = tmp_path / "a" / "b"
+    leftovers = [p for p in review_dir.iterdir() if p.name.startswith(".") and p.name.endswith(".tmp")]
+    assert leftovers == []
+
+
+def test_save_review_cleans_up_tempfile_on_error(tmp_path, monkeypatch):
+    """If the atomic-write raises, the tempfile must be cleaned up so
+    the reviews directory doesn't accumulate `.N.md.*.tmp` cruft."""
+    import review_store as rs
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    # Force os.replace to fail.
+    def _fail_replace(*args, **kwargs):
+        raise OSError("nope")
+
+    monkeypatch.setattr(os, "replace", _fail_replace)
+
+    import pytest
+    with pytest.raises(OSError):
+        save_review("a/b", 99, "APPROVE", "", "body")
+
+    review_dir = tmp_path / "a" / "b"
+    if review_dir.exists():
+        leftovers = list(review_dir.iterdir())
+        # Only possibly nothing OR the tempfile was cleaned up.
+        for p in leftovers:
+            assert not p.name.endswith(".tmp"), (
+                f"Tempfile {p} not cleaned up after atomic-write failure"
+            )
