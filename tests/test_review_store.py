@@ -335,9 +335,37 @@ def test_save_review_is_atomic_via_tempfile(tmp_path, monkeypatch):
     half-written frontmatter would cause `get_review` to return None and
     silently lose the review.
 
-    Simulates a crash by patching the internal atomic-write helper to
-    raise after creating the tempfile but before os.replace. The
-    existing review file on disk must be unchanged."""
+    Strategy: directly verify `os.replace` is invoked (the fingerprint
+    of the atomic pattern). A regression to `path.write_text` wouldn't
+    trigger os.replace and the counter stays at 0."""
+    import review_store as rs
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
+
+    replace_calls = {"n": 0}
+    orig_replace = os.replace
+
+    def _counting_replace(src, dst, *args, **kwargs):
+        replace_calls["n"] += 1
+        return orig_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", _counting_replace)
+
+    save_review("a/b", 7, "APPROVE", "https://x/7", "FIRST")
+    assert replace_calls["n"] >= 1, (
+        "save_review did not call os.replace — it's using a non-atomic "
+        "write_text fallback, which loses the original file on crash."
+    )
+
+    # Second save must also go through replace.
+    replace_calls["n"] = 0
+    save_review("a/b", 7, "REQUEST_CHANGES", "https://x/7", "SECOND")
+    assert replace_calls["n"] >= 1
+
+
+def test_save_review_preserves_original_on_replace_failure(tmp_path, monkeypatch):
+    """Complement: when os.replace fails, the PRE-EXISTING file must
+    remain intact (not truncated by a mid-write failure in the new
+    content). This is the actual crash-safety guarantee."""
     import review_store as rs
     monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
 
@@ -346,9 +374,6 @@ def test_save_review_is_atomic_via_tempfile(tmp_path, monkeypatch):
     orig_rec = get_review("a/b", 7)
     assert orig_rec is not None
     assert "ORIGINAL" in orig_rec.body
-
-    # Force _atomic_write to raise by patching os.replace to fail.
-    orig_replace = os.replace
 
     def _fail_replace(*args, **kwargs):
         raise OSError("simulated replace failure")
@@ -359,20 +384,15 @@ def test_save_review_is_atomic_via_tempfile(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         save_review("a/b", 7, "REQUEST_CHANGES", "https://x/7", "CORRUPT ATTEMPT")
 
-    # Restore replace so get_review / teardown works.
-    monkeypatch.setattr(os, "replace", orig_replace)
+    # Un-patch replace so get_review works on intact original file.
+    monkeypatch.undo()
+    monkeypatch.setattr(rs, "STORE_ROOT", str(tmp_path))
 
-    # Original file must still be intact.
     rec = get_review("a/b", 7)
     assert rec is not None
     assert rec.verdict == "APPROVE"
     assert "ORIGINAL" in rec.body
     assert "CORRUPT" not in rec.body
-
-    # No tempfile leakage in the review dir.
-    review_dir = tmp_path / "a" / "b"
-    leftovers = [p for p in review_dir.iterdir() if p.name.startswith(".") and p.name.endswith(".tmp")]
-    assert leftovers == []
 
 
 def test_save_review_cleans_up_tempfile_on_error(tmp_path, monkeypatch):
