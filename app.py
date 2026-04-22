@@ -464,6 +464,7 @@ def review_pr(owner, repo, pr_number, installation_id, head_ref, head_sha):
             memory=memory,
             adrs=adrs,
             ci=ci,
+            head_ref=head_ref,
         )
         log(
             f"Analysis: risk={analysis.risk.level} score={analysis.risk.score}, "
