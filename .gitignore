@@ -16,6 +16,7 @@ venv/
 # Editor / agent state
 .claude/settings.local.json
 .claude/plans/
+.planning/
 
 # Local dev
 /tmp/

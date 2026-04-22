@@ -3,6 +3,8 @@ PyJWT
 requests
 cryptography
 PyYAML
+# Required — the LLM backend uses the official Anthropic SDK.
+anthropic>=0.40.0
 # Optional — only required to run the MCP server (bin/seneschal-mcp-server).
 # The webhook handler itself does not import fastmcp.
 fastmcp>=3

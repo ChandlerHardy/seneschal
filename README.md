@@ -6,9 +6,9 @@
 
 **A self-hosted AI code reviewer that sees more than the diff.**
 
-Runs as a GitHub App on your own infrastructure. Reviews pull requests on demand, files follow-up fixes as commits, and — unlike hosted alternatives — can tap into your repo's decision history, your configured review personas, your CI test results, and your local editor.
+Runs as a GitHub App on your own infrastructure. Reviews pull requests on demand, surfaces risk and test-gap analysis, and — unlike hosted alternatives — can tap into your repo's decision history, your configured review personas, your CI test results, and your local editor.
 
-Uses your own Claude Max subscription via `claude -p` instead of per-token billing.
+**Bring your own Anthropic API key.** Code and reviews stay on your infra.
 
 ---
 
@@ -29,7 +29,7 @@ Most AI code review bots only see the diff. Seneschal sees:
 |---|---|---|---|---|
 | Self-hosted | ✓ | ✗ | ✗ | (runs in GitHub Actions) |
 | Code never leaves your infra | ✓ | ✗ | ✗ | — |
-| Cost model | Your Claude Max plan | Per seat / mo | Per seat / mo | Per-token API |
+| Cost model | Your Anthropic API key (pay-as-you-go) | Per seat / mo | Per seat / mo | Per-token API |
 | Opt-in per-PR trigger | ✓ (`/seneschal review`) | Auto on every PR | Auto | `@claude` mention |
 | Multi-persona review | ✓ (configurable) | ✗ | ✗ | ✗ |
 | CI-test-aware review | ✓ | ✗ | ✗ | ✗ |
@@ -41,8 +41,8 @@ Most AI code review bots only see the diff. Seneschal sees:
 1. You install Seneschal as a GitHub App on your repos (one-time).
 2. Seneschal runs as a long-lived Flask service on your server (systemd + webhook handler).
 3. On a PR, a collaborator comments `/seneschal review`.
-4. The bot clones the PR, pulls CI results from the Checks API, scans for ADRs, runs pre-review static analyzers (risk, scope drift, test gaps, secrets), and invokes `claude -p` with its review prompt.
-5. It posts a formal PR review. If you've enabled auto-fix, it can commit follow-up patches.
+4. The bot clones the PR, pulls CI results from the Checks API, scans for ADRs, runs pre-review static analyzers (risk, scope drift, test gaps, secrets), and invokes the Anthropic Messages API with its review prompt.
+5. It posts a formal PR review.
 6. The review is persisted locally so the MCP server can surface it later.
 
 ## Install
@@ -53,9 +53,11 @@ See [docs/mcp-server.md](docs/mcp-server.md) for the MCP piece. Full self-host g
 2. Create a GitHub App, save its `.pem` and webhook secret to `~/seneschal/`.
 3. Run `./install.sh <host>` to deploy via SSH.
 4. In the systemd unit (`/etc/systemd/system/seneschal.service`), set:
+   - `Environment=ANTHROPIC_API_KEY=sk-ant-...` (required; get one at <https://console.anthropic.com/>)
    - `Environment=SENESCHAL_TRIGGER_AUTHORS=your-github-username`
-   - `Environment=SENESCHAL_AUTOFIX_AUTHORS=your-github-username`
 5. Point the GitHub App's webhook at `http://<your-host>:9100/webhook/seneschal`.
+
+See [docs/backends.md](docs/backends.md) for optional backend configuration (model override, Anthropic-compatible base URL).
 
 ## Configuration
 
@@ -70,7 +72,6 @@ ignore_paths:
   - examples/
 review_style: concise        # concise | thorough | blunt
 full_review: true            # invoke multi-persona review
-auto_fix: false              # let the bot commit follow-up fixes
 
 # Multi-persona review: six builtins plus your own markdown files.
 # Omit `personas:` entirely and all six builtins run.
