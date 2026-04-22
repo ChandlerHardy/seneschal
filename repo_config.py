@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys as _sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -44,6 +45,69 @@ def _sanitize(text: str, max_len: int) -> str:
     text = text.replace("\r", " ").replace("\n", " ")
     text = " ".join(text.split())
     return text[:max_len]
+
+
+# `changelog_path` flows to `app.put_file(path=...)`. A rogue
+# `.seneschal.yml` committing `changelog_path: ../.github/workflows/x.yml`
+# would let anyone with push access redirect Seneschal's auto-commit at
+# a protected workflow file. Keep it confined to repo-relative, forward
+# slashes only, no traversal segments.
+def _safe_changelog_path(path: str) -> Optional[str]:
+    """Return `path` if it's a safe repo-relative file path, else None.
+
+    Rejects:
+      - absolute paths (`/foo`, `C:\\foo`)
+      - backslashes (Windows-style, banned outright)
+      - `..` segments (parent-dir traversal)
+      - empty / whitespace-only strings
+    """
+    if not path or not path.strip():
+        return None
+    if "\\" in path:
+        return None
+    if path.startswith("/"):
+        return None
+    norm = os.path.normpath(path)
+    if norm.startswith("/") or norm == "..":
+        return None
+    # Split on POSIX `/` so we catch `../foo` even after normpath
+    # normalizes it to `../foo` rather than collapsing it.
+    for part in norm.split("/"):
+        if part == "..":
+            return None
+    return norm
+
+
+# `release_base_branch` lands in the `base` field of a create-pull-request
+# call. A value like `main?admin=1` could be used to tack query params onto
+# the downstream GitHub API URL in the rare future where we interpolate it
+# into a path (e.g. `git/ref/heads/<branch>`). Validate against git's own
+# ref-name rules (the strict subset we need).
+_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9_\-./]+$")
+
+
+def _safe_branch_name(name: str) -> Optional[str]:
+    """Return `name` if it looks like a valid git branch name, else None.
+
+    Applies git's ref-name rules (the strict subset we need):
+      - `[A-Za-z0-9_\\-./]+` only
+      - max 100 chars
+      - no leading/trailing slash or dot
+      - no consecutive dots (`..`)
+    """
+    if not name or not name.strip():
+        return None
+    if len(name) > 100:
+        return None
+    if not _BRANCH_NAME_RE.match(name):
+        return None
+    if name.startswith("/") or name.endswith("/"):
+        return None
+    if name.startswith(".") or name.endswith("."):
+        return None
+    if ".." in name:
+        return None
+    return name
 
 
 @dataclass
@@ -165,9 +229,31 @@ def parse_config(raw: str) -> RepoConfig:
         if isinstance(pm_raw.get("changelog"), bool):
             pm.changelog = pm_raw["changelog"]
         if isinstance(pm_raw.get("changelog_path"), str) and pm_raw["changelog_path"].strip():
-            pm.changelog_path = _sanitize(pm_raw["changelog_path"], 200)
+            candidate = _sanitize(pm_raw["changelog_path"], 200)
+            safe = _safe_changelog_path(candidate)
+            if safe is not None:
+                pm.changelog_path = safe
+            else:
+                # Reject + fall back to default. `print` rather than `log`
+                # because repo_config is imported from contexts (the MCP
+                # server) that don't wire `app.log`.
+                print(
+                    f"[seneschal] rejecting unsafe changelog_path {pm_raw['changelog_path']!r}; "
+                    f"falling back to default {pm.changelog_path!r}",
+                    file=_sys.stderr,
+                )
         if isinstance(pm_raw.get("release_base_branch"), str) and pm_raw["release_base_branch"].strip():
-            pm.release_base_branch = _sanitize(pm_raw["release_base_branch"], 100)
+            candidate = _sanitize(pm_raw["release_base_branch"], 100)
+            safe = _safe_branch_name(candidate)
+            if safe is not None:
+                pm.release_base_branch = safe
+            else:
+                print(
+                    f"[seneschal] rejecting unsafe release_base_branch "
+                    f"{pm_raw['release_base_branch']!r}; falling back to "
+                    f"default {pm.release_base_branch!r}",
+                    file=_sys.stderr,
+                )
         if pm_raw.get("release_threshold") in {"patch", "minor", "major"}:
             pm.release_threshold = pm_raw["release_threshold"]
         if isinstance(pm_raw.get("release_pr_draft"), bool):

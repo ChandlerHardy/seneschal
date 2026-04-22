@@ -196,3 +196,63 @@ def test_post_merge_block_invalid_type_ignored():
     cfg = parse_config(raw)
     # Falls back to defaults silently.
     assert cfg.post_merge.changelog is False
+
+
+# --------------------------------------------------------------------------
+# Path-traversal + branch-name rejection (security)
+# --------------------------------------------------------------------------
+
+
+def test_changelog_path_rejects_parent_traversal():
+    raw = "post_merge:\n  changelog_path: ../.github/workflows/attack.yml\n"
+    cfg = parse_config(raw)
+    # Falls back to the default rather than honoring the attacker's value.
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_absolute_path():
+    raw = "post_merge:\n  changelog_path: /etc/passwd\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_rejects_backslashes():
+    raw = "post_merge:\n  changelog_path: 'docs\\\\..\\\\CHANGELOG.md'\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_changelog_path_accepts_nested_subdir():
+    raw = "post_merge:\n  changelog_path: docs/notes/CHANGELOG.md\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "docs/notes/CHANGELOG.md"
+
+
+def test_changelog_path_rejects_mid_path_traversal():
+    raw = "post_merge:\n  changelog_path: docs/../../../etc/passwd\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.changelog_path == "CHANGELOG.md"
+
+
+def test_release_base_branch_rejects_slash_injection():
+    raw = "post_merge:\n  release_base_branch: main?admin=1\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.release_base_branch == "main"
+
+
+def test_release_base_branch_rejects_spaces():
+    raw = "post_merge:\n  release_base_branch: 'main release'\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.release_base_branch == "main"
+
+
+def test_release_base_branch_rejects_dotdot():
+    raw = "post_merge:\n  release_base_branch: 'foo..bar'\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.release_base_branch == "main"
+
+
+def test_release_base_branch_accepts_valid_name():
+    raw = "post_merge:\n  release_base_branch: release/v2.x\n"
+    cfg = parse_config(raw)
+    assert cfg.post_merge.release_base_branch == "release/v2.x"

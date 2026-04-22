@@ -12,7 +12,7 @@ def test_parse_followups_finds_marker():
     body = "Some text\n- [FOLLOWUP] Do the thing\nMore text"
     result = parse_followups(body)
     assert len(result) == 1
-    assert result[0].title == "Do the thing"
+    assert result[0].title == "[seneschal followup] Do the thing"
 
 
 def test_parse_followups_case_insensitive():
@@ -30,7 +30,9 @@ def test_parse_followups_truncates_long_title():
     long_text = "x" * 200
     body = f"- [FOLLOWUP] {long_text}"
     result = parse_followups(body)
-    assert len(result[0].title) == 100
+    # Sanitized title caps at 80 chars of content, plus the
+    # "[seneschal followup] " prefix (21 chars).
+    assert len(result[0].title) == 80 + len("[seneschal followup] ")
 
 
 def test_parse_followups_includes_source_line():
@@ -71,9 +73,33 @@ def test_parse_followups_caps_at_10_with_rollup():
     body = "\n".join(lines)
     result = parse_followups(body)
     assert len(result) == 11  # 10 individual + 1 rollup
-    assert result[10].title == "Additional follow-ups from review"
+    assert result[10].title == "[seneschal followup] Additional follow-ups from review"
     # Rollup should mention the leftover items
     assert "item 10" in result[10].body_excerpt or "item 14" in result[10].body_excerpt
+
+
+def test_parse_followups_sanitizes_mentions_hash_and_prefix():
+    """Reviewer-controlled title must not let attacker fire @-mentions
+    or #-autolink cross-issue links when the followup issue is created."""
+    body = "- [FOLLOWUP] @admin ping #99 <https://phish.example>"
+    result = parse_followups(body)
+    assert len(result) == 1
+    title = result[0].title
+    assert "@" not in title
+    assert "#" not in title
+    assert title.startswith("[seneschal followup] ")
+    # Original words are preserved (without their sigils).
+    assert "admin" in title
+    assert "99" in title
+
+
+def test_parse_followups_sanitizes_control_chars_and_whitespace():
+    body = "- [FOLLOWUP] weird\x00 title   with\tlots  of space"
+    result = parse_followups(body)
+    assert len(result) == 1
+    assert "\x00" not in result[0].title
+    # Whitespace collapsed.
+    assert "  " not in result[0].title.replace("[seneschal followup] ", "")
 
 
 def test_parse_followups_exactly_10_no_rollup():
