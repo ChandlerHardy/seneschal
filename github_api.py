@@ -415,19 +415,58 @@ def find_open_prs_with_label(owner, repo, label, token):
     return out
 
 
+_GET_PR_COMMITS_PAGE_CAP = 10  # 10 pages × 100/page = 1000-commit ceiling
+
+
 def get_pr_commits(owner, repo, pr_number, token):
-    """GET /repos/{owner}/{repo}/pulls/{pr_number}/commits — list of commit dicts."""
+    """GET /repos/{owner}/{repo}/pulls/{pr_number}/commits — list of commit dicts.
+
+    Paginates the standard GitHub way: follow `page=N` until the endpoint
+    returns a short page (< 100 items) or an empty page, then stop.
+    Previously a hard-coded `per_page=100` one-shot silently returned only
+    the first 100 commits — PRs with 101+ commits missed BREAKING CHANGE
+    signals in any commit past #100, which meant the release bump kind
+    was computed against partial data.
+
+    Capped at `_GET_PR_COMMITS_PAGE_CAP` pages (1000 commits) to bound the
+    worst case. PRs with more than 1000 commits are vanishingly rare and
+    usually not legitimate. On cap hit we log a warning and return what
+    we have — better to ship a bounded scan than unbounded I/O.
+    """
+    # Deferred import to avoid a circular dependency with app.py (which
+    # imports from github_api).
+    from app import log
+
     session = _github_session()
-    resp = session.get(
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits",
-        headers={
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github+json",
-        },
-        params={"per_page": 100},
-    )
-    resp.raise_for_status()
-    return resp.json() or []
+    out: List[dict] = []
+    for page in range(1, _GET_PR_COMMITS_PAGE_CAP + 1):
+        resp = session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/commits",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            params={"per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        batch = resp.json() or []
+        if not batch:
+            break
+        out.extend(batch)
+        if len(batch) < 100:
+            break
+    else:
+        # Loop exited via range exhaustion — we fetched the cap + the last
+        # page was full, so there's very likely more. Log truncation so
+        # operators see it in the logs rather than silently mis-detect
+        # breaking changes on the unseen tail.
+        log(
+            f"get_pr_commits: truncated at {_GET_PR_COMMITS_PAGE_CAP} pages "
+            f"({_GET_PR_COMMITS_PAGE_CAP * 100} commits) for "
+            f"{owner}/{repo}#{pr_number}; breaking-change scan may miss "
+            f"signals past this point"
+        )
+    return out
 
 
 def apply_labels(owner, repo, pr_number, labels, token):
