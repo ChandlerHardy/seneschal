@@ -27,12 +27,12 @@ response stays bounded. Repos enumerated via `cross_repo.known_repos`.
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
 from typing import List, Optional
 
 import cross_repo
 from fs_safety import safe_open_in_repo
+from log import log as _neutral_log
 
 
 # Per-repo manifests to probe. Keeping this tuple explicit makes it easy
@@ -63,11 +63,8 @@ class Hit:
 
 
 def _log(msg: str) -> None:
-    try:
-        sys.stderr.write(f"[dependency_grep] {msg}\n")
-        sys.stderr.flush()
-    except OSError:
-        pass
+    """Prefixed wrapper around the neutral stderr logger."""
+    _neutral_log(f"[dependency_grep] {msg}")
 
 
 def _read_manifest(repo_path: str, manifest_name: str) -> Optional[str]:

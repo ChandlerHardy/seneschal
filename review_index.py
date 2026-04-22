@@ -37,7 +37,8 @@ import threading
 from typing import List, Optional
 
 from fs_safety import validate_repo_slug
-from secrets_scan import _PATTERNS as _SECRET_PATTERNS
+from log import log as _neutral_log
+from secrets_scan import redact as _secrets_redact
 
 
 # Schema version. Bump when the SQL schema changes in a way that would make
@@ -62,14 +63,10 @@ _FTS_UNSAFE_RE = re.compile(r'["\\]')
 
 
 def _log(msg: str) -> None:
-    """Stderr logger. Kept local so this module doesn't drag in app.log
-    (which transitively imports Flask). Matches the minimal pattern used
-    by the MCP server itself."""
-    try:
-        sys.stderr.write(f"[review_index] {msg}\n")
-        sys.stderr.flush()
-    except OSError:
-        pass
+    """Stderr logger with the `[review_index]` prefix. Delegates to the
+    neutral `log.log` so every module shares one formatter; the module
+    tag stays local so stderr output remains grep-able."""
+    _neutral_log(f"[review_index] {msg}")
 
 
 def _sanitize_fts_query(q: str) -> str:
@@ -88,20 +85,10 @@ def _sanitize_fts_query(q: str) -> str:
     return f'"{cleaned}"'
 
 
-def _redact_snippet(text: str) -> str:
-    """Scrub any matched secret pattern from a snippet before returning.
-
-    The MCP server is a new egress channel; a reviewer's code block might
-    include a real or example token that we never want to print back to a
-    fresh Claude session. Run every pattern from secrets_scan — the
-    `hardcoded credential assignment` pattern in particular catches
-    `api_key = "..."` style leaks."""
-    if not text:
-        return text
-    out = text
-    for pattern, _kind in _SECRET_PATTERNS:
-        out = pattern.sub("***REDACTED***", out)
-    return out
+# Backward-compat shim: keep the old private name so tests and any
+# out-of-tree callers that imported `_redact_snippet` still work. The
+# canonical implementation now lives in `secrets_scan.redact`.
+_redact_snippet = _secrets_redact
 
 
 def _make_snippet(body: str, query: str) -> str:

@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 from dataclasses import dataclass
 from typing import List, Optional
+
+from log import log as _neutral_log
 
 
 # Capture GitHub origins in both forms seen in `.git/config`:
@@ -59,11 +60,8 @@ class KnownRepo:
 
 
 def _log(msg: str) -> None:
-    try:
-        sys.stderr.write(f"[cross_repo] {msg}\n")
-        sys.stderr.flush()
-    except OSError:
-        pass
+    """Prefixed wrapper around the neutral stderr logger."""
+    _neutral_log(f"[cross_repo] {msg}")
 
 
 def _clear_cache() -> None:

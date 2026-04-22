@@ -51,7 +51,7 @@ from review_store import (  # noqa: E402
     last_review,
     list_reviews,
 )
-from secrets_scan import _PATTERNS as _SECRET_PATTERNS  # noqa: E402
+from secrets_scan import redact as _redact  # noqa: E402
 
 try:
     from fastmcp import FastMCP
@@ -91,12 +91,12 @@ _INDEX: Optional[review_index.Index] = None
 _INDEX_OPEN_LOCK = threading.Lock()
 
 
+from log import log as _neutral_log  # noqa: E402
+
+
 def _log(msg: str) -> None:
-    try:
-        sys.stderr.write(f"[mcp_server] {msg}\n")
-        sys.stderr.flush()
-    except OSError:
-        pass
+    """Prefixed wrapper around the neutral stderr logger."""
+    _neutral_log(f"[mcp_server] {msg}")
 
 
 def _get_index() -> review_index.Index:
@@ -124,18 +124,6 @@ def _get_index() -> review_index.Index:
         # `ensure_synced` leaves `_synced` False on failure so the
         # next call retries — same semantics as before, minus the race.
     return _INDEX
-
-
-def _redact(text: str) -> str:
-    """Belt-and-suspenders redaction for strings that flow into MCP
-    responses from GitHub (issue titles, etc.). `review_index` already
-    scrubs review-body snippets; this catches the GitHub-API egress."""
-    if not text:
-        return text
-    out = text
-    for pattern, _kind in _SECRET_PATTERNS:
-        out = pattern.sub("***REDACTED***", out)
-    return out
 
 
 def _summary_or_none(rec):

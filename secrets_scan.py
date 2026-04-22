@@ -47,6 +47,25 @@ _PATTERNS = [
 ]
 
 
+def redact(text: str) -> str:
+    """Scrub any matched secret pattern from `text`.
+
+    Public API promoted from private `_redact_snippet` / `_redact`
+    duplicates that used to live in `review_index` and the MCP server.
+    Every new egress channel (MCP tool response, GitHub-API
+    passthrough) should run its string content through this once.
+
+    Returns the input untouched when no pattern matches, so this is
+    safe to call on any string.
+    """
+    if not text:
+        return text
+    out = text
+    for pattern, _kind in _PATTERNS:
+        out = pattern.sub("***REDACTED***", out)
+    return out
+
+
 @dataclass
 class SecretHit:
     kind: str

@@ -52,13 +52,15 @@ import jwt
 import requests
 
 from fs_safety import validate_repo_slug
+from log import log as _neutral_log
 
 
-# Public App ID for the `seneschal-cr` GitHub App. Overridable via env so
-# a fork or test instance can inject its own number without patching code.
-# Keeping this as the default rather than eliminating it keeps the CLI
-# usable out-of-the-box on the author's infrastructure.
-_DEFAULT_APP_ID = 3127694
+# Public App ID for the `seneschal-cr` GitHub App. `github_api.APP_ID`
+# is the single source of truth; this module's env-override helper
+# (`_get_app_id`) reads from that when SENESCHAL_APP_ID isn't set.
+# The import is deferred inside `_get_app_id` so the MCP server (which
+# imports seneschal_token) doesn't need to load github_api's Flask
+# dependencies just to mint tokens.
 _DEFAULT_PEM_PATH = os.path.expanduser("~/seneschal/ch-code-reviewer.pem")
 
 # GitHub installation tokens expire at 60 min. Cache for 50 min to leave
@@ -89,11 +91,8 @@ class AppNotInstalledError(RuntimeError):
 
 
 def _log(msg: str) -> None:
-    try:
-        sys.stderr.write(f"[seneschal_token] {msg}\n")
-        sys.stderr.flush()
-    except OSError:
-        pass
+    """Prefixed wrapper around the neutral stderr logger."""
+    _neutral_log(f"[seneschal_token] {msg}")
 
 
 def _clear_cache() -> None:
@@ -102,15 +101,39 @@ def _clear_cache() -> None:
 
 
 def _get_app_id() -> int:
-    """Resolve the App ID from env, falling back to the default."""
+    """Resolve the App ID from env, falling back to github_api.APP_ID.
+
+    `github_api.APP_ID` is the single source of truth for the default
+    Seneschal App ID. This function lets operators override with
+    `SENESCHAL_APP_ID` (for forks, test instances, or staging) without
+    patching code. Deferred import of github_api to keep this module
+    safe to import before github_api's heavier deps load.
+    """
+    # Deferred import: `github_api` carries requests/urllib3 and the
+    # PR-analysis modules. The MCP server imports `seneschal_token`
+    # eagerly at module-load time; deferring this keeps the import
+    # surface minimal until a token actually gets minted.
+    from github_api import APP_ID as _GITHUB_API_APP_ID
+    default_app_id = _GITHUB_API_APP_ID
+
     raw = os.environ.get("SENESCHAL_APP_ID")
     if not raw:
-        return _DEFAULT_APP_ID
+        return default_app_id
     try:
         return int(raw)
     except (TypeError, ValueError):
-        _log(f"ignoring invalid SENESCHAL_APP_ID={raw!r}; using default {_DEFAULT_APP_ID}")
-        return _DEFAULT_APP_ID
+        _log(f"ignoring invalid SENESCHAL_APP_ID={raw!r}; using default {default_app_id}")
+        return default_app_id
+
+
+# Backward-compat alias — kept because `test_app_id_falls_back_to_default`
+# asserts equivalence to `_DEFAULT_APP_ID`. The constant is resolved at
+# import time from `github_api.APP_ID` so both names point at the same
+# value and tests don't have to juggle two.
+try:
+    from github_api import APP_ID as _DEFAULT_APP_ID  # noqa: E402
+except ImportError:  # pragma: no cover — pre-existing env where app is absent
+    _DEFAULT_APP_ID = 3127694
 
 
 def _get_pem_path() -> str:
