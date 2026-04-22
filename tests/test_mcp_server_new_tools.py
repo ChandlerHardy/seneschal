@@ -245,7 +245,75 @@ def test_followups_breaks_loop_on_rate_limit():
     # The loop must STOP on the first rate-limit response — not call
     # requests.get for every subsequent repo.
     assert get_call_count["n"] == 1
-    assert out == []
+    # Round-3: a rate-limited sweep returns a sentinel as the final
+    # element so the caller can detect the truncation. The sentinel
+    # must be the only result (no real followups landed before the
+    # break since the very first repo rate-limited us).
+    assert len(out) == 1
+    sentinel = out[-1]
+    assert sentinel.get("_truncated") is True
+    assert sentinel.get("_reason") == "rate_limit"
+    assert sentinel.get("_processed_slugs") == 1
+
+
+def test_followups_rate_limit_sentinel_includes_partial_results():
+    """When some repos return real followups before the rate-limit hits,
+    the real results come first and the sentinel is appended last."""
+    import cross_repo
+
+    fake_repos = [
+        cross_repo.KnownRepo(slug="a/one", path="/tmp/a/one"),
+        cross_repo.KnownRepo(slug="a/two", path="/tmp/a/two"),
+        cross_repo.KnownRepo(slug="a/three", path="/tmp/a/three"),
+    ]
+
+    responses = iter(
+        [
+            _issue_response(
+                [
+                    {
+                        "number": 10,
+                        "title": "fix retry",
+                        "state": "open",
+                        "html_url": "https://x/10",
+                    },
+                ]
+            ),
+            _issue_response(
+                [
+                    {
+                        "number": 20,
+                        "title": "wire up cache",
+                        "state": "open",
+                        "html_url": "https://x/20",
+                    },
+                ]
+            ),
+            # Third call rate-limits.
+            (lambda: (lambda m: (setattr(m, "status_code", 429), m)[1])(MagicMock()))(),
+        ]
+    )
+
+    def _fake_get(*args, **kwargs):
+        resp = next(responses)
+        # The lambda-built rate-limit response doesn't carry json/raise_for_status;
+        # real code only inspects status_code for 403/429 before raising.
+        return resp
+
+    with patch.object(cross_repo, "known_repos", return_value=fake_repos), patch.object(
+        seneschal_token, "mint_installation_token", return_value="tok"
+    ), patch("mcp_server.server.requests.get", side_effect=_fake_get):
+        out = server.seneschal_followups()
+
+    # First 2 real results come through, then the sentinel.
+    assert len(out) == 3
+    assert out[0]["number"] == 10
+    assert out[1]["number"] == 20
+    sentinel = out[-1]
+    assert sentinel.get("_truncated") is True
+    assert sentinel.get("_reason") == "rate_limit"
+    # 3 slugs were touched before the break (two succeeded, third triggered).
+    assert sentinel.get("_processed_slugs") == 3
 
 
 def test_followups_rejects_invalid_repo_slug():
@@ -294,6 +362,98 @@ def test_dependency_usage_respects_limit():
         scan.return_value = []
         server.seneschal_dependency_usage("foo", limit=7)
     assert scan.call_args.kwargs.get("limit") == 7
+
+
+# --------------------------------------------------------------------------
+# Round-3: unified error shapes for P0 tools.
+# --------------------------------------------------------------------------
+
+
+def test_p0_tools_return_unified_error_shape_on_bad_slug():
+    """Round-3 warnings #10-14: P0 tools used to return either
+    `{"error": str(e)}` (no prefix) or `f"(error) {e}"` (string, not
+    dict). The unified contract is now `{"error": "<tool> failed: ..."}`
+    for single-dict tools and `[{"error": "<tool> failed: ..."}]` for
+    list-returning tools — matching the P2 tool shape so callers can
+    detect errors with one check across all 9 tools.
+    """
+    # seneschal_last_review — dict-returning.
+    out = server.seneschal_last_review("not-a-slug")
+    assert isinstance(out, dict)
+    assert "error" in out
+    assert out["error"].startswith("seneschal_last_review failed: ")
+
+    # seneschal_review_history — list-returning.
+    out = server.seneschal_review_history("not-a-slug")
+    assert isinstance(out, list) and len(out) == 1
+    assert out[0]["error"].startswith("seneschal_review_history failed: ")
+
+    # seneschal_review_text — dict-returning.
+    out = server.seneschal_review_text("not-a-slug", 1)
+    assert isinstance(out, dict)
+    assert out["error"].startswith("seneschal_review_text failed: ")
+
+    # seneschal_repo_memory — dict-returning (was string-returning pre-round3).
+    out = server.seneschal_repo_memory("not-a-slug", "/tmp")
+    assert isinstance(out, dict)
+    assert out["error"].startswith("seneschal_repo_memory failed: ")
+
+
+def test_p0_tools_scrub_internal_exceptions():
+    """Every P0 tool catches non-ValueError exceptions and routes them
+    through `_error_dict`/`_error_list` with a fixed-shape "internal
+    error; see server logs" message — so a stray OSError from
+    review_store that embeds a token or local path can't leak through
+    the MCP response channel."""
+    sensitive_msg = "boom ghs_SENSITIVE_TOKEN_XYZ /home/user/.secret"
+
+    # last_review
+    with patch("mcp_server.server.last_review", side_effect=RuntimeError(sensitive_msg)):
+        out = server.seneschal_last_review("owner/repo")
+    assert "SENSITIVE" not in out.get("error", "")
+    assert "seneschal_last_review" in out.get("error", "")
+
+    # review_history
+    with patch("mcp_server.server.list_reviews", side_effect=RuntimeError(sensitive_msg)):
+        out = server.seneschal_review_history("owner/repo")
+    assert len(out) == 1
+    assert "SENSITIVE" not in out[0].get("error", "")
+    assert "seneschal_review_history" in out[0].get("error", "")
+
+    # review_text
+    with patch("mcp_server.server.get_review", side_effect=RuntimeError(sensitive_msg)):
+        out = server.seneschal_review_text("owner/repo", 1)
+    assert "SENSITIVE" not in out.get("error", "")
+    assert "seneschal_review_text" in out.get("error", "")
+
+    # repo_memory
+    with patch("mcp_server.server.get_repo_memory", side_effect=RuntimeError(sensitive_msg)):
+        out = server.seneschal_repo_memory("owner/repo", "/tmp")
+    assert "SENSITIVE" not in out.get("error", "")
+    assert "seneschal_repo_memory" in out.get("error", "")
+
+
+def test_seneschal_repo_memory_returns_content_dict_on_success(tmp_path):
+    """The shape flip from `str` → `{"content": str}` is the one
+    user-visible change; pin it explicitly so a future regression that
+    unwraps the dict gets caught."""
+    (tmp_path / ".seneschal-memory.md").write_text("# Rules\nUse tabs")
+    out = server.seneschal_repo_memory("owner/repo", str(tmp_path))
+    assert isinstance(out, dict)
+    assert out.get("content") == "# Rules\nUse tabs"
+    assert "error" not in out
+
+
+def test_seneschal_review_history_default_limit_matches_constant():
+    """Round-3 warning #12: the MCP server's `seneschal_review_history`
+    used to default to 10; P2 tools defaulted to DEFAULT_SEARCH_LIMIT
+    or DEFAULT_LIST_LIMIT. The P0 list tool now uses DEFAULT_LIST_LIMIT
+    so defaults line up across the MCP surface."""
+    import inspect
+
+    sig = inspect.signature(server.seneschal_review_history)
+    default = sig.parameters["limit"].default
+    assert default == server.DEFAULT_LIST_LIMIT
 
 
 # --------------------------------------------------------------------------

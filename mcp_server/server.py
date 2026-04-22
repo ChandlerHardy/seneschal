@@ -159,7 +159,13 @@ def _summary_or_none(rec):
 
 
 # --------------------------------------------------------------------------
-# P0 tools — single-repo review history (unchanged).
+# P0 tools — single-repo review history.
+#
+# Error contract (round 3): every P0 tool routes exceptions through
+# `_error_dict`/`_error_list` so all 9 MCP tools share one payload shape.
+# ValueError detail is safe to echo (our own validate_repo_slug output);
+# any other exception is scrubbed to "internal error; see server logs"
+# to avoid leaking tokens or local paths through the response channel.
 # --------------------------------------------------------------------------
 
 
@@ -172,32 +178,48 @@ def seneschal_last_review(repo: str) -> dict | None:
 
     Returns:
         A dict with keys: repo, pr_number, verdict, timestamp, url. Or
-        None if no reviews have been persisted for that repo.
+        None if no reviews have been persisted for that repo. On a
+        malformed slug, returns `{"error": "seneschal_last_review failed: ..."}`
+        with the validation detail — those strings are caller-facing.
+        On any other exception, returns a scrubbed
+        `{"error": "seneschal_last_review failed: internal error; see server logs"}`
+        so tokens / local paths never leak through the MCP response
+        channel.
     """
     try:
         rec = last_review(repo)
     except ValueError as e:
-        return {"error": str(e)}
+        # Caller-facing validation — echo the detail (safe: comes from our
+        # own validate_repo_slug).
+        return _error_dict("seneschal_last_review", str(e))
+    except Exception as e:  # noqa: BLE001
+        _log(f"seneschal_last_review failed for repo={repo!r}: {e}")
+        return _error_dict("seneschal_last_review", "internal error; see server logs")
     return _summary_or_none(rec)
 
 
 @mcp.tool
-def seneschal_review_history(repo: str, limit: int = 10) -> list[dict]:
+def seneschal_review_history(repo: str, limit: int = DEFAULT_LIST_LIMIT) -> list[dict]:
     """Return up to `limit` most-recent review summaries for `repo`, newest first.
 
     Args:
         repo: GitHub repo slug in "owner/name" form.
-        limit: Max number of reviews to return. Default 10, max 100.
+        limit: Max number of reviews to return. Default 50, clamped to
+            `MAX_LIMIT=200`.
 
     Returns:
         List of summary dicts (same shape as seneschal_last_review), or
         an empty list if the repo has no persisted reviews. If `repo` is
-        malformed, returns a one-element list with an error payload.
+        malformed, returns a one-element list with an error payload
+        using the unified `"<tool> failed: ..."` shape.
     """
     try:
         recs = list_reviews(repo, limit=min(max(1, int(limit)), MAX_LIMIT))
     except ValueError as e:
-        return [{"error": str(e)}]
+        return _error_list("seneschal_review_history", str(e))
+    except Exception as e:  # noqa: BLE001
+        _log(f"seneschal_review_history failed for repo={repo!r}: {e}")
+        return _error_list("seneschal_review_history", "internal error; see server logs")
     return [r.summary() for r in recs]
 
 
@@ -211,12 +233,17 @@ def seneschal_review_text(repo: str, pr_number: int) -> dict | None:
 
     Returns:
         A dict with keys: summary (metadata dict) and body (markdown).
-        None if that PR has no persisted review.
+        None if that PR has no persisted review. Error payloads use
+        the unified `{"error": "<tool> failed: ..."}` shape — internal
+        exceptions are scrubbed so secrets in error strings never leak.
     """
     try:
         rec = get_review(repo, int(pr_number))
     except (ValueError, TypeError) as e:
-        return {"error": str(e)}
+        return _error_dict("seneschal_review_text", str(e))
+    except Exception as e:  # noqa: BLE001
+        _log(f"seneschal_review_text failed for repo={repo!r} pr={pr_number!r}: {e}")
+        return _error_dict("seneschal_review_text", "internal error; see server logs")
     if rec is None:
         return None
     # Redact the body before returning — a reviewer's code block could
@@ -228,23 +255,35 @@ def seneschal_review_text(repo: str, pr_number: int) -> dict | None:
 
 
 @mcp.tool
-def seneschal_repo_memory(repo: str, repo_root: str) -> str:
+def seneschal_repo_memory(repo: str, repo_root: str) -> dict:
     """Return the curated review-memory markdown from a repo's working tree.
 
     Looks for `.seneschal-memory.md` first, then the legacy
-    `.ch-code-reviewer-memory.md`. Returns the file contents as a string,
-    or an empty string if neither file exists or the repo_root doesn't
-    resolve to a directory.
+    `.ch-code-reviewer-memory.md`.
 
     Args:
         repo: GitHub repo slug (used to validate the caller — not used to
             find the file; `repo_root` is the actual path).
         repo_root: Absolute path to the repo's working tree.
+
+    Returns:
+        On success: `{"content": "<markdown>"}` — an empty string under
+        `content` when neither memory file exists or `repo_root` doesn't
+        resolve to a directory.
+        On error: `{"error": "seneschal_repo_memory failed: ..."}` using
+        the unified error-shape contract. Round-3 change from the
+        previous `f"(error) {e}"` string return: every other tool
+        returns a dict, and callers parsing across tools shouldn't have
+        to special-case this one.
     """
     try:
-        return get_repo_memory(repo, repo_root)
+        content = get_repo_memory(repo, repo_root)
     except ValueError as e:
-        return f"(error) {e}"
+        return _error_dict("seneschal_repo_memory", str(e))
+    except Exception as e:  # noqa: BLE001
+        _log(f"seneschal_repo_memory failed for repo={repo!r}: {e}")
+        return _error_dict("seneschal_repo_memory", "internal error; see server logs")
+    return {"content": content}
 
 
 # --------------------------------------------------------------------------
@@ -362,6 +401,13 @@ def seneschal_followups(
 
     Returns:
         List of dicts with keys: repo, number, title, state, url.
+
+        If the sweep is truncated by a GitHub rate-limit (403/429) mid-
+        loop, the final element is a sentinel dict with keys
+        `_truncated=True`, `_reason="rate_limit"`, and `_processed_slugs`
+        (the count of slugs the sweep reached before breaking). Caller
+        can inspect the last element to distinguish "only 3 repos had
+        open followups" from "hit rate limit after repo 3".
     """
     # Validate inputs up-front.
     if repo is not None:
@@ -383,9 +429,12 @@ def seneschal_followups(
             return _error_list("seneschal_followups", "repo enumeration failed; see server logs")
 
     out: list[dict] = []
+    processed_slugs = 0
+    truncated_by_rate_limit = False
     for slug in slugs:
         if len(out) >= limit:
             break
+        processed_slugs += 1
         # Mint a token per-slug. `AppNotInstalledError` → skip quietly.
         try:
             token = seneschal_token.mint_installation_token(slug)
@@ -421,11 +470,15 @@ def seneschal_followups(
             # the tokens (and the caller's stdio buffer) on predictable
             # failures. 5 extra lines, stops a real bug observed in the
             # followup-heavy mornings.
+            #
+            # Round-3: flag the truncation so the caller can distinguish
+            # "3 repos had followups" from "hit rate limit after repo 3".
             if resp.status_code in (403, 429):
                 _log(
                     f"seneschal_followups: GitHub returned {resp.status_code} for {slug}; "
                     f"breaking loop to avoid cascading rate-limit failures"
                 )
+                truncated_by_rate_limit = True
                 break
             resp.raise_for_status()
             issues = resp.json()
@@ -451,6 +504,19 @@ def seneschal_followups(
                     "url": str(issue.get("html_url", "")) if isinstance(issue, dict) else "",
                 }
             )
+    # Round-3: if the sweep broke early on a rate-limit, append a sentinel
+    # as the FINAL element so the caller can detect truncation without
+    # having to inspect server logs. The `_`-prefixed keys mark it as
+    # metadata rather than a real followup row — a caller that doesn't
+    # know about the sentinel shape just sees an extra "empty" item.
+    if truncated_by_rate_limit:
+        out.append(
+            {
+                "_truncated": True,
+                "_reason": "rate_limit",
+                "_processed_slugs": processed_slugs,
+            }
+        )
     return out
 
 
