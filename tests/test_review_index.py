@@ -128,15 +128,17 @@ def test_sync_skips_unchanged_files(store, idx, monkeypatch):
     _write_review(store, "a/b", 1, "first body")
     idx.sync_from_markdown(str(store))
 
-    # Patch _parse_review_file to count calls on the second sync.
+    # Patch parse_review_file to count calls on the second sync.
+    # Round-3: promoted from the private `_parse_review_file` name since
+    # review_index now imports it as a public symbol.
     calls = {"n": 0}
-    orig = review_store._parse_review_file
+    orig = review_store.parse_review_file
 
     def _counting(*args, **kwargs):
         calls["n"] += 1
         return orig(*args, **kwargs)
 
-    monkeypatch.setattr(review_store, "_parse_review_file", _counting)
+    monkeypatch.setattr(review_store, "parse_review_file", _counting)
     n = idx.sync_from_markdown(str(store))
     assert n == 0, "unchanged files should not be re-parsed"
     assert calls["n"] == 0
@@ -473,6 +475,37 @@ def test_list_merged_prs_rejects_invalid_since(tmp_path, store, idx):
         idx.list_merged_prs(since="yesterday")
     with pytest.raises(ValueError):
         idx.list_merged_prs(since="not-a-date")
+
+
+def test_list_merged_prs_normalizes_offset_since_to_utc(tmp_path, store, idx):
+    """Round-3 warning #6: stored `merged_at` is always `Z`-suffixed
+    (UTC), and the SQL comparison is lexicographic. An offset-carrying
+    input like `2026-04-22T17:00:00+05:00` sorts BEFORE the equivalent
+    UTC instant (`+` < `Z` lexicographically), so the same instant
+    could land inside or outside the same window depending on the
+    suffix used. `_parse_iso_or_raise` now normalizes every tz-aware
+    input to UTC-Z BEFORE the SQL compare so callers can supply any
+    offset and get consistent semantics."""
+    # Stored merged_at is 12:00 UTC.
+    _write_review(store, "a/b", 1, "body", merged_at="2026-04-22T12:00:00Z")
+    idx.sync_from_markdown(str(store))
+
+    # `+05:00` input representing the same instant (12:00 UTC) should
+    # INCLUDE the stored row. Before the fix, the raw `17:00:00+05:00`
+    # string would sort after `12:00:00Z` on lex compare and exclude it.
+    rows = idx.list_merged_prs(since="2026-04-22T17:00:00+05:00")
+    assert len(rows) == 1, (
+        "offset-input equivalent to stored UTC must be normalized before "
+        "lex compare — same instant must not exclude the stored row"
+    )
+    # A slightly-LATER UTC instant (12:01) must exclude the stored row.
+    rows = idx.list_merged_prs(since="2026-04-22T17:01:00+05:00")
+    assert len(rows) == 0
+
+    # Naive input (no tz) is treated as UTC — earlier naive window
+    # includes the row.
+    rows = idx.list_merged_prs(since="2026-04-22T11:59:59")
+    assert len(rows) == 1
 
 
 def test_search_adrs_returns_snippet_key_not_excerpt(tmp_path, store, idx, monkeypatch):
