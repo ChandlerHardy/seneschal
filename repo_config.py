@@ -51,6 +51,11 @@ _SENSITIVE_PATH_SEGMENTS = SENSITIVE_PATH_SEGMENTS
 MAX_RULE_LEN = 200
 MAX_RULES = 30
 MAX_IGNORE_PATHS = 50
+# Dedicated cap for `standards.branch_name_patterns`. Realistic configs
+# have ~5 entries (one per top-level branch convention); 20 is generous.
+# Kept distinct from MAX_IGNORE_PATHS so changing one list's limit doesn't
+# silently shift the other.
+MAX_BRANCH_PATTERNS = 20
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
@@ -342,7 +347,7 @@ def parse_config(raw: str) -> RepoConfig:
         if isinstance(st_raw.get("branch_name_patterns"), list):
             st.branch_name_patterns = [
                 _sanitize(str(p), MAX_RULE_LEN)
-                for p in st_raw["branch_name_patterns"][:MAX_IGNORE_PATHS]
+                for p in st_raw["branch_name_patterns"][:MAX_BRANCH_PATTERNS]
                 if str(p).strip()
             ]
         # Severity overrides — accept only the four canonical labels.

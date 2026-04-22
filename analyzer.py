@@ -411,11 +411,17 @@ def _branch_name_to_finding(
 ) -> Optional[Finding]:
     if violation is None:
         return None
+    # Compose final detail: `<reason> (ref: <head_ref>)`. The violation
+    # reason no longer embeds head_ref (see BranchNameViolation docstring),
+    # so we splice it here for reviewer context.
+    detail = violation.reason
+    if violation.head_ref:
+        detail = f"Branch `{violation.head_ref}`: {violation.reason}"
     return Finding(
         severity=severity,
         category="branch-name",
         title="Branch name does not match repo convention",
-        detail=violation.reason,
+        detail=detail,
     )
 
 

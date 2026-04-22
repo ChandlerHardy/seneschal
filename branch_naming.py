@@ -4,8 +4,14 @@ Given a PR's head-ref (e.g. `feat/add-widget`) and a list of regex
 patterns from `.seneschal.yml`, returns a `BranchNameViolation` when
 ZERO patterns match. Empty pattern list = feature disabled.
 
-ReDoS mitigation: `re.match` in stdlib does not accept a timeout
-parameter, so we rely on defense-in-depth:
+Matching uses `re.fullmatch` — patterns must describe the ENTIRE head
+ref, not just a prefix. `^feat/add` would otherwise match
+`feat/addendum-sneaky-branch`, which is almost never what operators
+want. If a prefix-only match is intended the pattern can be explicit
+(e.g. `^feat/.*`).
+
+ReDoS mitigation: `re.match` / `re.fullmatch` in stdlib do not accept
+a timeout parameter, so we rely on defense-in-depth:
  - Patterns are truncated to ~200 chars by `repo_config._sanitize`
    during config parse.
  - `.seneschal.yml` is operator-controlled (push access required).
@@ -23,6 +29,14 @@ from typing import List, Optional
 
 @dataclass
 class BranchNameViolation:
+    """Branch-name mismatch context.
+
+    `head_ref` is the offending ref. `reason` explains the mismatch
+    (what patterns were configured); it does NOT embed `head_ref` —
+    the renderer in analyzer.py composes the final message so reviewers
+    see the ref once, not twice.
+    """
+
     head_ref: str
     reason: str
 
@@ -33,14 +47,24 @@ def check_branch_name(
 ) -> Optional[BranchNameViolation]:
     """Return a violation if `head_ref` matches none of the patterns.
 
-    Empty `patterns` list means the feature is OFF — return None.
-    Invalid regex patterns are logged to stderr and skipped.
+    Behavior:
+     - Empty `patterns` list = feature OFF → return None silently.
+     - Patterns configured but `head_ref` is None/empty → return None
+       and emit a stderr warning so the silent no-op is operator-visible.
+     - Invalid regex patterns are logged to stderr and skipped.
+     - All patterns invalid → return None (no wolf-crying on every PR).
     """
     if not patterns:
         return None
-    # Defensive: webhook payloads could conceivably be missing the ref.
-    # Rather than raising, just skip the check.
-    if head_ref is None:
+    # Patterns configured but head_ref is missing — surface the no-op
+    # instead of silently accepting. Webhook payloads SHOULD carry the
+    # ref; a missing ref means the caller upstream is broken.
+    if not head_ref:
+        print(
+            "[seneschal] branch_name_patterns configured but head_ref is "
+            "missing; skipping branch-name check",
+            file=_sys.stderr,
+        )
         return None
 
     compiled: List[re.Pattern] = []
@@ -62,14 +86,17 @@ def check_branch_name(
         return None
 
     for rx in compiled:
-        if rx.match(head_ref):
+        # fullmatch: pattern must describe the ENTIRE ref, not just a
+        # prefix. `^feat/add` rightly refuses to match
+        # `feat/addendum-sneaky-branch`.
+        if rx.fullmatch(head_ref):
             return None
 
     accepted = ", ".join(patterns)
     return BranchNameViolation(
         head_ref=head_ref,
         reason=(
-            f"Branch name `{head_ref}` does not match any configured "
+            f"Branch name does not match any configured "
             f"branch_name_patterns: {accepted}"
         ),
     )

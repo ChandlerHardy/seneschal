@@ -395,7 +395,7 @@ def test_strict_mode_off_preserves_soft_title_finding():
 def test_branch_name_nit_emitted_on_non_matching_ref():
     from repo_config import StandardsConfig
     config = RepoConfig(standards=StandardsConfig(
-        branch_name_patterns=[r"^feat/", r"^fix/"],
+        branch_name_patterns=[r"^feat/.*", r"^fix/.*"],
     ))
     files = [f("src/foo.py")]
     result = analyze_pr(
@@ -417,7 +417,7 @@ def test_branch_name_nit_emitted_on_non_matching_ref():
 def test_branch_name_matching_ref_no_finding():
     from repo_config import StandardsConfig
     config = RepoConfig(standards=StandardsConfig(
-        branch_name_patterns=[r"^feat/", r"^fix/"],
+        branch_name_patterns=[r"^feat/.*", r"^fix/.*"],
     ))
     files = [f("src/foo.py")]
     result = analyze_pr(
