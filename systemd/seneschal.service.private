@@ -1,0 +1,35 @@
+[Unit]
+Description=Seneschal — GitHub App webhook handler for automated PR reviews (PRIVATE FORK, CLI backend)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/seneschal
+ExecStart=/home/ubuntu/seneschal/venv/bin/python /home/ubuntu/seneschal/app.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+# PRIVATE-FORK ONLY: select the CLI backend (wraps `claude -p`).
+# This is the whole reason this file exists. The public `seneschal.service`
+# requires an ANTHROPIC_API_KEY instead; we override that here and route
+# through the authenticated Claude CLI session on this host.
+Environment=SENESCHAL_BACKEND=cli
+
+# Auto-review kill switch. Leave disabled unless the operator explicitly
+# wants webhook-driven automatic reviews (the `/seneschal review` PR
+# comment trigger works either way).
+#Environment=SENESCHAL_AUTOREVIEW=1
+
+# REQUIRED: comma-separated GitHub usernames allowed to trigger reviews
+# via `/seneschal review` PR comments. Empty means no one can trigger.
+Environment=SENESCHAL_TRIGGER_AUTHORS=ChandlerHardy
+
+# SENESCHAL_PORT lets side-by-side deployments pick a different port so
+# a v2 can run on 9101 while v1 keeps serving on 9100 until the GitHub
+# App webhook URL is flipped over.
+#Environment=SENESCHAL_PORT=9100
+
+[Install]
+WantedBy=multi-user.target

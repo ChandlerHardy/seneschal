@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Deploy Seneschal to a remote host (typically an OCI / VPS box).
+# PRIVATE FORK deploy script. Ships backend_cli.py alongside the public
+# files and installs the `seneschal.service.private` systemd unit, which
+# sets SENESCHAL_BACKEND=cli so reviews route through `claude -p` against
+# the operator's own Claude Max session on the target host.
 #
 # Usage:
 #   ./install.sh [host]
 #
 # Default host is "oci" (an SSH config alias). The target box must have:
 #   - Python 3.9+ installed
+#   - The Claude CLI installed and authenticated (run `claude` interactively
+#     once to auth; this fork's CliBackend shells out to `claude -p`)
 #   - An SSH-accessible user with sudo for systemd management
 #   - Port 9100 open (or whatever the Flask app binds to)
 #
@@ -13,9 +18,8 @@
 #   ~/seneschal/ch-code-reviewer.pem     (GitHub App private key, chmod 600)
 #   ~/seneschal/webhook-secret.txt       (GitHub App webhook secret, chmod 600)
 #
-# And edit /etc/systemd/system/seneschal.service to set:
-#   Environment=ANTHROPIC_API_KEY=sk-ant-...
-#   Environment=SENESCHAL_TRIGGER_AUTHORS=your-github-username
+# No ANTHROPIC_API_KEY is required in this mode — the CLI backend uses
+# the already-authenticated Claude session on the host.
 
 set -euo pipefail
 
@@ -35,12 +39,14 @@ ssh "$HOST" "
   fi
 "
 
-# Ship Python sources flat (matches the flat layout of this repo)
+# Ship Python sources flat (matches the flat layout of this repo).
+# `backend_cli.py` is private-fork-only; it's the CLI-backed `Backend`
+# impl the patched `backend.py` factory selects when SENESCHAL_BACKEND=cli.
 for f in app.py analyzer.py risk.py scope.py diff_parser.py test_gaps.py \
          related_prs.py repo_config.py review_memory.py context_loader.py \
          findings.py summary.py title_check.py breaking_changes.py \
          quality_scan.py secrets_scan.py full_review.py seneschal_token.py \
-         backend.py \
+         backend.py backend_cli.py \
          __init__.py requirements.txt; do
   scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
 done
@@ -60,11 +66,14 @@ for f in agents/seneschal-architect.md \
   scp "$REPO_DIR/$f" "${HOST}:~/.claude/$(echo "$f" | sed 's#^#agents/#' 2>/dev/null || echo "$f")"
 done
 
-# Smoke-import so we catch missing deps before systemd starts
-ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token' && echo 'seneschal imports: OK'"
+# Smoke-import so we catch missing deps before systemd starts. Set
+# SENESCHAL_BACKEND=cli for the import check too — otherwise `backend.py`
+# tries to construct ApiBackend, which requires ANTHROPIC_API_KEY.
+ssh "$HOST" "cd ~/seneschal && SENESCHAL_BACKEND=cli ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import backend_cli; import diff_parser; import full_review; import seneschal_token; backend.get_backend()' && echo 'seneschal imports: OK (cli backend)'"
 
-# Install / update the systemd unit
-scp "$REPO_DIR/systemd/seneschal.service" "${HOST}:/tmp/seneschal.service"
+# Install / update the systemd unit — PRIVATE FORK uses the .private unit
+# file, which sets SENESCHAL_BACKEND=cli.
+scp "$REPO_DIR/systemd/seneschal.service.private" "${HOST}:/tmp/seneschal.service"
 ssh "$HOST" "
   sudo cp /tmp/seneschal.service /etc/systemd/system/seneschal.service
   sudo systemctl daemon-reload

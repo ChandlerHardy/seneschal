@@ -248,10 +248,23 @@ def get_backend() -> Backend:
     Tests — and private-fork backends — use `set_backend(...)` to inject
     a different implementation without running the default constructor
     (which would require a live API key).
+
+    PRIVATE-FORK PATCH: respect the `SENESCHAL_BACKEND` env var. When set
+    to `cli`, construct a `CliBackend` (wraps `claude -p`) instead of
+    the default `ApiBackend`. This hook lives only in `seneschal-personal`
+    and is the single diff against the public `backend.py`.
     """
     global _backend_singleton
     if _backend_singleton is None:
-        _backend_singleton = ApiBackend()
+        choice = (os.environ.get("SENESCHAL_BACKEND") or "").strip().lower()
+        if choice == "cli":
+            # Lazy import so the public-repo unit tests don't need backend_cli
+            # on the path. Private fork always ships backend_cli.py via
+            # install.sh.
+            from backend_cli import CliBackend
+            _backend_singleton = CliBackend()
+        else:
+            _backend_singleton = ApiBackend()
     return _backend_singleton
 
 
