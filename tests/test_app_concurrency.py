@@ -383,3 +383,95 @@ def test_post_review_holds_per_pr_lock_during_save(tmp_path, monkeypatch):
     # And the review did get saved.
     rec = review_store.get_review("o/r", 55)
     assert rec is not None
+
+
+# --------------------------------------------------------------------------
+# W3 (round 3): lock filename separator must be collision-free.
+#
+# Previous separator `_` collided: owner `a_b` + repo `c` + pr 1 and
+# owner `a` + repo `b_c` + pr 1 both produce `a_b_c_1.lock`, so the
+# two unrelated PRs falsely serialize across processes. GitHub owner
+# and repo names can't contain `+`, so using `+` as the separator is
+# collision-free.
+# --------------------------------------------------------------------------
+
+
+def test_per_pr_lock_filename_uses_plus_separator(tmp_path, monkeypatch):
+    """The on-disk lockfile must use `+` as the component separator so
+    `owner_with_underscore` + `repo` can't collide with `owner` +
+    `repo_with_underscore` on the same PR number."""
+    monkeypatch.setattr(app, "_PER_PR_LOCK_DIR", str(tmp_path / "locks"))
+
+    # Enter + exit the lock so the file exists on disk.
+    with app._per_pr_lock("owner", "repo", 42):
+        pass
+
+    expected = os.path.join(str(tmp_path / "locks"), "owner+repo+42.lock")
+    assert os.path.exists(expected), (
+        f"Lockfile at unexpected path. Contents of lock dir: "
+        f"{os.listdir(tmp_path / 'locks')}"
+    )
+
+
+def test_per_pr_lock_no_collision_across_similar_slugs(tmp_path, monkeypatch):
+    """`a_b/c` and `a/b_c` at the same PR must produce DIFFERENT lockfiles
+    with the new `+` separator. With the old `_` separator both became
+    `a_b_c_1.lock` and the PRs serialized against each other."""
+    monkeypatch.setattr(app, "_PER_PR_LOCK_DIR", str(tmp_path / "locks"))
+
+    with app._per_pr_lock("a_b", "c", 1):
+        pass
+    with app._per_pr_lock("a", "b_c", 1):
+        pass
+
+    files = set(os.listdir(tmp_path / "locks"))
+    assert "a_b+c+1.lock" in files
+    assert "a+b_c+1.lock" in files
+    assert len(files) == 2, f"Expected 2 distinct lockfiles, got {files}"
+
+
+# --------------------------------------------------------------------------
+# W4 (round 3): _get_thread_lock must coerce pr_number consistently so a
+# string "42" doesn't cross-serialize with int 0.
+# --------------------------------------------------------------------------
+
+
+def test_get_thread_lock_string_pr_does_not_collide_with_zero():
+    """Passing `pr_number="42"` used to fall through the `isinstance(int)`
+    check and key as 0, so "42" and pr 0 shared the SAME threading.Lock
+    (and `"43"`, `"99"`, etc. all shared it). Verify int-vs-string for
+    the same PR now dedupe to the SAME lock, and different string
+    values get different locks."""
+    # Snapshot + restore the shared dict so this test doesn't leak.
+    original = dict(app._PER_PR_THREAD_LOCKS)
+    try:
+        app._PER_PR_THREAD_LOCKS.clear()
+        lock_str_42 = app._get_thread_lock("o", "r", "42")
+        lock_int_42 = app._get_thread_lock("o", "r", 42)
+        lock_str_43 = app._get_thread_lock("o", "r", "43")
+        lock_int_0 = app._get_thread_lock("o", "r", 0)
+
+        # "42" and 42 both coerce to int 42 → same lock.
+        assert lock_str_42 is lock_int_42
+        # "43" coerces to 43 → distinct from 0.
+        assert lock_str_43 is not lock_int_0
+        # 42 and 43 are distinct.
+        assert lock_int_42 is not lock_str_43
+    finally:
+        app._PER_PR_THREAD_LOCKS.clear()
+        app._PER_PR_THREAD_LOCKS.update(original)
+
+
+def test_get_thread_lock_invalid_pr_does_not_cross_serialize_with_zero():
+    """A truly-uncoercible pr_number (None, dict, random object) must
+    NOT key as int 0 — previously the `else 0` fallback caused all
+    invalid values to share a lock with a legitimate PR 0 call."""
+    original = dict(app._PER_PR_THREAD_LOCKS)
+    try:
+        app._PER_PR_THREAD_LOCKS.clear()
+        lock_bad = app._get_thread_lock("o", "r", None)
+        lock_zero = app._get_thread_lock("o", "r", 0)
+        assert lock_bad is not lock_zero
+    finally:
+        app._PER_PR_THREAD_LOCKS.clear()
+        app._PER_PR_THREAD_LOCKS.update(original)

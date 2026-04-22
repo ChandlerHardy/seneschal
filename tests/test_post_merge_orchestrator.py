@@ -892,6 +892,55 @@ def test_amend_release_pr_falls_back_to_snapshot_when_fetch_fails(tmp_path, monk
     assert "stale snapshot" in call.kwargs["message"].lower() or "stale" in call.kwargs["message"].lower()
 
 
+def test_changelog_step_crlf_compare_is_normalized(tmp_path, monkeypatch):
+    """W2 unit-level: the `new_content == existing` skip-check must
+    normalize the raw CRLF `existing` before comparing against the
+    LF-only `new_content` produced by insert_unreleased_entry. We verify
+    the normalization directly by inspecting what gets passed to
+    put_file — the CRLF-origin file should be rewritten as LF (no
+    line-ending churn beyond the new entry itself)."""
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review("o/r", 42, "APPROVE", "https://x/42", "body")
+
+    cfg = _config(changelog=True)
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        clone_dir = tmp_path / "clone"
+        clone_dir.mkdir()
+        # Write CHANGELOG with CRLF line endings (Windows-origin).
+        existing = (
+            "# Changelog\n\n"
+            "## [Unreleased]\n\n"
+            "### Added\n"
+            "- prior entry ([#41](x))\n\n"
+        )
+        (clone_dir / "CHANGELOG.md").write_bytes(
+            existing.replace("\n", "\r\n").encode("utf-8")
+        )
+        mock_app.ensure_repo_synced.return_value = str(clone_dir)
+        mock_app.put_file = MagicMock(return_value={"commit": {"sha": "abc"}})
+        mock_app.get_file_sha = MagicMock(return_value="oldsha")
+
+        handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=42,
+            installation_id=1,
+            pr_meta=_pr_meta(42, "feat: add thing"),
+            config=cfg,
+        )
+
+    # The content written to GitHub must be LF-only (insert produces
+    # LF; compare against normalized existing so the "skip" path is
+    # reachable for future dedupe logic).
+    assert mock_app.put_file.called
+    written = mock_app.put_file.call_args.kwargs.get("content") or ""
+    assert "\r\n" not in written, (
+        "put_file received CRLF content — W2 fix should normalize "
+        "existing to LF on compare + carry LF through the write."
+    )
+
+
 def test_amend_release_pr_uses_fresh_when_fetch_succeeds(tmp_path, monkeypatch):
     """Complement to the snapshot-fallback test: when get_file_content
     returns content, that's what should land on the release branch,
@@ -1088,6 +1137,126 @@ def test_strip_md_images_handles_nested_parens():
     assert _strip_md_images("just text") == "just text"
     # Malformed (unbalanced): return verbatim rather than throwing.
     assert "![alt](http" in _strip_md_images("![alt](http")
+
+
+def test_followups_continue_past_transient_create_issue_failure(tmp_path, monkeypatch):
+    """W6: if create_issue fails for followup #2 (e.g. transient 500),
+    the orchestrator must STILL attempt followup #3 + persist whatever
+    succeeded. Previous behavior was `break` on the first failure,
+    silently dropping all subsequent followups — which was then masked
+    by title-keyed dedupe on retry: the missing ones NEVER got filed
+    because mark_merged had already recorded partial success.
+
+    Here we simulate: 3 followups; #1 succeeds, #2 raises, #3 succeeds.
+    Expected: 2 issues filed, 2 titles persisted.
+    """
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    save_review(
+        "o/r",
+        50,
+        "APPROVE",
+        "https://x/50",
+        "## Review\n\n"
+        "- [FOLLOWUP] first thing\n"
+        "- [FOLLOWUP] second thing\n"
+        "- [FOLLOWUP] third thing\n",
+    )
+
+    cfg = _config(followups=True)
+
+    call_count = {"n": 0}
+
+    def _flaky_create_issue(**kwargs):
+        call_count["n"] += 1
+        # Fail on the second call only.
+        if call_count["n"] == 2:
+            raise RuntimeError("HTTP 500: transient server error")
+        return {"number": 900 + call_count["n"]}
+
+    with patch("post_merge.orchestrator.app") as mock_app:
+        mock_app.get_installation_token.return_value = "tok"
+        mock_app.ensure_repo_synced.return_value = str(tmp_path / "clone")
+        (tmp_path / "clone").mkdir(exist_ok=True)
+        mock_app.create_issue = MagicMock(side_effect=_flaky_create_issue)
+
+        result = handle_pr_merged(
+            owner="o",
+            repo="r",
+            pr_number=50,
+            installation_id=1,
+            pr_meta=_pr_meta(50, "feat: x"),
+            config=cfg,
+        )
+
+    # Three attempts total — one failed, two succeeded.
+    assert mock_app.create_issue.call_count == 3, (
+        f"W6 regression: expected 3 create_issue attempts, got "
+        f"{mock_app.create_issue.call_count}. Loop broke on first failure?"
+    )
+    # Two issue numbers persisted (the successful ones).
+    assert len(result["followups_filed"]) == 2
+    # And review store carries the two successful titles so a retry
+    # dedupes correctly + only re-tries the failed one.
+    rec = review_store.get_review("o/r", 50)
+    assert rec is not None
+    assert len(rec.followups_filed_titles) == 2
+    # The failed title ("second thing") must NOT be in the persisted
+    # titles — that would block the retry from re-filing it.
+    titles_lower = [t.casefold() for t in rec.followups_filed_titles]
+    assert not any("second" in t for t in titles_lower), (
+        f"W6 regression: failed followup was persisted as succeeded: "
+        f"{rec.followups_filed_titles}"
+    )
+
+
+def test_safe_open_in_repo_refuses_intermediate_symlink(tmp_path, monkeypatch):
+    """W5: `_safe_open_in_repo` must refuse when any INTERMEDIATE
+    directory in the path is a symlink. The old code only used
+    O_NOFOLLOW on the final component, so `docs/` → `/etc` combined
+    with reading `docs/CHANGELOG.md` would resolve through the
+    intermediate symlink and our commonpath check could be bypassed
+    on adversarial symlink targets.
+
+    Fix walks each intermediate component with os.lstat and refuses
+    if any is a symlink.
+    """
+    from post_merge.orchestrator import _safe_open_in_repo
+
+    # Set up a fake repo with a symlinked intermediate dir.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Real docs dir with a real changelog — this is what `docs/CHANGELOG.md`
+    # SHOULD point at.
+    real_docs = tmp_path / "elsewhere"
+    real_docs.mkdir()
+    (real_docs / "CHANGELOG.md").write_text("secret content from outside")
+    # Replace `docs` with a symlink to `elsewhere`.
+    os.symlink(str(real_docs), str(repo / "docs"))
+
+    # Attempt to read `docs/CHANGELOG.md` — even though the realpath
+    # resolves inside `tmp_path`, the intermediate `docs/` is a
+    # symlink and must be rejected.
+    result = _safe_open_in_repo(str(repo), "docs/CHANGELOG.md")
+    assert result is None, (
+        "W5 regression: intermediate-symlink was allowed through. "
+        "Returned content: %r" % (result,)
+    )
+
+
+def test_safe_open_in_repo_allows_nested_real_dirs(tmp_path):
+    """Sanity: the intermediate-symlink check must NOT false-positive on
+    ordinary nested directories. `docs/notes/CHANGELOG.md` where every
+    component is a real dir must still read successfully."""
+    from post_merge.orchestrator import _safe_open_in_repo
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "docs").mkdir()
+    (repo / "docs" / "notes").mkdir()
+    (repo / "docs" / "notes" / "CHANGELOG.md").write_text("legit content")
+
+    result = _safe_open_in_repo(str(repo), "docs/notes/CHANGELOG.md")
+    assert result == "legit content"
 
 
 def test_is_already_exists_error_via_response_attribute():

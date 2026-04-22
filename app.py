@@ -716,13 +716,31 @@ _PER_PR_LOCK_DIR = os.path.expanduser("~/.seneschal/locks")
 # the lockfile and each `LOCK_EX` succeeds independently, breaking the
 # concurrency promise. Threading.Lock serializes same-process threads;
 # fcntl serializes cross-process handlers.
-_PER_PR_THREAD_LOCKS: Dict[Tuple[str, str, int], threading.Lock] = {}
+# Key type is `(owner, repo, int_pr_or_sentinel)` — W4 fix allows the
+# PR slot to be the `"__invalid__"` sentinel string when coercion fails.
+_PER_PR_THREAD_LOCKS: Dict[Tuple[str, str, object], threading.Lock] = {}
 _PER_PR_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 def _get_thread_lock(owner: str, repo: str, pr_number: int) -> threading.Lock:
-    """Return the shared threading.Lock for (owner, repo, pr_number)."""
-    key = (str(owner), str(repo), int(pr_number) if isinstance(pr_number, int) else 0)
+    """Return the shared threading.Lock for (owner, repo, pr_number).
+
+    W4: previously `int(pr_number) if isinstance(pr_number, int) else 0`
+    — the else branch collapsed any non-int (including the string
+    `"42"`) to 0, cross-serializing unrelated PRs passed as strings.
+    Match the defensive pattern used by `_per_pr_lock`: `int(pr_number)`
+    unconditionally, letting a genuine TypeError/ValueError bubble up
+    cleanly on truly-invalid input.
+    """
+    try:
+        pr_key = int(pr_number)
+    except (TypeError, ValueError):
+        # Preserve the previous behavior of not raising from inside the
+        # lock-lookup path — but key on a sentinel dict that still
+        # distinguishes "invalid" PRs from "pr #0". Use a string tag so
+        # it can't collide with any real int key.
+        pr_key = "__invalid__"
+    key = (str(owner), str(repo), pr_key)
     with _PER_PR_THREAD_LOCKS_GUARD:
         lock = _PER_PR_THREAD_LOCKS.get(key)
         if lock is None:
@@ -760,8 +778,13 @@ def _per_pr_lock(owner: str, repo: str, pr_number: int):
     except (TypeError, ValueError):
         safe_pr = 0
     os.makedirs(_PER_PR_LOCK_DIR, exist_ok=True)
+    # W3: previously joined components with `_` — owner `a_b` + repo `c`
+    # collides with owner `a` + repo `b_c` on the same PR number. Use
+    # `+` as a separator: GitHub disallows it in both owner and repo
+    # names (letters, digits, `-`, `_`, `.` only), so it can't appear in
+    # the sanitized components and is collision-free by construction.
     lock_path = os.path.join(
-        _PER_PR_LOCK_DIR, f"{safe_owner}_{safe_repo}_{safe_pr}.lock",
+        _PER_PR_LOCK_DIR, f"{safe_owner}+{safe_repo}+{safe_pr}.lock",
     )
     thread_lock = _get_thread_lock(owner, repo, safe_pr)
     thread_lock.acquire()

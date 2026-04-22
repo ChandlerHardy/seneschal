@@ -16,6 +16,7 @@ import errno
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -88,9 +89,15 @@ def _safe_open_in_repo(repo_path: str, rel_path: str) -> Optional[str]:
     Defense (belt + suspenders):
       1. `os.path.realpath` both paths and confirm the resolved file is
          WITHIN the resolved repo tree via `os.path.commonpath`.
-      2. `os.open(..., O_RDONLY | O_NOFOLLOW)` so the kernel refuses to
-         follow a symlink at read time — closes the TOCTOU window
-         between realpath and open.
+      2. `os.lstat` each INTERMEDIATE path component (W5 round 3): the
+         old code only guarded the final path component against being a
+         symlink via `O_NOFOLLOW`, but an attacker could replace an
+         intermediate directory (e.g. `docs/`) with a symlink between
+         realpath and open. We pre-check every component and reject if
+         any is a symlink.
+      3. `os.open(..., O_RDONLY | O_NOFOLLOW)` on the target so the
+         kernel refuses to follow a symlink at read time — closes the
+         TOCTOU window on the final component.
 
     Returns the file contents as a string, or None on any safety
     violation or I/O error. Logs a warning when traversal is blocked.
@@ -121,6 +128,35 @@ def _safe_open_in_repo(repo_path: str, rel_path: str) -> Optional[str]:
             f"path comparison failed (mixed roots)"
         )
         return None
+    # W5: intermediate-component symlink check. `O_NOFOLLOW` only guards
+    # the final component. If the attacker symlinks `docs/` → `/etc`,
+    # then `docs/CHANGELOG.md` would still open `/etc/CHANGELOG.md`
+    # (realpath resolves the intermediate symlink), and our commonpath
+    # check can be bypassed if the symlink target happens to match the
+    # repo-root realpath. Walk each intermediate component with lstat
+    # and refuse if any is a symlink.
+    #
+    # Pragmatic threat model: the attacker has push access but not
+    # host FS write — they stage symlinks via the git tree. A perfect
+    # openat-style traversal would be better but CPython doesn't
+    # expose openat directly; lstat-per-component is good enough.
+    rel_norm = os.path.normpath(rel_path)
+    parts = [p for p in rel_norm.split(os.sep) if p and p != "."]
+    current = repo_path
+    # Walk intermediate dirs (everything except the final component).
+    for intermediate in parts[:-1]:
+        current = os.path.join(current, intermediate)
+        try:
+            st = os.lstat(current)
+        except OSError:
+            # Missing intermediate dir — will fail at open anyway.
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            app.log(
+                f"[post_merge] refused to read {rel_path!r}: "
+                f"intermediate component {intermediate!r} is a symlink"
+            )
+            return None
     # O_NOFOLLOW on the FINAL path component: if the target itself is a
     # symlink (even if its realpath lands inside the repo), refuse. This
     # closes a TOCTOU window where the file is swapped for a symlink
@@ -453,7 +489,13 @@ def _changelog_step(
     entry = changelog_mod.format_unreleased_entry(pr_number, title, pr_url, breaking=breaking)
     existing = _read_local_changelog(repo_path, config.post_merge.changelog_path)
     new_content = changelog_mod.insert_unreleased_entry(existing, entry, kind, breaking=breaking)
-    if new_content == existing:
+    # W2: `insert_unreleased_entry` normalizes CRLF → LF internally and
+    # always returns LF. Comparing against the raw `existing` (which may
+    # carry CRLF from a Windows-origin file) would always be unequal and
+    # trigger a spurious rewrite commit on every merge. Normalize the
+    # RHS before compare so we correctly detect the no-op case.
+    existing_normalized = (existing or "").replace("\r\n", "\n").replace("\r", "\n")
+    if new_content == existing_normalized:
         # Nothing changed — skip the push.
         return (False, None)
 
@@ -533,6 +575,13 @@ def _followups_step(
     pr_url = pr_meta.get("html_url") or f"https://github.com/{owner}/{repo}/pull/{pr_number}"
     new_numbers: List[int] = []
     new_titles: List[str] = []
+    # W6: previously a single transient create_issue failure (500, rate
+    # limit) aborted the whole loop via `break`, so issues N+1..M were
+    # never attempted. Partial persistence + title-keyed dedupe in
+    # mark_merged makes retry safe: continue past individual failures,
+    # persist whatever succeeded, and let a future retry (re-delivery
+    # of the webhook, or a manual re-fire) pick up the missing ones.
+    failures = 0
     for f in needed:
         try:
             body = _sanitize_issue_body(f.body_excerpt, pr_number, pr_url)
@@ -549,8 +598,20 @@ def _followups_step(
                 new_numbers.append(num)
                 new_titles.append(f.title)
         except Exception as e:  # noqa: BLE001
-            app.log(f"[post_merge] create_issue failed on {repo_slug}#{pr_number}: {e!r}")
-            break
+            failures += 1
+            app.log(
+                f"[post_merge] create_issue failed on {repo_slug}#{pr_number} "
+                f"for followup {f.title!r}: {e!r} (continuing; will retry "
+                f"on next delivery)"
+            )
+            continue
+    if failures and not new_numbers:
+        # All attempts failed — log once at a higher level so operators
+        # see the outage rather than one line per issue.
+        app.log(
+            f"[post_merge] ALL {failures} followup(s) failed to file on "
+            f"{repo_slug}#{pr_number}; none were persisted"
+        )
     return (new_numbers, new_titles)
 
 
@@ -828,13 +889,20 @@ def _amend_release_pr(
     # the commit message so reviewers know the amend was built on
     # possibly-stale content rather than a fresh read.
     fresh_fetch_ok = False
-    content_to_write = changelog_content
+    # Normalize snapshot CRLF upfront. `insert_unreleased_entry` emits
+    # LF-only output so the caller's snapshot is already LF — but if
+    # this helper grows another callsite someday, this defends against
+    # accidentally writing CRLF back on a LF branch and producing a
+    # diff that's 100% line-ending noise.
+    content_to_write = (changelog_content or "").replace("\r\n", "\n").replace("\r", "\n")
     try:
         fresh_content, _base_sha = app.get_file_content(
             owner, repo, changelog_path, release_base_branch, token,
         )
         if fresh_content:
-            content_to_write = fresh_content
+            # Same CRLF normalization on fresh content — keeps the
+            # release-branch commit diff free of line-ending churn.
+            content_to_write = fresh_content.replace("\r\n", "\n").replace("\r", "\n")
             fresh_fetch_ok = True
         else:
             # Empty body / 404 → fall back to snapshot.

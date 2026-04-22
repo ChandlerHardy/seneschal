@@ -73,6 +73,80 @@ def test_get_review_handles_corrupt_frontmatter(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# W1 (round 3): locale-agnostic UTF-8 encoding
+#
+# `os.fdopen(fd, "w")` + `path.read_text()` use the process locale. On a
+# `LANG=C` host, writing a review body with emoji/accented characters
+# raised UnicodeEncodeError and the review was lost. Pin UTF-8 on both
+# write and read, and accept a UTF-8 BOM on read so externally-edited
+# files don't parse as corrupt.
+# --------------------------------------------------------------------------
+
+
+def test_save_review_round_trips_unicode(tmp_path, monkeypatch):
+    """Emoji + accented chars must survive save → get without encode
+    errors. Previously `os.fdopen(fd, "w")` inherited the process
+    locale — on `LANG=C` this aborted the write and `get_review`
+    returned None."""
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    body = "review with emoji \U0001F525 and accénts é ñ ü"
+    save_review("a/b", 42, "APPROVE", "https://x/42", body)
+    rec = get_review("a/b", 42)
+    assert rec is not None
+    assert "\U0001F525" in rec.body
+    assert "accénts" in rec.body
+
+
+def test_save_review_unicode_under_c_locale(tmp_path, monkeypatch):
+    """Force the ASCII locale and confirm the save path still uses
+    UTF-8. `open("w")` without an explicit encoding would raise
+    UnicodeEncodeError here; the fix pins `encoding="utf-8"` on the
+    fdopen call."""
+    import locale
+
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    # Snapshot + restore the locale so other tests aren't affected.
+    original = locale.setlocale(locale.LC_ALL)
+    try:
+        try:
+            locale.setlocale(locale.LC_ALL, "C")
+        except locale.Error:
+            # Some platforms reject `C` — fall back to the mock via env.
+            monkeypatch.setenv("LANG", "C")
+            monkeypatch.setenv("LC_ALL", "C")
+        body = "emoji \U0001F525 still works"
+        save_review("a/b", 1, "APPROVE", "", body)
+        rec = get_review("a/b", 1)
+        assert rec is not None
+        assert "\U0001F525" in rec.body
+    finally:
+        try:
+            locale.setlocale(locale.LC_ALL, original)
+        except locale.Error:
+            pass
+
+
+def test_get_review_strips_utf8_bom(tmp_path, monkeypatch):
+    """An externally-edited review file with a UTF-8 BOM at the start
+    of the frontmatter must still parse. Previously the BOM bytes
+    prepended `---\\n{` making the JSON-parse step barf."""
+    monkeypatch.setattr(review_store, "STORE_ROOT", str(tmp_path))
+    d = tmp_path / "a" / "b"
+    d.mkdir(parents=True)
+    # Hand-roll a review file with a BOM byte.
+    frontmatter = (
+        '---\n{\n  "pr_number": 7,\n  "verdict": "APPROVE",\n'
+        '  "timestamp": "2026-04-21T00:00:00Z",\n  "url": ""\n}\n---\n'
+    )
+    body = "body with emoji \U0001F525\n"
+    (d / "7.md").write_bytes("﻿".encode("utf-8") + (frontmatter + body).encode("utf-8"))
+    rec = get_review("a/b", 7)
+    assert rec is not None
+    assert rec.pr_number == 7
+    assert "\U0001F525" in rec.body
+
+
+# --------------------------------------------------------------------------
 # list_reviews
 # --------------------------------------------------------------------------
 

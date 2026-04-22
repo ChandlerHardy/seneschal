@@ -107,7 +107,12 @@ def _atomic_write(path: Path, content: str) -> None:
         dir=str(parent),
     )
     try:
-        with os.fdopen(fd, "w") as fh:
+        # Force UTF-8 regardless of the process locale. `os.fdopen(fd, "w")`
+        # uses `locale.getpreferredencoding()` which is ASCII on bare
+        # `LANG=C` — any emoji/accented character in a review body
+        # (titles often carry them) would raise UnicodeEncodeError and
+        # the review would be lost silently.
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
         os.replace(tmp_path, path)
     except Exception:
@@ -193,8 +198,17 @@ def save_review(
 
 def _parse_review_file(path: Path, repo_slug: str) -> Optional[ReviewRecord]:
     try:
-        raw = path.read_text()
+        # `utf-8-sig` transparently strips a UTF-8 BOM if an external
+        # editor (Windows Notepad, a misconfigured VS Code on Windows)
+        # saved the frontmatter with one; on BOM-less input it behaves
+        # identically to `utf-8`. Forcing the encoding also protects
+        # against locale-driven decode errors on `LANG=C` hosts.
+        raw = path.read_text(encoding="utf-8-sig")
     except OSError:
+        return None
+    except UnicodeDecodeError:
+        # Corrupt encoding — treat as if the file doesn't exist. Caller
+        # gets None and moves on rather than crashing the webhook thread.
         return None
     m = _FRONTMATTER_RE.match(raw)
     if not m:
@@ -372,8 +386,10 @@ def get_repo_memory(repo_slug: str, repo_root: str) -> str:
         p = os.path.join(repo_root, name)
         if os.path.isfile(p):
             try:
-                with open(p, "r") as fh:
+                # Pin UTF-8 (BOM-tolerant) so locale doesn't choke on
+                # non-ASCII rules/context in the memory file.
+                with open(p, "r", encoding="utf-8-sig") as fh:
                     return fh.read()
-            except OSError:
+            except (OSError, UnicodeDecodeError):
                 return ""
     return ""
