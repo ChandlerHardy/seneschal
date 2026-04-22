@@ -47,6 +47,39 @@ _PATTERNS = [
 ]
 
 
+def redact(text):
+    """Scrub any matched secret pattern from `text`.
+
+    Public API promoted from private `_redact_snippet` / `_redact`
+    duplicates that used to live in `review_index` and the MCP server.
+    Every new egress channel (MCP tool response, GitHub-API
+    passthrough) should run its string content through this once.
+
+    Returns the input untouched when no pattern matches, so this is
+    safe to call on any string.
+
+    Round-3: non-str inputs (bytes, int, None, dicts) are returned
+    unchanged instead of crashing. The old falsy short-circuit caught
+    `None`/`""`/`0` but a truthy non-str (`b"sk-ant-..."`, `123`, a
+    dict) fell through to `pattern.sub` which raised `TypeError`.
+    Today all callers pass strings; keeping the defensive check costs
+    one `isinstance` per call and protects future callers who forward
+    `requests.Response.content` (bytes) or cached JSON values without
+    first stringifying.
+    """
+    # Non-str: return unchanged. `pattern.sub` on bytes/int/etc. raises
+    # TypeError — we'd rather silently pass the value through than abort
+    # the whole MCP tool response on a latent type mismatch.
+    if not isinstance(text, str):
+        return text
+    if not text:
+        return text
+    out = text
+    for pattern, _kind in _PATTERNS:
+        out = pattern.sub("***REDACTED***", out)
+    return out
+
+
 @dataclass
 class SecretHit:
     kind: str

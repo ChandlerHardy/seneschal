@@ -22,6 +22,7 @@ Most AI code review bots only see the diff. Seneschal sees:
 | **CI test results** | On webhook, fetches the GitHub Checks API for the PR's head SHA. Failing tests get surfaced to the reviewer, with correlation heuristics flagging which failures likely relate to the changed files. |
 | **ADRs and decision logs** | Discovers your repo's ADRs (`docs/adr/`, `docs/decisions/`, `ADR.md`, etc.) and feeds the ones most relevant to the diff into the review prompt. A reviewer-with-team-history can flag "this re-introduces the pattern rejected in ADR-0042." |
 | **Editor integration** | Ships an optional MCP server. Ask Claude Code "what did Seneschal say about my last PR?" and get a real answer without switching tabs. |
+| **Cross-repo knowledge custody** | Same MCP server surfaces search across every review, ADR, and follow-up issue Seneschal has seen — not just the repo you're currently in. Great for "find every PR I flagged 'migration'" or "which repos use this now-CVE'd package." Stays on your infra; never calls out except to GitHub for issue metadata. |
 
 ## How it compares
 

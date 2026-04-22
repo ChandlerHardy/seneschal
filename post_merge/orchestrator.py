@@ -35,6 +35,14 @@ from post_merge import changelog as changelog_mod  # noqa: E402
 from post_merge import followups as followups_mod  # noqa: E402
 from post_merge import release as release_mod  # noqa: E402
 
+# Size cap for CHANGELOG reads. Matches `dependency_grep._MAX_MANIFEST_BYTES`
+# and `review_store._MAX_MEMORY_BYTES` so every `safe_open_in_repo` caller
+# that reads full file contents shares one threshold. A changelog above
+# 1 MB is pathological (the largest real-world CHANGELOG.md we've seen is
+# ~150 KB); rejecting the read prevents an attacker-planted 500 MB symlink
+# target from OOMing the post-merge thread.
+_MAX_CHANGELOG_BYTES = 1_048_576  # 1 MB
+
 # Process-local cache of which `owner/repo` combinations had `put_file` to
 # main return 403. Entries are (monotonic_seconds, protected_bool). After
 # `_PROTECTED_TTL_SEC` we re-probe — branch protection may have been
@@ -88,6 +96,22 @@ def _read_local_changelog(repo_path: str, changelog_path: str) -> str:
     TOCTOU window between `os.path.exists` and the open.
     """
     if not repo_path:
+        return ""
+    # Size-cap BEFORE the full-file read. `safe_open_in_repo` reads the
+    # entire body into a Python string — a 500 MB attacker-planted
+    # CHANGELOG.md (or a symlink to one) would OOM the webhook thread.
+    # Stat first, reject anything above 1 MB (matches the pattern in
+    # `dependency_grep._read_manifest` + `review_store.get_repo_memory`).
+    abs_path = os.path.join(repo_path, changelog_path)
+    try:
+        st = os.stat(abs_path)
+    except OSError:
+        return ""
+    if st.st_size > _MAX_CHANGELOG_BYTES:
+        app.log(
+            f"[post_merge] refusing to read {changelog_path!r} from {repo_path!r}: "
+            f"size {st.st_size} exceeds cap {_MAX_CHANGELOG_BYTES}"
+        )
         return ""
     content = safe_open_in_repo(repo_path, changelog_path)
     return content or ""

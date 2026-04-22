@@ -108,9 +108,18 @@ def _sanitize_text(text: str) -> str:
 
 
 def _parse_adr_file(abs_path: str, rel_path: str) -> ADR:
-    """Best-effort parse of an ADR markdown file."""
+    """Best-effort parse of an ADR markdown file.
+
+    Pin `encoding="utf-8"` explicitly — plain `open(abs_path, "r")`
+    defaults to `locale.getpreferredencoding()` which resolves to ASCII
+    on `LANG=C` servers. A single non-ASCII char in an ADR (emoji,
+    accent, em-dash) would raise UnicodeDecodeError, which used to
+    propagate into `review_index._sync_adrs_inner` and get silently
+    swallowed — leaving `seen` empty for that repo and triggering an
+    accidental purge of every already-indexed ADR for the same repo.
+    """
     try:
-        with open(abs_path, "r") as fh:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
             content = fh.read()
     except OSError:
         return ADR(id="", title=os.path.basename(rel_path), status="", body="", path=rel_path)

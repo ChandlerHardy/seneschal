@@ -743,6 +743,30 @@ def test_read_local_changelog_accepts_regular_file(tmp_path):
     assert "Unreleased" in content
 
 
+def test_read_local_changelog_rejects_oversized_file(tmp_path, monkeypatch):
+    """Round-3 warning #2: `_read_local_changelog` routed straight through
+    `safe_open_in_repo` (full-file read) with no size cap. A 500 MB
+    attacker-planted CHANGELOG.md or a symlink the symlink-check can't
+    detect (a regular file that happens to be huge) would OOM the
+    webhook thread. Stat-first gate at 1 MB matches the pattern used by
+    `dependency_grep._read_manifest` + `review_store.get_repo_memory`."""
+    from post_merge import orchestrator
+    from post_merge.orchestrator import _read_local_changelog
+
+    # Capture logs to confirm the rejection is surfaced.
+    logged = []
+    monkeypatch.setattr(orchestrator.app, "log", lambda msg: logged.append(msg))
+
+    repo_dir = tmp_path / "clone"
+    repo_dir.mkdir()
+    (repo_dir / "CHANGELOG.md").write_bytes(
+        b"x" * (orchestrator._MAX_CHANGELOG_BYTES + 1)
+    )
+    content = _read_local_changelog(str(repo_dir), "CHANGELOG.md")
+    assert content == ""
+    assert any("exceeds cap" in m for m in logged), logged
+
+
 def test_current_version_refuses_symlink_outside_repo(tmp_path):
     """Analogous to the changelog case: `_current_version` reads
     pyproject.toml / package.json / VERSION. A symlink on any of those

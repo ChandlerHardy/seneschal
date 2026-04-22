@@ -1,22 +1,43 @@
 #!/usr/bin/env python3
 """Mint a Seneschal GitHub App installation token for a given repo.
 
+This module exposes two surfaces:
+
+  - Programmatic: `mint_installation_token(owner_or_slug) -> str`. Called
+    from the MCP server (and any other in-process caller) to obtain a
+    short-lived installation token without shelling out. Uses an in-process
+    TTL cache so a single Python process doesn't hit GitHub's `/app/
+    installations` endpoint on every tool call.
+
+  - CLI: `python3 seneschal_token.py <owner/repo>`. Thin shell over the
+    programmatic API. Prints the token to stdout on success; exits non-zero
+    with a short stderr message on failure.
+
 Usage:
     python3 seneschal_token.py <owner/repo>
 
-Prints the installation token to stdout on success. Exits non-zero with a
-short error to stderr on failure (App not installed on the repo, missing
-PEM, network error). Intended for use in shell pipelines:
+Exit codes (CLI):
+    0 — token minted and printed
+    1 — usage error, bad PEM, network/HTTP failure (TokenMintError)
+    2 — App not installed on the target repo (AppNotInstalledError)
 
+Intended for shell pipelines:
     GH_TOKEN=$(~/seneschal/venv/bin/python ~/seneschal/seneschal_token.py \\
                   ChandlerHardy/foo) \\
       gh issue create --repo ChandlerHardy/foo ...
 
-This helper exists so the heartbeat cron can file issues under
-Seneschal[bot] instead of Chandler's personal account, creating a clear
-separation between the operator and the automation. If the App isn't
-installed on a given repo the helper exits non-zero so the caller can
-fall back to the user's normal gh auth.
+This helper exists so automated jobs can file issues under Seneschal[bot]
+instead of Chandler's personal account. If the App isn't installed on a
+given repo the helper exits 2 so the caller can fall back to the user's
+normal gh auth.
+
+Env overrides:
+  SENESCHAL_APP_ID       — numeric App ID (default: 3127694)
+  SENESCHAL_PEM_PATH     — path to App private key PEM (default: ~/seneschal/ch-code-reviewer.pem)
+  SENESCHAL_GITHUB_TOKEN — if set, `mint_installation_token` returns this
+                           value verbatim (for local/dev use when the App
+                           isn't installed; a PAT with the same scopes is
+                           a valid drop-in).
 """
 
 from __future__ import annotations
@@ -25,31 +46,111 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Tuple
 
 import jwt
 import requests
 
+from fs_safety import validate_repo_slug
+from log import log as _neutral_log
 
+
+# Public App ID for the `seneschal-cr` GitHub App. Source of truth lives
+# HERE (round-3 consolidation): `seneschal_token` is the one module that
+# knows how to sign JWTs + mint installation tokens, so the default ID
+# belongs next to that logic. `github_api` used to also declare APP_ID
+# which forced a bi-directional deferred import between the two modules;
+# promoting this to the single source of truth collapses the cycle —
+# `github_api` no longer needs to know the default at all, and any
+# consumer that needs the value imports it from here.
 APP_ID = 3127694
-PEM_PATH = os.path.expanduser("~/seneschal/ch-code-reviewer.pem")
+
+_DEFAULT_PEM_PATH = os.path.expanduser("~/seneschal/ch-code-reviewer.pem")
+
+# GitHub installation tokens expire at 60 min. Cache for 50 min to leave
+# a 10-min safety margin for in-flight requests that hold a reference.
+_TOKEN_TTL_SECONDS = 50 * 60
+
+# In-process cache: slug -> (token, expires_at_epoch_seconds). Module-level
+# dict is intentional — the MCP server is a single process and we want every
+# tool invocation in that session to share the cache.
+_CACHE: dict = {}
 
 
-def _die(msg: str, code: int = 1) -> None:
-    print(f"seneschal_token: {msg}", file=sys.stderr)
-    sys.exit(code)
+class TokenMintError(RuntimeError):
+    """Raised when the token-minting pipeline fails for a non-404 reason
+    (PEM missing, network failure, non-404 HTTP error). Distinct from
+    AppNotInstalledError so callers can distinguish "should fall back to
+    PAT" (this) from "should skip the repo" (AppNotInstalledError)."""
+
+
+class AppNotInstalledError(RuntimeError):
+    """Raised when GitHub returns 404 on the installation lookup for the
+    given owner/repo. Callers should skip that repo rather than surface
+    the error — the App just isn't installed there."""
+
+    def __init__(self, slug: str):
+        super().__init__(f"Seneschal App not installed on {slug}")
+        self.slug = slug
+
+
+def _log(msg: str) -> None:
+    """Prefixed wrapper around the neutral stderr logger."""
+    _neutral_log(f"[seneschal_token] {msg}")
+
+
+def _clear_cache() -> None:
+    """Reset the in-process token cache. Tests only."""
+    _CACHE.clear()
+
+
+def _get_app_id() -> int:
+    """Resolve the App ID from env, falling back to the module default.
+
+    `APP_ID` at module scope is the single source of truth (round-3:
+    promoted here so `github_api` no longer needs to declare the value
+    and the bi-directional deferred import is gone). This function lets
+    operators override with `SENESCHAL_APP_ID` (for forks, test
+    instances, or staging) without patching code.
+    """
+    raw = os.environ.get("SENESCHAL_APP_ID")
+    if not raw:
+        return APP_ID
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        _log(f"ignoring invalid SENESCHAL_APP_ID={raw!r}; using default {APP_ID}")
+        return APP_ID
+
+
+# Backward-compat alias — the pre-round-3 name was `_DEFAULT_APP_ID`,
+# pulled in via deferred import from `github_api`. After promoting
+# `APP_ID` to module-scope source of truth, both names point at the
+# same value so the existing `test_app_id_falls_back_to_default`
+# assertion keeps working without a rename.
+_DEFAULT_APP_ID = APP_ID
+
+
+def _get_pem_path() -> str:
+    return os.environ.get("SENESCHAL_PEM_PATH", _DEFAULT_PEM_PATH)
 
 
 def _generate_jwt() -> str:
+    """Sign a 9-minute JWT using the GitHub App's PEM."""
+    pem_path = _get_pem_path()
     try:
-        pem = Path(PEM_PATH).read_text()
-    except FileNotFoundError:
-        _die(f"PEM not found at {PEM_PATH}")
+        pem = Path(pem_path).read_text()
+    except FileNotFoundError as e:
+        raise TokenMintError(f"PEM not found at {pem_path}") from e
+    except OSError as e:
+        raise TokenMintError(f"could not read PEM at {pem_path}: {e}") from e
     now = int(time.time())
-    payload = {"iat": now - 60, "exp": now + 540, "iss": str(APP_ID)}
+    payload = {"iat": now - 60, "exp": now + 540, "iss": str(_get_app_id())}
     return jwt.encode(payload, pem, algorithm="RS256")
 
 
 def _installation_id_for_repo(jwt_token: str, owner: str, repo: str) -> int:
+    """Look up the installation ID for the App's install on this repo."""
     resp = requests.get(
         f"https://api.github.com/repos/{owner}/{repo}/installation",
         headers={
@@ -59,7 +160,7 @@ def _installation_id_for_repo(jwt_token: str, owner: str, repo: str) -> int:
         timeout=10,
     )
     if resp.status_code == 404:
-        _die(f"App not installed on {owner}/{repo}", code=2)
+        raise AppNotInstalledError(f"{owner}/{repo}")
     resp.raise_for_status()
     return int(resp.json()["id"])
 
@@ -77,23 +178,105 @@ def _installation_token(jwt_token: str, installation_id: int) -> str:
     return resp.json()["token"]
 
 
-def main(argv: list[str]) -> int:
+def _parse_slug(slug: str) -> Tuple[str, str]:
+    """Validate + split an `owner/repo` slug. Raises ValueError otherwise.
+
+    Delegates to `fs_safety.validate_repo_slug` as the single source of
+    truth for what counts as a safe slug — the earlier bespoke check
+    accepted characters (`?`, `#`, `&`, spaces, newlines) that would
+    then interpolate unescaped into the GitHub API URL at
+    `/repos/{owner}/{repo}/installation`, opening a URL-injection path.
+    """
+    if slug is None:
+        raise ValueError("slug must be in owner/repo form, got None")
+    validate_repo_slug(slug)
+    owner, _, repo = slug.partition("/")
+    return owner, repo
+
+
+def mint_installation_token(owner_or_slug: str) -> str:
+    """Return a valid installation token for `owner_or_slug`.
+
+    Behavior:
+      1. If `SENESCHAL_GITHUB_TOKEN` is set, return that verbatim. Useful
+         for local dev where the App isn't installed; a PAT with the same
+         scopes is a drop-in.
+      2. Check the in-process cache; return if fresh (< 50 min old).
+      3. Otherwise, sign a JWT with the App PEM, look up the installation
+         ID via /repos/<slug>/installation, exchange for an installation
+         token, cache, and return.
+
+    Args:
+      owner_or_slug: `owner/repo` slug. (Org-wide tokens via just `owner`
+        are not supported; GitHub requires an installation ID bound to a
+        specific install, and the install can span the whole org — we
+        still look it up via an example repo in that org.)
+
+    Raises:
+      ValueError: malformed slug.
+      AppNotInstalledError: /repos/<slug>/installation returned 404.
+      TokenMintError: any other failure (PEM missing, network error, 500
+        from GitHub, etc.).
+    """
+    # Validate the slug FIRST — before the PAT short-circuit — so a
+    # malformed slug can never reach the downstream GitHub API call,
+    # whether we're minting via App JWT or handing back a PAT. Previously
+    # the PAT path returned the token before any validation ran, so a
+    # caller with `SENESCHAL_GITHUB_TOKEN` set and any arbitrary string
+    # (including URL-injection payloads) got back a valid token and the
+    # caller's downstream code could then interpolate that untrusted
+    # slug into a request URL.
+    owner, repo = _parse_slug(owner_or_slug)
+    slug = f"{owner}/{repo}"
+
+    # PAT override — one env var beats the whole App dance.
+    pat = os.environ.get("SENESCHAL_GITHUB_TOKEN")
+    if pat:
+        return pat
+
+    # Cache hit?
+    cached = _CACHE.get(slug)
+    if cached is not None:
+        token, expires_at = cached
+        if expires_at > time.time():
+            return token
+        # Expired — fall through to a fresh mint.
+        _CACHE.pop(slug, None)
+
+    try:
+        jwt_token = _generate_jwt()
+        inst_id = _installation_id_for_repo(jwt_token, owner, repo)
+        token = _installation_token(jwt_token, inst_id)
+    except AppNotInstalledError:
+        raise
+    except requests.HTTPError as e:
+        raise TokenMintError(f"GitHub API error for {slug}: {e}") from e
+    except requests.RequestException as e:
+        raise TokenMintError(f"network error for {slug}: {e}") from e
+
+    _CACHE[slug] = (token, time.time() + _TOKEN_TTL_SECONDS)
+    return token
+
+
+def _die(msg: str, code: int = 1) -> None:
+    print(f"seneschal_token: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def main(argv: list) -> int:
+    """CLI entry point. Thin wrapper over `mint_installation_token` with
+    stderr + exit-code mapping preserved from the pre-refactor script."""
     if len(argv) != 2:
         _die("usage: seneschal_token.py <owner/repo>")
     target = argv[1]
-    if "/" not in target:
-        _die("repo must be in owner/repo form")
-    owner, repo = target.split("/", 1)
-
-    jwt_token = _generate_jwt()
     try:
-        inst_id = _installation_id_for_repo(jwt_token, owner, repo)
-        token = _installation_token(jwt_token, inst_id)
-    except requests.HTTPError as e:
-        _die(f"GitHub API error: {e}")
-    except requests.RequestException as e:
-        _die(f"network error: {e}")
-
+        token = mint_installation_token(target)
+    except ValueError as e:
+        _die(str(e), code=1)
+    except AppNotInstalledError as e:
+        _die(str(e), code=2)
+    except TokenMintError as e:
+        _die(str(e), code=1)
     print(token)
     return 0
 

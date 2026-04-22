@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from secrets_scan import SecretHit, scan_diff, summarize_secrets  # noqa: E402
+from secrets_scan import SecretHit, redact, scan_diff, summarize_secrets  # noqa: E402
 
 
 def make_diff(filename, added_lines):
@@ -159,6 +159,29 @@ def test_redacted_preview_keeps_short_identifiers():
 
 def test_summarize_clean():
     assert "clean" in summarize_secrets([]).lower()
+
+
+def test_redact_accepts_non_str_defensively():
+    """Round-3 warning #7: the old `redact(text)` short-circuited on
+    falsy inputs (None/""/0) but truthy non-str (bytes, int, dict)
+    fell through to `pattern.sub` which raises `TypeError`. Today all
+    callers pass strings — this is a latent defense for future callers
+    that forward `requests.Response.content` (bytes) without decoding."""
+    token = _fake_token("gh" + "p_", "abcdefghijklmnopqrstuvwxyz0123456789")
+
+    # Bytes input: return unchanged (no crash).
+    assert redact(token.encode("utf-8")) == token.encode("utf-8")
+    # Int input: return unchanged.
+    assert redact(123) == 123
+    # None: return unchanged (matches old falsy short-circuit).
+    assert redact(None) is None
+    # Dict: return unchanged (neither crashes nor tries to serialize).
+    d = {"key": token}
+    assert redact(d) is d
+    # Sanity: normal str input still redacts.
+    redacted = redact(f"embed {token} here")
+    assert token not in redacted
+    assert "REDACTED" in redacted
 
 
 def test_summarize_with_hits():

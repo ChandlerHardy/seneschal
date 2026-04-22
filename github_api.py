@@ -31,7 +31,13 @@ from risk import PRFile
 
 
 # Config
-APP_ID = 3127694
+# `APP_ID` used to be duplicated here + in `seneschal_token` via a
+# bi-directional deferred import. Round-3 consolidation: the source of
+# truth lives in `seneschal_token.APP_ID`. Every consumer that needs the
+# value imports it from there. This module still re-exports the name
+# for backward-compat with `app.py`'s existing `from github_api import
+# APP_ID` until the next wave can churn the import site.
+from seneschal_token import APP_ID  # noqa: E402 — re-export for app.py compat
 INSTALL_DIR = os.path.expanduser("~/seneschal")
 PEM_PATH = os.path.join(INSTALL_DIR, "ch-code-reviewer.pem")
 
@@ -50,14 +56,17 @@ def _github_session():
 
 
 def generate_jwt():
-    now = int(time.time())
-    payload = {
-        "iat": now - 60,
-        "exp": now + (10 * 60),
-        "iss": str(APP_ID),
-    }
-    pem = Path(PEM_PATH).read_text()
-    return jwt.encode(payload, pem, algorithm="RS256")
+    """Sign a JWT for the Seneschal GitHub App.
+
+    Delegates to `seneschal_token._generate_jwt` so the App ID, PEM
+    path, env overrides (SENESCHAL_APP_ID, SENESCHAL_PEM_PATH), and
+    expiry window live in one place. The old inline impl used a
+    600s exp window; the shared impl uses 540s to leave a larger
+    safety margin against GitHub's 10-minute hard cap for in-flight
+    requests that hold a reference to the token.
+    """
+    from seneschal_token import _generate_jwt
+    return _generate_jwt()
 
 
 def get_installation_token(installation_id):
