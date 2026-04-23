@@ -35,17 +35,15 @@ ssh "$HOST" "
   fi
 "
 
-# Ship Python sources flat (matches the flat layout of this repo)
-for f in app.py analyzer.py risk.py scope.py diff_parser.py test_gaps.py \
-         related_prs.py repo_config.py review_memory.py context_loader.py \
-         findings.py summary.py title_check.py breaking_changes.py \
-         quality_scan.py secrets_scan.py full_review.py seneschal_token.py \
-         backend.py github_api.py fs_safety.py review_store.py \
-         review_index.py cross_repo.py dependency_grep.py \
-         license_check.py commit_convention.py branch_naming.py \
-         __init__.py requirements.txt; do
-  scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
-done
+# Ship Python sources flat (matches the flat layout of this repo).
+# Glob every *.py at the repo root so newly-added modules ship
+# automatically. Tests live under tests/ and are not caught by this glob.
+# If a future file at the repo root shouldn't deploy, put it under
+# scripts/ or bin/ instead. The smoke-import below (~line 84) still
+# names the runtime-required modules explicitly so a missing module on
+# the target is caught before systemd starts.
+scp "$REPO_DIR"/*.py "${HOST}:~/seneschal/"
+scp "$REPO_DIR/requirements.txt" "${HOST}:~/seneschal/requirements.txt"
 
 # Ship post_merge package (P1)
 for f in post_merge/__init__.py post_merge/changelog.py post_merge/release.py \
