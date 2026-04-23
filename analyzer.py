@@ -158,13 +158,9 @@ class PRAnalysis:
         if self.relevant_adrs:
             parts.append(render_adrs_addendum(self.relevant_adrs))
         if self.ci.fetched and self.ci.total > 0:
-            touched = [
-                # Pull touched filenames from risk scoring — set during analyze_pr
-                # and stored on self.diff_summary isn't structured for this; instead
-                # we rely on the render function's own inputs. Since correlation
-                # needs touched files but we don't hold them on PRAnalysis, render
-                # the CI block with only the correlation we already computed.
-            ]
+            # Correlation was pre-computed by analyze_pr (which still has
+            # the touched-files list) and stored on self._ci_correlated,
+            # so the renderer only needs that pre-computed view here.
             parts.append(render_ci_addendum(self.ci, self._ci_correlated))
         return "\n".join(p for p in parts if p)
 
@@ -400,6 +396,19 @@ def _license_to_findings(
     return out
 
 
+def _compose_detail(label: str, subject: str, reason: str) -> str:
+    """Compose a ``<Label> `{subject}`: {reason}`` detail string.
+
+    Shared by the commit-convention and branch-name renderers so adding a
+    4th P3 check lands as a thin wrapper rather than a copy-paste. When
+    `subject` is empty, falls back to the bare reason — the leading
+    backticked value would be noise without context.
+    """
+    if not subject:
+        return reason
+    return f"{label} `{subject}`: {reason}"
+
+
 def _convention_to_finding(
     violation: Optional[ConventionViolation],
     severity: Severity = Severity.WARNING,
@@ -408,14 +417,11 @@ def _convention_to_finding(
         return None
     # Prefix the reason with the offending title so reviewers see exactly
     # what failed, not just the generic explanation.
-    detail = violation.reason
-    if violation.title:
-        detail = f"Title `{violation.title}`: {violation.reason}"
     return Finding(
         severity=severity,
         category="commit-convention",
         title="PR title does not follow conventional-commit convention",
-        detail=detail,
+        detail=_compose_detail("Title", violation.subject, violation.reason),
     )
 
 
@@ -425,17 +431,14 @@ def _branch_name_to_finding(
 ) -> Optional[Finding]:
     if violation is None:
         return None
-    # Compose final detail: `<reason> (ref: <head_ref>)`. The violation
-    # reason no longer embeds head_ref (see BranchNameViolation docstring),
-    # so we splice it here for reviewer context.
-    detail = violation.reason
-    if violation.head_ref:
-        detail = f"Branch `{violation.head_ref}`: {violation.reason}"
+    # Compose final detail via shared helper. The violation reason no
+    # longer embeds head_ref (see BranchNameViolation docstring), so
+    # _compose_detail splices it in for reviewer context.
     return Finding(
         severity=severity,
         category="branch-name",
         title="Branch name does not match repo convention",
-        detail=detail,
+        detail=_compose_detail("Branch", violation.subject, violation.reason),
     )
 
 

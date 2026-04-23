@@ -37,6 +37,14 @@ class ConventionViolation:
     title: str
     reason: str
 
+    @property
+    def subject(self) -> str:
+        """Uniform accessor across P3 violation dataclasses (see also
+        LicenseViolation.subject, BranchNameViolation.subject). Lets
+        analyzer's finding renderers stay table-driven instead of
+        copy-pasting per-field extraction."""
+        return self.title
+
 
 def check_pr_title_strict(
     title: Optional[str],

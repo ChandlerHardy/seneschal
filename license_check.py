@@ -43,6 +43,14 @@ class LicenseViolation:
     file: str
     reason: str
 
+    @property
+    def subject(self) -> str:
+        """Uniform accessor across P3 violation dataclasses (see also
+        ConventionViolation.subject, BranchNameViolation.subject). Lets
+        analyzer's finding renderers stay table-driven instead of
+        copy-pasting per-field extraction."""
+        return self.file
+
 
 # How many leading lines of the added content we'll consider as "header
 # candidate" region. Anything past this is ignored — headers don't live

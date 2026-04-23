@@ -48,6 +48,9 @@ def test_added_file_missing_header_flagged():
     assert len(violations) == 1
     assert isinstance(violations[0], LicenseViolation)
     assert violations[0].file == "src/foo.go"
+    # Uniform `.subject` across P3 violation dataclasses — lets the
+    # analyzer's finding renderers stay table-driven.
+    assert violations[0].subject == violations[0].file
 
 
 def test_year_placeholder_any_4_digit_year_accepted():
