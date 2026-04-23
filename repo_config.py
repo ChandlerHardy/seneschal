@@ -395,11 +395,25 @@ def load_from_path(path: str) -> RepoConfig:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw = fh.read()
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError) as e:
+        # Surface the read failure to operators. Previously swallowed
+        # silently → all standards checks toggled OFF with zero trace.
+        print(
+            f"[seneschal] failed to read {path!r}: {type(e).__name__}: {e}; "
+            f"falling back to defaults",
+            file=_sys.stderr,
+        )
         return RepoConfig()
     try:
         return parse_config(raw)
-    except Exception:
+    except Exception as e:
+        # Malformed YAML or similar — same operator-visibility rationale
+        # as the read-failure branch above.
+        print(
+            f"[seneschal] failed to parse {path!r}: {type(e).__name__}: {e}; "
+            f"falling back to defaults",
+            file=_sys.stderr,
+        )
         return RepoConfig()
 
 

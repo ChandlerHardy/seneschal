@@ -125,6 +125,43 @@ def test_load_from_path_pins_utf8_encoding(tmp_path, monkeypatch):
     assert "résumé" in config.rules[0]
 
 
+def test_load_from_path_logs_malformed_yaml(tmp_path, capsys):
+    """Round-3 FIX 3: malformed YAML must log to stderr before falling
+    back to defaults. Previously `except Exception: return RepoConfig()`
+    silently turned every standards check OFF with zero trace, leaving
+    operators no way to debug a busted `.seneschal.yml`."""
+    cfg_path = tmp_path / ".seneschal.yml"
+    # Unbalanced `[` → yaml.safe_load raises ScannerError.
+    cfg_path.write_text("rules: [unterminated\n", encoding="utf-8")
+
+    config = load_from_path(str(cfg_path))
+
+    # Falls back to defaults.
+    assert config.rules == []
+    # But leaves a trail.
+    err = capsys.readouterr().err
+    assert "[seneschal]" in err
+    assert "failed to parse" in err
+    assert str(cfg_path) in err
+
+
+def test_load_from_path_logs_unicode_decode_error(tmp_path, capsys):
+    """Round-3 FIX 3: files that can't be decoded as UTF-8 must log to
+    stderr before falling back to defaults. Rare in practice (bad encoding
+    or truly binary junk in the config slot) but currently silent."""
+    cfg_path = tmp_path / ".seneschal.yml"
+    # Write bytes that are not valid UTF-8 (lone continuation byte 0xff).
+    cfg_path.write_bytes(b"\xff\xfe\x00bogus\n")
+
+    config = load_from_path(str(cfg_path))
+
+    assert config.rules == []
+    err = capsys.readouterr().err
+    assert "[seneschal]" in err
+    assert "failed to read" in err
+    assert "UnicodeDecodeError" in err
+
+
 def test_load_from_repo_finds_yml():
     with tempfile.TemporaryDirectory() as d:
         with open(os.path.join(d, ".ch-code-reviewer.yml"), "w") as fh:
