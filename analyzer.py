@@ -158,13 +158,9 @@ class PRAnalysis:
         if self.relevant_adrs:
             parts.append(render_adrs_addendum(self.relevant_adrs))
         if self.ci.fetched and self.ci.total > 0:
-            touched = [
-                # Pull touched filenames from risk scoring — set during analyze_pr
-                # and stored on self.diff_summary isn't structured for this; instead
-                # we rely on the render function's own inputs. Since correlation
-                # needs touched files but we don't hold them on PRAnalysis, render
-                # the CI block with only the correlation we already computed.
-            ]
+            # Correlation was pre-computed by analyze_pr (which still has
+            # the touched-files list) and stored on self._ci_correlated,
+            # so the renderer only needs that pre-computed view here.
             parts.append(render_ci_addendum(self.ci, self._ci_correlated))
         return "\n".join(p for p in parts if p)
 
