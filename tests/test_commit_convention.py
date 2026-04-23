@@ -145,3 +145,11 @@ def test_convention_violation_carries_title_context():
     assert isinstance(result, ConventionViolation)
     assert result.title == "random thing"
     assert result.reason
+
+
+def test_convention_violation_subject_aliases_title():
+    # Uniform `.subject` across P3 violation dataclasses — lets the
+    # analyzer's finding renderers stay table-driven.
+    result = check_pr_title_strict("random thing", strict=True)
+    assert isinstance(result, ConventionViolation)
+    assert result.subject == result.title

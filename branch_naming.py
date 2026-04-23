@@ -40,6 +40,14 @@ class BranchNameViolation:
     head_ref: str
     reason: str
 
+    @property
+    def subject(self) -> str:
+        """Uniform accessor across P3 violation dataclasses (see also
+        LicenseViolation.subject, ConventionViolation.subject). Lets
+        analyzer's finding renderers stay table-driven instead of
+        copy-pasting per-field extraction."""
+        return self.head_ref
+
 
 def check_branch_name(
     head_ref: Optional[str],

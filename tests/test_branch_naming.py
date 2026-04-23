@@ -32,6 +32,14 @@ def test_violation_reason_omits_bare_head_ref_duplication(capsys):
     assert "weird-branch" not in result.reason
 
 
+def test_branch_violation_subject_aliases_head_ref():
+    # Uniform `.subject` across P3 violation dataclasses — lets the
+    # analyzer's finding renderers stay table-driven.
+    result = check_branch_name("weird-branch", [r"^feat/"])
+    assert isinstance(result, BranchNameViolation)
+    assert result.subject == result.head_ref
+
+
 def test_warns_when_patterns_present_but_head_ref_missing(capsys):
     # Fix N: `head_ref=None` with configured patterns should emit a stderr
     # warning so the silent no-op is visible. Still returns None (doesn't
