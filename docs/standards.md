@@ -52,14 +52,17 @@ standards:
 
   # --- Branch-naming regex ---------------------------------------------
   # List of regex patterns. ANY match = valid; empty list = feature OFF.
+  # Patterns are matched with `re.fullmatch`, so a pattern like `^feat/`
+  # alone only matches the literal string `feat/`. Use `^feat/.*` to
+  # match any branch beginning with `feat/`.
   # Patterns are truncated to ~200 chars at parse-time (ReDoS defense).
   # Invalid regex patterns are logged to stderr and skipped rather than
   # crashing the check.
   branch_name_patterns:
-    - "^feat/"
-    - "^fix/"
-    - "^chore/"
-    - "^release/v[0-9]+"
+    - "^feat/.*"
+    - "^fix/.*"
+    - "^chore/.*"
+    - "^release/v[0-9]+.*"
 
   # --- Severity overrides ----------------------------------------------
   # Per-category overrides. Accepted values: blocker, warning, nit, info.
@@ -85,9 +88,9 @@ standards:
     - "vendor/**"
   commit_convention_strict: true
   branch_name_patterns:
-    - "^feat/"
-    - "^fix/"
-    - "^release/"
+    - "^feat/.*"
+    - "^fix/.*"
+    - "^release/.*"
 ```
 
 ### Python library with loose branching
@@ -155,7 +158,7 @@ continues to fire as normal.
 
 ### Binary files are skipped
 
-The license scanner looks for NUL bytes in the first ~40 added lines. If
+The license scanner looks for NUL bytes across all added lines. If
 found, the file is skipped (binary images, protobuf descriptors, etc.).
 
 ### Header text is capped at 2KB
@@ -163,6 +166,16 @@ found, the file is skipped (binary images, protobuf descriptors, etc.).
 `license_header` strings longer than 2048 bytes are truncated during
 YAML parsing. `license_header_file` contents are similarly capped after
 being read from disk.
+
+### Limitation: renames
+
+Files that GitHub marks as `status: renamed` are skipped by the license
+check, even if the file was also substantially rewritten in the same PR.
+Operators concerned about license headers being stripped during renames
+should run a separate full-repo license audit periodically (e.g. a CI
+job that greps all source files for the header). Detecting "meaningful
+rename+rewrite" heuristically is deferred — a future release may add a
+threshold knob.
 
 ## Interaction with other findings
 
