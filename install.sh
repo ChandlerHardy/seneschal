@@ -65,7 +65,7 @@ for f in agents/seneschal-architect.md \
          agents/seneschal-edge-case.md \
          agents/seneschal-design.md \
          agents/seneschal-simplifier.md; do
-  scp "$REPO_DIR/$f" "${HOST}:~/.claude/$(echo "$f" | sed 's#^#agents/#' 2>/dev/null || echo "$f")"
+  scp "$REPO_DIR/$f" "${HOST}:~/.claude/$f"
 done
 
 # Ship the `seneschal-post` CLI helper to ~/bin on the host. This is the
