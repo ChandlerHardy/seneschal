@@ -134,6 +134,8 @@ def get_pr_files(owner, repo, pr_number, token):
                 additions=f.get("additions", 0),
                 deletions=f.get("deletions", 0),
                 status=f.get("status", "modified"),
+                # Only present when status == "renamed"; blank otherwise.
+                previous_filename=f.get("previous_filename") or "",
             ))
         if len(batch) < 100:
             break

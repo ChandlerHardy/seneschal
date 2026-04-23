@@ -42,6 +42,7 @@ for f in app.py analyzer.py risk.py scope.py diff_parser.py test_gaps.py \
          quality_scan.py secrets_scan.py full_review.py seneschal_token.py \
          backend.py github_api.py fs_safety.py review_store.py \
          review_index.py cross_repo.py dependency_grep.py \
+         license_check.py commit_convention.py branch_naming.py \
          __init__.py requirements.txt; do
   scp "$REPO_DIR/$f" "${HOST}:~/seneschal/$f"
 done
@@ -64,7 +65,7 @@ for f in agents/seneschal-architect.md \
          agents/seneschal-edge-case.md \
          agents/seneschal-design.md \
          agents/seneschal-simplifier.md; do
-  scp "$REPO_DIR/$f" "${HOST}:~/.claude/$(echo "$f" | sed 's#^#agents/#' 2>/dev/null || echo "$f")"
+  scp "$REPO_DIR/$f" "${HOST}:~/.claude/$f"
 done
 
 # Ship the `seneschal-post` CLI helper to ~/bin on the host. This is the
@@ -80,7 +81,7 @@ ssh "$HOST" "chmod +x ~/bin/seneschal-post"
 # by the MCP server today, but lives in the same ~/seneschal/ dir as the
 # webhook code, so failing imports here catch broken deploys before they
 # surface in Claude Code sessions.
-ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token; import review_index; import cross_repo; import dependency_grep; from post_merge import orchestrator' && echo 'seneschal imports: OK'"
+ssh "$HOST" "cd ~/seneschal && ~/seneschal/venv/bin/python -c 'import analyzer; import backend; import diff_parser; import full_review; import seneschal_token; import review_index; import cross_repo; import dependency_grep; import license_check; import commit_convention; import branch_naming; from post_merge import orchestrator' && echo 'seneschal imports: OK'"
 
 # Install / update the systemd unit
 scp "$REPO_DIR/systemd/seneschal.service" "${HOST}:/tmp/seneschal.service"

@@ -12,14 +12,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence
 
+from branch_naming import BranchNameViolation, check_branch_name
 from breaking_changes import BreakingChange, detect_breaking_changes, summarize_breaking
 from ci_context import CIResult, correlate_failing_checks, render_ci_addendum
+from commit_convention import ConventionViolation, check_pr_title_strict
 from context_loader import BlastRadius, compute_blast_radius
 from findings import Finding, FindingSet, Severity
 from history_context import ADR, render_adrs_addendum
+from license_check import LicenseViolation, scan_license_headers
 from quality_scan import QualityHit, scan_quality, summarize_quality
 from related_prs import OtherPR, RelatedPR, find_related_prs, summarize_related
-from repo_config import RepoConfig
+from repo_config import RepoConfig, StandardsConfig
 from review_memory import ReviewMemory
 from risk import PRFile, RiskScore, score_risk
 from scope import ScopeReport, detect_scope_drift
@@ -341,16 +344,122 @@ def _quality_to_findings(hits: Sequence[QualityHit]) -> List[Finding]:
     return out
 
 
+# Severity default map for P3 standards findings. Overrides from
+# `StandardsConfig.*_severity` swap these out per-category at runtime.
+_SEVERITY_LABEL_MAP = {
+    "blocker": Severity.BLOCKER,
+    "warning": Severity.WARNING,
+    "nit": Severity.NIT,
+    "info": Severity.INFO,
+}
+
+
+def _resolve_severity(override: Optional[str], default: Severity) -> Severity:
+    """Translate an optional `.seneschal.yml` severity label to a Severity.
+
+    None  → use the default (silent — label wasn't configured).
+    Unknown label → use the default AND log to stderr (fix O): configs
+    should have been rejected at parse time, so reaching this branch
+    means either a bypass or a skew between the parser's accepted-set
+    and this map.
+    """
+    if override is None:
+        return default
+    if override in _SEVERITY_LABEL_MAP:
+        return _SEVERITY_LABEL_MAP[override]
+    # Mirror repo_config.py's stderr pattern — analyzer is imported by
+    # contexts (MCP server) that don't wire `app.log`.
+    import sys as _sys
+    print(
+        f"[seneschal] unknown severity label {override!r}; "
+        f"falling back to default {default.label}",
+        file=_sys.stderr,
+    )
+    return default
+
+
+def _license_to_findings(
+    violations: Sequence[LicenseViolation],
+    severity: Severity = Severity.WARNING,
+) -> List[Finding]:
+    out: List[Finding] = []
+    for v in violations[:25]:
+        out.append(Finding(
+            severity=severity,
+            category="license",
+            title="Missing license header",
+            detail=v.reason,
+            file=v.file,
+        ))
+    if len(violations) > 25:
+        out.append(Finding(
+            severity=severity,
+            category="license",
+            title=f"...and {len(violations) - 25} more license violations",
+        ))
+    return out
+
+
+def _convention_to_finding(
+    violation: Optional[ConventionViolation],
+    severity: Severity = Severity.WARNING,
+) -> Optional[Finding]:
+    if violation is None:
+        return None
+    # Prefix the reason with the offending title so reviewers see exactly
+    # what failed, not just the generic explanation.
+    detail = violation.reason
+    if violation.title:
+        detail = f"Title `{violation.title}`: {violation.reason}"
+    return Finding(
+        severity=severity,
+        category="commit-convention",
+        title="PR title does not follow conventional-commit convention",
+        detail=detail,
+    )
+
+
+def _branch_name_to_finding(
+    violation: Optional[BranchNameViolation],
+    severity: Severity = Severity.NIT,
+) -> Optional[Finding]:
+    if violation is None:
+        return None
+    # Compose final detail: `<reason> (ref: <head_ref>)`. The violation
+    # reason no longer embeds head_ref (see BranchNameViolation docstring),
+    # so we splice it here for reviewer context.
+    detail = violation.reason
+    if violation.head_ref:
+        detail = f"Branch `{violation.head_ref}`: {violation.reason}"
+    return Finding(
+        severity=severity,
+        category="branch-name",
+        title="Branch name does not match repo convention",
+        detail=detail,
+    )
+
+
 def build_findings(
     risk: RiskScore,
     scope: ScopeReport,
     gaps: Sequence[TestGap],
     related: Sequence[RelatedPR],
     title_report: TitleReport,
+    standards: StandardsConfig,
     breaking: Sequence[BreakingChange] = (),
     secrets: Sequence[SecretHit] = (),
     quality: Sequence[QualityHit] = (),
+    license_violations: Sequence[LicenseViolation] = (),
+    convention_violation: Optional[ConventionViolation] = None,
+    branch_violation: Optional[BranchNameViolation] = None,
+    suppress_soft_title: bool = False,
 ) -> FindingSet:
+    """Compose a FindingSet from raw analysis outputs.
+
+    `standards` is a required positional-or-keyword parameter — callers
+    always supply `config.standards` (itself a default-factory), so the
+    previous `Optional[StandardsConfig]` sentinel was dead code.
+    """
     fs = FindingSet()
     # Secrets go first so they can never be buried.
     fs.extend(_secrets_to_findings(secrets))
@@ -364,14 +473,33 @@ def build_findings(
     scope_f = _scope_to_finding(scope)
     if scope_f:
         fs.add(scope_f)
-    title_f = _title_to_finding(title_report)
-    if title_f:
-        fs.add(title_f)
+    # Soft title finding is suppressed when the strict commit-convention
+    # finding is about to fire — prevents double-reporting the same issue.
+    if not suppress_soft_title:
+        title_f = _title_to_finding(title_report)
+        if title_f:
+            fs.add(title_f)
     fs.extend(_gaps_to_findings(gaps))
     related_f = _related_to_finding(related)
     if related_f:
         fs.add(related_f)
     fs.extend(_quality_to_findings(quality))
+
+    # Standards enforcement (P3). Each block is independent and gated on
+    # its own presence check — absent standards config = no new findings.
+    license_sev = _resolve_severity(standards.license_severity, Severity.WARNING)
+    fs.extend(_license_to_findings(license_violations, severity=license_sev))
+
+    convention_sev = _resolve_severity(standards.commit_convention_severity, Severity.WARNING)
+    convention_f = _convention_to_finding(convention_violation, severity=convention_sev)
+    if convention_f:
+        fs.add(convention_f)
+
+    branch_sev = _resolve_severity(standards.branch_name_severity, Severity.NIT)
+    branch_f = _branch_name_to_finding(branch_violation, severity=branch_sev)
+    if branch_f:
+        fs.add(branch_f)
+
     return fs
 
 
@@ -386,6 +514,7 @@ def analyze_pr(
     memory: Optional[ReviewMemory] = None,
     adrs: Optional[Sequence[ADR]] = None,
     ci: Optional[CIResult] = None,
+    head_ref: Optional[str] = None,
 ) -> PRAnalysis:
     """Run all analysis modules and return a combined PRAnalysis.
 
@@ -411,7 +540,46 @@ def analyze_pr(
     secrets = scan_diff(diff_text)
     quality = scan_quality(diff_text)
 
-    findings = build_findings(risk, scope, gaps, related, title_report, breaking, secrets, quality)
+    # Standards enforcement (P3) — all three producers no-op when the
+    # corresponding config knob is empty/False.
+    # NOTE: pass the raw `files` (pre-ignore_paths filter) so license
+    # enforcement applies repo-wide, not just to non-ignored paths.
+    # The `license_applies_to` / `license_exemptions` knobs are the
+    # right control surface for license scoping, not `ignore_paths`.
+    license_violations = scan_license_headers(
+        diff_text,
+        pr_files=files,
+        config=config.standards,
+    )
+    convention_violation = check_pr_title_strict(
+        pr_title,
+        strict=config.standards.commit_convention_strict,
+    )
+    branch_violation = check_branch_name(
+        head_ref,
+        config.standards.branch_name_patterns,
+    )
+    # When strict-convention fires, suppress the soft title finding so we
+    # don't double-report the same underlying issue.
+    suppress_soft_title = (
+        config.standards.commit_convention_strict and convention_violation is not None
+    )
+
+    findings = build_findings(
+        risk,
+        scope,
+        gaps,
+        related,
+        title_report,
+        config.standards,
+        breaking=breaking,
+        secrets=secrets,
+        quality=quality,
+        license_violations=license_violations,
+        convention_violation=convention_violation,
+        branch_violation=branch_violation,
+        suppress_soft_title=suppress_soft_title,
+    )
 
     # ADR relevance scoring — only runs if caller supplied ADRs.
     # Done here so the scoring heuristic has access to touched filenames.

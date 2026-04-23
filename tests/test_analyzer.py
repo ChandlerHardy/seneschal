@@ -280,3 +280,255 @@ def test_inline_comments_empty_when_no_line_info():
         run_blast_radius=False,
     )
     assert result.inline_comments() == []
+
+
+# --------------------------------------------------------------------------
+# StandardsConfig wiring (P3)
+# --------------------------------------------------------------------------
+
+
+def test_standards_default_off_produces_no_new_findings():
+    """With StandardsConfig at all defaults, none of the new categories appear."""
+    files = [f("src/foo.py")]
+    result = analyze_pr(
+        files=files,
+        pr_title="feat: add thing",
+        diff_text=SMALL_DIFF,
+        other_open_prs=[],
+        repo_dir="/nonexistent",
+        config=RepoConfig(),  # standards defaults to off
+        run_blast_radius=False,
+        head_ref="some-branch",
+    )
+    categories = {find.category for find in result.findings.findings}
+    assert "license" not in categories
+    assert "commit-convention" not in categories
+    assert "branch-name" not in categories
+
+
+def test_license_finding_emitted_for_missing_header():
+    from repo_config import StandardsConfig
+    config = RepoConfig(standards=StandardsConfig(
+        license_header="// Copyright {YEAR} Acme Corp.",
+    ))
+    diff = (
+        "diff --git a/src/new.go b/src/new.go\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/src/new.go\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+package new\n"
+        "+// no header\n"
+    )
+    files = [f("src/new.go", status="added")]
+    result = analyze_pr(
+        files=files,
+        pr_title="feat: add new.go",
+        diff_text=diff,
+        other_open_prs=[],
+        repo_dir="/nonexistent",
+        config=config,
+        run_blast_radius=False,
+    )
+    license_findings = [x for x in result.findings.findings if x.category == "license"]
+    assert len(license_findings) == 1
+    assert license_findings[0].file == "src/new.go"
+
+
+def test_commit_convention_strict_mode_emits_warning():
+    from repo_config import StandardsConfig
+    config = RepoConfig(standards=StandardsConfig(
+        commit_convention_strict=True,
+    ))
+    files = [f("src/foo.py")]
+    result = analyze_pr(
+        files=files,
+        pr_title="update stuff",  # non-conventional
+        diff_text=SMALL_DIFF,
+        other_open_prs=[],
+        repo_dir="/nonexistent",
+        config=config,
+        run_blast_radius=False,
+    )
+    convention_findings = [x for x in result.findings.findings if x.category == "commit-convention"]
+    assert len(convention_findings) == 1
+
+
+def test_commit_convention_strict_suppresses_soft_title_finding():
+    """When strict mode fires, the soft title_check nudge must NOT double-up."""
+    from repo_config import StandardsConfig
+    config = RepoConfig(standards=StandardsConfig(
+        commit_convention_strict=True,
+    ))
+    files = [f("src/foo.py")]
+    result = analyze_pr(
+        files=files,
+        pr_title="wip",  # both title_check (vague) and strict mode would flag
+        diff_text=SMALL_DIFF,
+        other_open_prs=[],
+        repo_dir="/nonexistent",
+        config=config,
+        run_blast_radius=False,
+    )
+    title_findings = [x for x in result.findings.findings if x.category == "title"]
+    convention_findings = [x for x in result.findings.findings if x.category == "commit-convention"]
+    assert len(convention_findings) == 1
+    assert len(title_findings) == 0  # soft title suppressed
+
+
+def test_strict_mode_off_preserves_soft_title_finding():
+    """When strict mode is OFF, title_check's soft nudge still fires."""
+    files = [f("src/foo.py")]
+    result = analyze_pr(
+        files=files,
+        pr_title="wip",
+        diff_text=SMALL_DIFF,
+        other_open_prs=[],
+        repo_dir="/nonexistent",
+        config=RepoConfig(),
+        run_blast_radius=False,
+    )
+    title_findings = [x for x in result.findings.findings if x.category == "title"]
+    assert len(title_findings) == 1
+
+
+def test_branch_name_nit_emitted_on_non_matching_ref():
+    from repo_config import StandardsConfig
+    config = RepoConfig(standards=StandardsConfig(
+        branch_name_patterns=[r"^feat/.*", r"^fix/.*"],
+    ))
+    files = [f("src/foo.py")]
+    result = analyze_pr(
+        files=files,
+        pr_title="fix: something",
+        diff_text=SMALL_DIFF,
+        other_open_prs=[],
+        repo_dir="/nonexistent",
+        config=config,
+        run_blast_radius=False,
+        head_ref="my-weird-branch",
+    )
+    branch_findings = [x for x in result.findings.findings if x.category == "branch-name"]
+    assert len(branch_findings) == 1
+    from findings import Severity
+    assert branch_findings[0].severity == Severity.NIT
+
+
+def test_branch_name_matching_ref_no_finding():
+    from repo_config import StandardsConfig
+    config = RepoConfig(standards=StandardsConfig(
+        branch_name_patterns=[r"^feat/.*", r"^fix/.*"],
+    ))
+    files = [f("src/foo.py")]
+    result = analyze_pr(
+        files=files,
+        pr_title="feat: thing",
+        diff_text=SMALL_DIFF,
+        other_open_prs=[],
+        repo_dir="/nonexistent",
+        config=config,
+        run_blast_radius=False,
+        head_ref="feat/new-thing",
+    )
+    branch_findings = [x for x in result.findings.findings if x.category == "branch-name"]
+    assert len(branch_findings) == 0
+
+
+def test_analyze_pr_head_ref_kwarg_optional():
+    """Callers that don't pass head_ref still work (backward compat)."""
+    files = [f("src/foo.py")]
+    result = analyze_pr(
+        files=files,
+        pr_title="fix: something",
+        diff_text=SMALL_DIFF,
+        other_open_prs=[],
+        repo_dir="/nonexistent",
+        config=RepoConfig(),
+        run_blast_radius=False,
+        # no head_ref
+    )
+    # Should not crash, should not emit branch-name finding
+    branch_findings = [x for x in result.findings.findings if x.category == "branch-name"]
+    assert len(branch_findings) == 0
+
+
+def test_build_findings_standards_is_required():
+    """Fix J: build_findings should not fall back to a default StandardsConfig.
+
+    Callers always pass `config.standards`; the Optional[] sentinel was
+    dead code.
+    """
+    import inspect
+    from analyzer import build_findings
+    sig = inspect.signature(build_findings)
+    # standards parameter should have no default (or a non-None default
+    # representing "required caller input"). The point is removing the
+    # silent `None -> StandardsConfig()` fallback.
+    std_param = sig.parameters["standards"]
+    assert std_param.annotation is not type(None)
+    # Cannot be Optional[StandardsConfig] — the whole point of fix J.
+    import typing
+    ann_str = str(std_param.annotation)
+    assert "Optional" not in ann_str, (
+        f"build_findings(standards=...) should no longer accept None; "
+        f"annotation={ann_str!r}"
+    )
+
+
+def test_resolve_severity_logs_fallback_on_invalid_label(capsys):
+    """Fix O: invalid severity label should log to stderr before falling back."""
+    from analyzer import _resolve_severity
+    from findings import Severity
+    result = _resolve_severity("definitely-not-a-severity", Severity.WARNING)
+    assert result == Severity.WARNING
+    captured = capsys.readouterr()
+    assert "[seneschal]" in captured.err
+    assert "definitely-not-a-severity" in captured.err
+
+
+def test_resolve_severity_no_log_on_valid_label(capsys):
+    from analyzer import _resolve_severity
+    from findings import Severity
+    result = _resolve_severity("blocker", Severity.WARNING)
+    assert result == Severity.BLOCKER
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_resolve_severity_no_log_on_none_override(capsys):
+    from analyzer import _resolve_severity
+    from findings import Severity
+    result = _resolve_severity(None, Severity.NIT)
+    assert result == Severity.NIT
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_severity_override_license_upgrade_to_blocker():
+    from repo_config import StandardsConfig
+    from findings import Severity
+    config = RepoConfig(standards=StandardsConfig(
+        license_header="// REQUIRED HEADER",
+        license_severity="blocker",
+    ))
+    diff = (
+        "diff --git a/src/new.go b/src/new.go\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/src/new.go\n"
+        "@@ -0,0 +1,1 @@\n"
+        "+package new\n"
+    )
+    files = [f("src/new.go", status="added")]
+    result = analyze_pr(
+        files=files,
+        pr_title="feat: new.go",
+        diff_text=diff,
+        other_open_prs=[],
+        repo_dir="/nonexistent",
+        config=config,
+        run_blast_radius=False,
+    )
+    license_findings = [x for x in result.findings.findings if x.category == "license"]
+    assert len(license_findings) == 1
+    assert license_findings[0].severity == Severity.BLOCKER
