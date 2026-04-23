@@ -69,6 +69,9 @@ def _looks_binary(lines: Sequence[str]) -> bool:
     return False
 
 
+_YEAR_SENTINEL = "SENESCHALYEARPLACEHOLDER"
+
+
 def _build_header_regex(header_text: str) -> re.Pattern:
     """Translate header text (with optional `{YEAR}` placeholder) to regex.
 
@@ -76,13 +79,20 @@ def _build_header_regex(header_text: str) -> re.Pattern:
     as literal and escaped. Matching is line-oriented: `header_text` is
     split on newlines and each line becomes a regex; together they must
     appear as a contiguous prefix in the file's leading content.
+
+    Round-3 FIX 4: use an ASCII-alphanumeric sentinel (`SENESCHALYEAR-
+    PLACEHOLDER`) instead of a NUL-wrapped one. `re.escape` is guaranteed
+    to leave ASCII word chars untouched; NUL-escape behavior is a CPython
+    impl detail. Using a distinctive alnum token future-proofs the
+    substitution across Python versions and avoids colliding with header
+    content containing literal `\\x00` bytes.
     """
-    placeholder = "\x00YEAR\x00"
-    work = header_text.replace("{YEAR}", placeholder)
+    work = header_text.replace("{YEAR}", _YEAR_SENTINEL)
     escaped = re.escape(work)
-    # After re.escape, our sentinel is still intact (NUL bytes aren't
-    # escaped), so substitute the regex fragment for it.
-    regex = escaped.replace(re.escape(placeholder), r"\d{4}")
+    # After re.escape, our ASCII sentinel is identical on both sides
+    # (no metacharacters to escape), so substitute the regex fragment
+    # for the bare sentinel.
+    regex = escaped.replace(_YEAR_SENTINEL, r"\d{4}")
     return re.compile(regex)
 
 

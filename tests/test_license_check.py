@@ -200,6 +200,30 @@ def test_exemptions_take_priority_over_applies_to():
     assert scan_license_headers(diff, pr_files=None, config=config) == []
 
 
+def test_year_placeholder_survives_literal_nul_in_header():
+    """Round-3 FIX 4: `_build_header_regex` previously used a NUL-wrapped
+    sentinel (`\\x00YEAR\\x00`) and relied on the CPython impl detail that
+    `re.escape` does not escape NUL. The sentinel is now an ASCII-alnum
+    token. Confirm that a header carrying literal NUL bytes doesn't
+    confuse the `{YEAR}` substitution.
+
+    In practice, `_sanitize_header_text` strips NUL via `_CONTROL_CHARS`
+    before any header ever reaches the regex builder — but this test
+    exercises the builder directly to lock in the invariant that the
+    substitution is independent of what else is in the header text."""
+    from license_check import _build_header_regex
+
+    header_with_nul = "// Copyright {YEAR} Acme \x00 Corp."
+    pattern = _build_header_regex(header_with_nul)
+
+    # A real copyright line with literal NUL at the matching position
+    # must still satisfy the pattern.
+    assert pattern.match("// Copyright 2026 Acme \x00 Corp.") is not None
+    # And the `{YEAR}` slot still only accepts 4 digits — if our sentinel
+    # collision allowed non-digit content to sneak through, this would fail.
+    assert pattern.match("// Copyright YEAR Acme \x00 Corp.") is None
+
+
 def test_year_placeholder_rejects_non_numeric():
     diff = _mk_diff("src/foo.go", [
         "// Copyright YEAR Acme Corp. All rights reserved.",
