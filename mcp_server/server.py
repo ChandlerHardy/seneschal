@@ -552,9 +552,56 @@ def seneschal_dependency_usage(
     ]
 
 
-def main():  # pragma: no cover
-    """Run the MCP server over stdio (standard MCP transport)."""
-    mcp.run()
+def main(argv: list[str] | None = None) -> None:
+    """Run the MCP server.
+
+    Default transport is stdio (the standard MCP transport that local
+    Claude Code uses via `bin/seneschal-mcp-server`). Pass `--http` or
+    set `SENESCHAL_MCP_TRANSPORT=http` to bind an HTTP listener instead;
+    this is the deployment shape OCI uses so a remote Claude Code on the
+    tailnet can reach the same review store the bot writes to.
+
+    HTTP host/port/path resolve in order: CLI args → env vars → defaults
+    (`127.0.0.1`, `9101`, `/mcp`). The 127.0.0.1 default is intentional:
+    forgetting `SENESCHAL_MCP_HOST` results in a loopback bind, never an
+    accidental public listener. The OCI systemd unit must explicitly set
+    the Tailscale IP.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="seneschal-mcp-server")
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Bind an HTTP listener (default: stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="HTTP bind address (default: $SENESCHAL_MCP_HOST or 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="HTTP bind port (default: $SENESCHAL_MCP_PORT or 9101)",
+    )
+    parser.add_argument(
+        "--path",
+        default=None,
+        help="HTTP endpoint path (default: $SENESCHAL_MCP_PATH or /mcp)",
+    )
+    args = parser.parse_args(argv)
+
+    use_http = args.http or os.environ.get("SENESCHAL_MCP_TRANSPORT", "").lower() == "http"
+
+    if use_http:
+        host = args.host or os.environ.get("SENESCHAL_MCP_HOST", "127.0.0.1")
+        port = args.port if args.port is not None else int(os.environ.get("SENESCHAL_MCP_PORT", "9101"))
+        path = args.path or os.environ.get("SENESCHAL_MCP_PATH", "/mcp")
+        mcp.run(transport="http", host=host, port=port, path=path)
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":  # pragma: no cover

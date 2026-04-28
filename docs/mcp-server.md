@@ -35,6 +35,20 @@ skipped rather than surfaced as errors.
 
 ## Install
 
+The MCP server supports two transports — pick whichever matches your
+deployment:
+
+* **Stdio** (default): the local Claude Code process spawns the MCP
+  server as a subprocess and talks to it over stdin/stdout. Right when
+  the review store + bot live on the same machine you run Claude Code on.
+* **HTTP**: the MCP server runs as a long-lived HTTP listener; Claude
+  Code connects to it as a network client. Right when the bot lives on
+  a server (e.g. an OCI box accessible via Tailscale) and you want
+  desktop Claude Code to query the same review store the bot writes to,
+  without copying state between hosts.
+
+### Stdio (local)
+
 1. Install the optional dependency:
 
    ```bash
@@ -55,6 +69,65 @@ skipped rather than surfaced as errors.
    ```
 
 3. Restart Claude Code. Verify with `claude mcp list`.
+
+### HTTP (remote, e.g. via Tailscale)
+
+1. On the server, run the MCP entry point with `--http` (or set
+   `SENESCHAL_MCP_TRANSPORT=http`). Recommended deployment is a systemd
+   unit alongside the webhook bot — the public repo's webhook bot is
+   stdio-agnostic, so failures in one process don't take down the other.
+
+   ```bash
+   SENESCHAL_MCP_TRANSPORT=http \
+   SENESCHAL_MCP_HOST=100.120.165.66 \
+   SENESCHAL_MCP_PORT=9101 \
+     /home/ubuntu/seneschal/venv/bin/python -m mcp_server.server
+   ```
+
+   Bind explicitly to your tailnet IP — never `0.0.0.0` on a publicly
+   reachable host. The 127.0.0.1 default exists so a forgotten env var
+   produces a loopback bind, never an open public listener.
+
+2. On the client (your laptop), register with Claude Code over HTTP:
+
+   ```bash
+   claude mcp add seneschal --transport http http://<host>:9101/mcp
+   ```
+
+   Where `<host>` is the Tailscale-resolvable name of your server (e.g.
+   `oci`, or its `100.x.y.z` MagicDNS / IP).
+
+3. Verify with `claude mcp list` — seneschal should show as connected.
+   Call any tool from Claude Code; the request flows over Tailscale to
+   the server's review store and SQLite index.
+
+#### Auth model
+
+The HTTP endpoint has no application-level auth — the tailnet ACL is
+the trust boundary. This is the right shape for personal/single-operator
+deployments. For multi-user or multi-tenant deployments, front the
+listener with a reverse proxy that enforces token auth.
+
+#### Offline cache (optional)
+
+When the server is unreachable (no network, server down), the MCP
+client can fall back to a local mirror of the review store. The
+canonical setup is a periodic `rsync` from the server's
+`~/.seneschal/reviews/` (and `index.db`) into the same paths on the
+client, then a stdio fallback registration that points at the local
+copy. Most users will never need this — when the network is down,
+Claude Code itself usually is too.
+
+### Env summary
+
+The HTTP-transport knobs (CLI args win when both are set):
+
+| Variable | CLI flag | Default | Purpose |
+|---|---|---|---|
+| `SENESCHAL_MCP_TRANSPORT` | `--http` | `stdio` | Set to `http` to bind a network listener. |
+| `SENESCHAL_MCP_HOST` | `--host` | `127.0.0.1` | HTTP bind address. Set to your tailnet IP. |
+| `SENESCHAL_MCP_PORT` | `--port` | `9101` | HTTP bind port. |
+| `SENESCHAL_MCP_PATH` | `--path` | `/mcp` | HTTP endpoint path. |
 
 ## Data layout
 

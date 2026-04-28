@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Launch the Seneschal MCP server over stdio.
+# Launch the Seneschal MCP server. Default transport is stdio (for local
+# Claude Code). Pass `--http` (and optional `--host`/`--port`/`--path`) or
+# set SENESCHAL_MCP_TRANSPORT=http for HTTP transport — see docs/mcp-server.md
+# for the remote-deployment shape.
 #
-# Add to ~/.claude.json MCP servers config:
+# Stdio (local Claude Code) — add to ~/.claude.json MCP servers config:
 #   "seneschal": {
 #     "command": "/path/to/seneschal/bin/seneschal-mcp-server",
 #     "args": []
 #   }
+#
+# HTTP (e.g. accessed via Tailscale from another machine) — register with:
+#   claude mcp add seneschal --transport http http://<host>:9101/mcp
 #
 # Reads persisted reviews from ~/.seneschal/reviews/ (configurable via
 # SENESCHAL_REVIEW_STORE env var).
