@@ -79,14 +79,16 @@ deployment:
 
    ```bash
    SENESCHAL_MCP_TRANSPORT=http \
-   SENESCHAL_MCP_HOST=100.120.165.66 \
+   SENESCHAL_MCP_HOST=<your-tailnet-ip> \
    SENESCHAL_MCP_PORT=9101 \
      /home/ubuntu/seneschal/venv/bin/python -m mcp_server.server
    ```
 
-   Bind explicitly to your tailnet IP — never `0.0.0.0` on a publicly
-   reachable host. The 127.0.0.1 default exists so a forgotten env var
-   produces a loopback bind, never an open public listener.
+   Replace `<your-tailnet-ip>` with the address of the host's tailnet
+   interface (`tailscale ip -4` on the server). Bind explicitly to that
+   IP — never `0.0.0.0` on a publicly reachable host. The 127.0.0.1
+   default exists so a forgotten env var produces a loopback bind, never
+   an open public listener.
 
 2. On the client (your laptop), register with Claude Code over HTTP:
 
